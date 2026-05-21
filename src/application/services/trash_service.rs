@@ -218,13 +218,6 @@ impl TrashUseCase for TrashService {
             "file" => {
                 info!("Processing file to move to trash: {}", item_id);
 
-                // XXX: right now only owner can move to trash, need to improve
-
-                // Get the file — ownership-verified at SQL level.
-                // Returns NotFound if the file does not exist OR belongs to
-                // another user, preventing cross-user trash operations.
-                debug!("Getting file data (owner-scoped): {}", item_id);
-
                 let file_id = Uuid::parse_str(item_id)
                     .map_err(|_| DomainError::not_found("File", item_id))?;
                 self.authz
@@ -235,11 +228,11 @@ impl TrashUseCase for TrashService {
                     )
                     .await?;
 
-                let file = match self
-                    .file_read_port
-                    .get_file_for_owner(item_id, user_id)
-                    .await
-                {
+                // Authz already passed — use the non-owner-scoped read so that
+                // grantees with Delete permission can trash files they don't own.
+                // The file's user_id in storage.files is unchanged, so the item
+                // will appear in the original owner's trash view.
+                let file = match self.file_read_port.get_file(item_id).await {
                     Ok(file) => {
                         debug!("File found: {} ({})", file.name(), item_id);
                         file
@@ -257,8 +250,6 @@ impl TrashUseCase for TrashService {
                 let original_path = file.storage_path().to_string();
                 debug!("Original file path: {}", original_path);
 
-                // Create the trash item
-                // FIXME: item will be created with user_id that mat not be the owner_id
                 debug!("Creating TrashedItem object for the file");
                 let trashed_item = TrashedItem::new(
                     item_uuid,
@@ -320,9 +311,6 @@ impl TrashUseCase for TrashService {
                     )
                     .await?;
 
-                // Get the folder and verify ownership.
-                // Returns NotFound if the folder does not exist or belongs
-                // to another user — prevents cross-user trash operations.
                 let folder = self
                     .folder_storage_port
                     .get_folder(item_id)
@@ -337,8 +325,6 @@ impl TrashUseCase for TrashService {
 
                 let original_path = folder.storage_path().to_string();
 
-                // Create the trash item
-                // FIXME: item will be created with user_id that mat not be the owner_id
                 let trashed_item = TrashedItem::new(
                     item_uuid,
                     user_uuid,

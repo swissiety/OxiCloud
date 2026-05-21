@@ -1179,24 +1179,22 @@ Content-Type: application/json
 
 HTTP 200
 
-# Batch trash — CURRENT LIMITATION: even with Admin (Delete grant via
-# engine), the trash flow inside trash_service uses get_file_for_owner
-# at the data layer, which is owner-scoped. So a non-owner with Delete
-# grant gets engine-OK but the SQL filter blocks the fetch → 400.
-# This is documented inconsistency; a follow-up should make trash use
-# the engine for its lookup too. For now: only the owner can trash.
+# Frank (Admin grant = Delete) trashes batch_file_2 — item goes to
+# Alice's trash because file.user_id is unchanged (Alice is still owner).
 POST {{base_url}}/api/batch/trash
 Authorization: Bearer {{frank_token}}
 Content-Type: application/json
 { "file_ids": ["{{batch_file_2_id}}"], "folder_ids": [] }
 
-HTTP 400
+HTTP 200
+[Asserts]
+jsonpath "$.stats.successful" == 1
 
-# Alice (owner) CAN batch-trash — keeps coverage of the success path.
+# Alice trashes batch_file_1 (which frank moved into batch_sub_a in Phase 3C).
 POST {{base_url}}/api/batch/trash
 Authorization: Bearer {{alice_token}}
 Content-Type: application/json
-{ "file_ids": ["{{batch_file_2_id}}"], "folder_ids": [] }
+{ "file_ids": ["{{batch_file_1_id}}"], "folder_ids": [] }
 
 HTTP 200
 [Asserts]
