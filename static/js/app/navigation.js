@@ -11,7 +11,7 @@ import { photosView } from '../features/library/photos.js';
 import { recent } from '../features/library/recent.js';
 import { sharedView } from '../views/shared/sharedView.js';
 import { sharedWithMeView } from '../views/sharedWithMe/sharedWithMeView.js';
-import { loadFiles } from './filesView.js';
+import { filesView, loadFiles } from './filesView.js';
 import { setActionsBarMode, setGroupByView, syncGroupByMenu } from './main.js';
 import { app, appElements } from './state.js';
 import { loadTrashItems } from './trashView.js';
@@ -237,8 +237,8 @@ function switchToFilesSection() {
 
     // Set actions bar mode
     setActionsBarMode('files', true);
-    setGroupByView(null);
-    syncGroupByMenu([]);
+    setGroupByView(filesView);
+    syncGroupByMenu(filesView.groupByDefs);
 
     // Show owner column in the Files section
     ui.setOwnerColumnVisible(true);
@@ -432,8 +432,8 @@ function switchToMusicSection() {
 function activateFilesUI() {
     setCurrentSection('files');
     setActionsBarMode('files', true);
-    setGroupByView(null);
-    syncGroupByMenu([]);
+    setGroupByView(filesView);
+    syncGroupByMenu(filesView.groupByDefs);
     const breadcrumb = document.querySelector('.breadcrumb');
     breadcrumb?.classList.remove('hidden');
     toggleFileContainer(true);

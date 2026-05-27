@@ -143,6 +143,9 @@ const sharedWithMeView = {
      */
     _groupBy: '',
 
+    /** Whether the current sort order is reversed. */
+    _reversed: false,
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     /**
@@ -168,6 +171,19 @@ const sharedWithMeView = {
     },
 
     /**
+     * Flip the sort direction and reload from page 1.
+     * Calling with the current value is a no-op.
+     * @param {boolean} reversed
+     */
+    setDirection(reversed) {
+        if (this._reversed === reversed) return;
+        this._reversed = reversed;
+        this._nextCursor = null;
+        this._component?.clear();
+        this._loadPage();
+    },
+
+    /**
      * (Re-)load from page 1 and render into the existing files container.
      * Called every time the user switches to this section.
      */
@@ -175,6 +191,7 @@ const sharedWithMeView = {
         this._nextCursor = null;
         this._loading = false;
         this._groupBy = '';
+        this._reversed = false;
 
         this._ensureLoadMoreButton();
 
@@ -275,7 +292,8 @@ const sharedWithMeView = {
                 resourceTypes: /** @type {ResourceTypeEnum[]} */ (['file', 'folder']),
                 limit: 50,
                 cursor: this._nextCursor ?? undefined,
-                orderBy
+                orderBy,
+                reverse: this._reversed
             });
 
             this._nextCursor = data.next_cursor ?? null;

@@ -58,9 +58,10 @@ use crate::interfaces::api::handlers::file_handler::{
     delete_file, download_file, get_file_metadata, get_thumbnail, list_files_query,
     move_file_simple, rename_file, upload_file_with_thumbnails, upload_thumbnail,
 };
+#[allow(deprecated)]
 use crate::interfaces::api::handlers::folder_handler::{
     create_folder, delete_folder_with_trash, download_folder_zip, get_folder, list_folder_contents,
-    list_folder_contents_paginated, list_folder_listing, list_root_folders,
+    list_folder_contents_paginated, list_folder_listing, list_folder_resources, list_root_folders,
     list_root_folders_paginated, move_folder, rename_folder,
 };
 use crate::interfaces::api::handlers::i18n_handler::{
@@ -155,6 +156,9 @@ pub fn create_public_api_routes(app_state: &Arc<AppState>) -> Router<Arc<AppStat
 /// These routes require authentication when auth is enabled.
 /// Receives the fully-assembled `AppState` and extracts all needed services
 /// from it, avoiding a long parameter list.
+// Legacy folder endpoints (contents, listing) are kept for backward-compat;
+// they are marked #[deprecated] so the OpenAPI spec shows them as deprecated.
+#[allow(deprecated)]
 pub fn create_api_routes(app_state: &Arc<AppState>) -> Router<Arc<AppState>> {
     // Extract services from the pre-built AppState
     let folder_service = app_state.applications.folder_service_concrete.clone();
@@ -195,6 +199,7 @@ pub fn create_api_routes(app_state: &Arc<AppState>) -> Router<Arc<AppState>> {
             "/{id}/contents/paginated",
             get(list_folder_contents_paginated),
         )
+        .route("/{id}/resources", get(list_folder_resources))
         .route("/{id}/rename", put(rename_folder))
         .route("/{id}/move", put(move_folder))
         .with_state(folder_service.clone());

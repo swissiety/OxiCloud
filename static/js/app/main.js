@@ -89,6 +89,10 @@ const _toggleButtons = `
                 <i class="fas fa-layer-group"></i>
                 <span class="group-by-label"></span>
             </button>
+            <button class="toggle-btn sort-dir-btn" id="sort-dir-btn"
+                    title="Sort direction" data-i18n-title="sortdir.title">
+                <i class="fas fa-arrow-up" id="sort-dir-icon"></i>
+            </button>
             <div class="group-by-menu hidden" id="group-by-menu"></div>
         </div>
         <span class="view-toggle-separator hidden" id="group-by-separator"></span>
@@ -206,14 +210,14 @@ function setActionsBarMode(mode, force = false) {
 /**
  * The view that currently owns the group-by selector, or `null` when no
  * section supports grouping.  Set by `setGroupByView()` from navigation.js.
- * @type {{ setGroupBy: (key: string) => void } | null}
+ * @type {{ setGroupBy: (key: string) => void, setDirection: (reversed: boolean) => void } | null}
  */
 let _groupByView = null;
 
 /**
  * Update the reference to the view that handles group-by changes.
  * Called by navigation.js when the active section changes.
- * @param {{ setGroupBy: (key: string) => void } | null} view
+ * @param {{ setGroupBy: (key: string) => void, setDirection: (reversed: boolean) => void } | null} view
  */
 function setGroupByView(view) {
     _groupByView = view;
@@ -247,6 +251,8 @@ function syncGroupByMenu(defs = []) {
         btn?.classList.remove('active');
         const lbl = btn?.querySelector('.group-by-label');
         if (lbl) lbl.textContent = '';
+        // Reset direction button to ascending (↑)
+        document.getElementById('sort-dir-btn')?.classList.remove('active');
         return;
     }
 
@@ -289,10 +295,19 @@ function setupActionsBarDelegation() {
             groupByBtn?.classList.toggle('active', key !== '');
             const lbl = groupByBtn?.querySelector('.group-by-label');
             if (lbl) lbl.textContent = key !== '' ? (btn.textContent ?? '') : '';
+            // Changing order-by dimension resets direction to ascending
+            _groupByView?.setDirection(false);
+            document.getElementById('sort-dir-btn')?.classList.remove('active');
             return;
         }
 
         switch (btn.id) {
+            case 'sort-dir-btn': {
+                const nowReversed = !btn.classList.contains('active');
+                _groupByView?.setDirection(nowReversed);
+                btn.classList.toggle('active', nowReversed);
+                return;
+            }
             case 'group-by-btn':
                 document.getElementById('group-by-menu')?.classList.toggle('hidden');
                 return;
