@@ -1,0 +1,200 @@
+# Magic-Link External Authentication
+
+OxiCloud supports sharing resources with people who do not yet have an account on the instance, via per-email invitations and per-email sign-in links. Recipients are provisioned lazily as **external users** and authenticate exclusively through one-time URLs delivered by email, until they later set a password or link an OIDC identity.
+
+This page is the architectural overview. For configuration knobs, see [Environment Variables](/config/env). For how grants are evaluated, see [ReBAC Authorization](/architecture/rebac-authorization). For how shares relate to grants, see [Share Integration](/architecture/share-integration).
+
+## Why this exists
+
+Two scenarios are not covered by username/password or OIDC:
+
+1. **Sharing with someone who is not yet an OxiCloud user.** The sharer should be able to type an email address into the share modal and let the server handle the rest.
+2. **A pre-existing external user has lost their bookmark.** They never had a password — the only way to get back in is a fresh magic link to the address on file.
+
+Both are handled by the same magic-link primitive: a single-use, time-limited token issued out of band (by email) that exchanges for a session on redemption.
+
+## Two flows
+
+```
+Invitation flow                           Login-via-email flow
+───────────────                           ────────────────────
+Alice fills share modal                   Bob hits /login, types his email
+       │                                         │
+POST /api/grants                          POST /api/auth/magic-link/send
+{ subject.type: "email" }                 { email: "bob@example.com" }
+       │                                         │
+resolve_or_create_recipient               find user by email
+  ├─ found  → reuse                       (no creation here)
+  └─ new    → User::new_external                 │
+       │                                         │
+mint token (resource_type/id set)         mint token (NULL resource)
+       │                                         │
+queue invitation email                    queue sign-in email
+       │                                         │
+return GrantDto (201)                     return uniform 200
+       │                                         │
+       └──────────────┬──────────────────────────┘
+                      │
+              recipient clicks /magic/v1/{token}
+                      │
+               validate, mark used, issue cookies
+                      │
+       ┌──────────────┴──────────────────────────┐
+       ↓                                         ↓
+Redirect to /#/files/folder/{id}        Redirect to /#/sharedwithme
+(resource target)                       (no resource target)
+```
+
+The same redemption endpoint serves both — the only difference is the landing redirect, which is decided by whether `magic_link_tokens.resource_id IS NULL`.
+
+## Identity model for external users
+
+A user is **magic-link-eligible** if and only if they have no other authentication method configured. The single source of truth is `User::has_login_credential()`:
+
+| State                          | `password_hash`              | `oidc_subject` | Eligible? |
+|--------------------------------|------------------------------|----------------|-----------|
+| External, freshly invited      | `__EXTERNAL_NO_PASSWORD__`   | NULL           | yes       |
+| External who set a password    | real Argon2 hash             | NULL           | no        |
+| External who linked OIDC       | `__OIDC_NO_PASSWORD__`       | set            | no        |
+| Internal, password             | real Argon2 hash             | NULL           | no        |
+| Internal, OIDC-only            | `__OIDC_NO_PASSWORD__`       | set            | no        |
+
+The placeholder strings (`__EXTERNAL_NO_PASSWORD__`, `__OIDC_NO_PASSWORD__`) are an acknowledged smell. A future refactor introduces an `auth.user_auth_methods` side-table with one row per `(user_id, method_type)`; the migration touches the body of `has_login_credential()` only.
+
+The eligibility rule rules out one specific bypass: an internal user with a password cannot be signed in via a magic link sent to their mailbox. Mailbox ownership is not a substitute for the password — that distinction matters when mailboxes are easier to compromise than passwords (mail-forwarding rules, shared aliases, etc.).
+
+### Username and display
+
+- External users get `username = normalised_email`. Login forms accept username OR email; lookup tries `username` first, falls back to `email`.
+- The `auth.users.username` column was widened from 32 to 254 chars (RFC 5321 maximum) when this work landed.
+- `auth.users.given_name` and `auth.users.family_name` are `TEXT NULL` — populated from OIDC claims at JIT provisioning; external users get NULL initially and can fill them in later.
+- Home folder name (`"My Folder - alice"`) is **not** renamed when username changes — it was display text at creation; the folder is semantically owned by `user_id`.
+
+### Email normalisation
+
+Every email crossing the boundary into the DB or a rate-limit key goes through `domain::services::email_normalize::normalize_email`:
+
+1. Trim whitespace.
+2. Split on the **last** `@`.
+3. Lowercase the local part.
+4. Punycode-encode the domain via `idna::domain_to_ascii`.
+
+So `Alice@Example.COM`, `  alice@example.com  `, and `alice@münchen.de` all map to a stable ASCII form before storage or comparison. Gmail's `+tag` and `.` insensitivities are deliberately **not** special-cased — addresses are treated as opaque strings post-normalisation.
+
+## Token lifecycle
+
+```
+                    ┌─────────┐
+   (insert) ─────►  │ pending │  ─── redeem ──►  ┌──────┐
+                    │         │                  │ used │
+                    └────┬────┘                  └──────┘
+                         │
+                  (sweeper, TTL)
+                         ↓
+                    ┌─────────┐
+                    │ expired │
+                    └─────────┘
+```
+
+`auth.magic_link_tokens` mirrors `auth.device_codes` exactly: PostgreSQL ENUM status, 32-byte CSPRNG token in base64url, single-use via `UPDATE … WHERE status = 'pending'`, partial index on `expires_at WHERE pending`, and a background sweeper that promotes pending-and-overdue rows to expired.
+
+Salient properties:
+
+- **Single-use** — second redemption attempt rejected as "link already used".
+- **TTL-enforced** — `expires_at < NOW()` → "link expired". TTL is `OXICLOUD_MAGIC_LINK_TTL_HOURS`, default 24.
+- **Token in path, not query** — `GET /magic/v1/{token}` so the secret stays out of `Referer` headers.
+- **302 immediately on success** — the URL is replaced in the address bar before the user can navigate away or screenshot it.
+- **Optional resource target** — `resource_type` + `resource_id` columns, with a `CHECK ((resource_type IS NULL) = (resource_id IS NULL))` constraint to make the two-or-neither rule explicit.
+
+## User-profile visibility rule (`GET /api/users/{id}`)
+
+The endpoint is the cornerstone of the share modal's "who is this person" rendering. Its visibility rule is intentionally narrow, evaluated in this order:
+
+1. **Self** — caller asks for their own profile.
+2. **Shared-grant relationship** — caller and target share at least one access grant in either direction. Applies to internal AND external callers; this is what lets a recipient resolve the granter's name/photo in the SharedWithMe view.
+3. **External lockout** — if the caller is external and rule 2 did not match, stop and return 404.
+4. **Directory exposure** — if the target is internal AND `OXICLOUD_EXPOSE_SYSTEM_USERS=true`, return the target.
+5. **Admin** — admins can always look up any user.
+6. **404** — otherwise. Same response as "user does not exist" (anti-enumeration).
+
+A per-caller sliding-window rate limit (60 req/minute) guards against an attacker iterating UUIDs against rule 2 with a stale JWT. The visibility rule alone is sufficient defence-in-principle; the rate limit makes the attack uneconomical.
+
+## Audit events
+
+Every denial or rejection in the magic-link path emits a structured event on the `audit` tracing target. Operators tail `target=audit` for compliance and incident response.
+
+| Event                              | Reasons (subset)                                                                                  | Where it fires                                          |
+|------------------------------------|---------------------------------------------------------------------------------------------------|----------------------------------------------------------|
+| `authz.denied`                     | permission missing                                                                                | `AuthorizationEngine::require`                           |
+| `auth.login`                       | `user_not_found`, `bad_password`, `account_deactivated`                                           | `AuthApplicationService::login`                          |
+| `auth.magic_link_send`             | `sent`, `no_account`, `has_credential`, `account_deactivated`, `malformed_email`, `rate_limited_ip`, `rate_limited_email` | `MagicLinkInviteService::send_login_link` and the handler |
+| `auth.magic_link_redeem`           | `redeemed`, `token_not_found`, `token_used`, `token_expired`, `account_deactivated`               | `MagicLinkInviteService::redeem`                         |
+| `user_profile.rejected`            | `external_no_relationship`, `target_external_hidden`, `target_hidden`                              | `AuthApplicationService::get_user_profile`               |
+| `grants.email_invite`              | `rate_limited`                                                                                    | `grant_handler::create_grant`                            |
+
+The convention (see CLAUDE.md § Authorization) is: any branch that denies or rejects a request **must** emit an audit event before returning the user-facing response. Anti-enumeration is preserved at the API surface (uniform response shape, 404 not 403), and the true reason is recorded only in the audit channel.
+
+## Rate limits
+
+Three caps protect the magic-link surface. Each is a moka sliding-window counter; the keys differ.
+
+| Cap                                          | Keyed on                       | Default   | Env var                                              | Visible on hit? |
+|----------------------------------------------|--------------------------------|-----------|------------------------------------------------------|------------------|
+| Per-sharer email-invite                      | `caller_id`                    | 50 / hour | `OXICLOUD_MAGIC_LINK_INVITE_PER_CALLER_PER_HOUR`     | yes (429 + `Retry-After`) |
+| Per-target-email send                        | normalised email               | 5 / hour  | `OXICLOUD_MAGIC_LINK_SEND_PER_EMAIL_PER_HOUR`        | no (uniform 200) |
+| Per-source-IP send (backstop)                | trusted client IP              | 200 / hour | `OXICLOUD_MAGIC_LINK_SEND_PER_IP_PER_HOUR`           | no (uniform 200) |
+
+Two distinct visibility regimes:
+
+- **Authenticated callers** see 429 when they hit a cap, because their own rate-limit state leaks nothing about other accounts. The invite cap is in this regime.
+- **Anonymous callers** never see 429 on the send endpoint — the status itself would become an enumeration oracle ("this email has been probed recently → probably has an account"). The two send caps are silently absorbed: the response stays the uniform 200, and the real reason is recorded in the audit channel.
+
+An authenticated caller resending to themselves bypasses both send caps. The bypass signal is "presence (not validity) of an Authorization header or access cookie" — a stale-cookie holder gets a 401 from any other endpoint they touch, so the worst-case bypass is narrow.
+
+The per-IP backstop respects `OXICLOUD_TRUST_PROXY_CIDR` for client IP resolution: behind a reverse proxy, the upstream IP from `X-Forwarded-For` (leftmost) is used; without a configured trusted CIDR, the proxy's IP would be used and the backstop would effectively become a single bucket.
+
+## Defence-in-depth boundary protections
+
+External users are a new principal kind, and several pre-existing surfaces would over-share once they appeared. Three protections close those gaps:
+
+1. **Subject groups reject external members.** `subject_group_service.rs::add_member` short-circuits if the candidate user has `is_external = TRUE`. Otherwise an admin could add `alice@example.com` to "Engineering", which later receives a grant on internal-only resources — silent privilege escalation. Mirrors the no-external-admins enforcement.
+2. **System contacts hide externals by default.** `auth_service.list_users` and `auth_service.search_users` take `include_external: bool`, defaulting to `false`. The share modal autocomplete (via `/api/address-books/system/contacts`) therefore never surfaces external users to internal callers, and external users never see internal users at the address book layer.
+3. **External users are excluded from the Internal virtual group.** `pg_acl_engine.rs::expand_user` no longer inserts `INTERNAL_GROUP_ID` for users with `is_external = TRUE`. The group's name finally honours its semantics; every grant addressed to "all internal users" is now genuinely internal-only.
+
+These three protections all activate at the **service layer**, so every protocol surface (REST, WebDAV, CalDAV, NextCloud) inherits them automatically.
+
+Pre-existing safeguards from the user-lifecycle work continue to apply: the DB CHECK constraints `users_external_not_admin` and `users_external_no_storage`, and the `HomeFolderLifecycleHook` short-circuit that skips home-folder provisioning for externals.
+
+## Kill switches and feature scoping
+
+| Knob                                   | What it does                                                                                          |
+|----------------------------------------|--------------------------------------------------------------------------------------------------------|
+| `OXICLOUD_ALLOW_EXTERNAL_USERS=false`  | Coarse off-switch. `POST /api/grants` rejects email-typed subjects for unknown emails; send endpoint returns the uniform stub without issuing a token. Pre-existing externals continue to function. |
+| `OXICLOUD_EXTERNAL_EMAIL_DOMAINS=…`    | Fine-grained allowlist of accepted domains for new external users. Empty = no restriction. Exact-match (case-insensitive) on the post-`@` part — `partner.com` does NOT match `eng.partner.com`. |
+| `OXICLOUD_SMTP_*` unconfigured         | The whole magic-link feature is unavailable. Endpoints that depend on it return `503 Service Unavailable` with a clear message. |
+| `OXICLOUD_MAGIC_LINK_TTL_HOURS`        | Token lifetime. Default 24 hours. Shortening it raises the resend rate; lengthening it raises the window for token theft. |
+
+The send endpoint **does** return 503 (not the uniform 200) when SMTP is entirely unconfigured: the absence of the feature is visible from any other `/api/auth/magic-link/*` route anyway, so hiding the 503 leaks nothing the attacker could not learn elsewhere.
+
+## What is deliberately out of scope
+
+These are intentionally deferred. Each has a clear future trigger; none block the present design.
+
+- **`auth.user_auth_methods` side-table.** Replaces the placeholder-string smell. `has_login_credential()` is the single migration point.
+- **Email-locale routing.** v1 ships English-only invitation templates. A future PR adds recipient-locale detection (Accept-Language at send time, or stored preference) and a template engine.
+- **MX-record validation at share time.** Regex is the only pre-send check; bad domains surface via SMTP bounce.
+- **Dormant external user sweeper.** Purges users with no `last_login_at` for 13+ months. The GDPR-purge variant in `UserLifecycleHook::on_user_deleted` is its hook entry point.
+- **`OXICLOUD_EXTERNAL_USERS_CAN_RESHARE=false`.** Forbids externals from being a grant's `granted_by`. Today an external with `Permission::Share` can mint more externals — a soft policy worth tightening but not load-bearing.
+- **Differentiated session TTL for externals.** Uniform across all users today. Future env: `OXICLOUD_EXTERNAL_REFRESH_TOKEN_EXPIRY_DAYS`.
+- **`session_kind` on sessions emitted from magic-link.** Enables scoped sessions ("magic-link session can only access granted resources, not the user's own folders"). External users have no own folders so the practical exposure is small.
+- **Admin-list-users that includes externals.** Today `list_users` filters externals by default. A future admin UI for managing externals (rename, deactivate, view their grants) will need an `include_external` query param.
+- **Open Cloud Mesh (OCM) federation.** A separate path for external identity; `ExternalIdentityLifecycleHook::on_user_created` accommodates a `source` discriminator (`magic_link` / `oidc` / `ocm`).
+- **WebAuthn / passkey enrolment.** Distinct future feature; magic-link is the bootstrap.
+- **Bounce tracking.** No webhook listener for SES-style bounce notifications. A future `on_email_bounce` event would surface "this user's email is dead" in admin UI.
+
+## Related documents
+
+- [User lifecycle](/architecture/user-lifecycle) — the hook framework that fires on user creation and the deletion modes.
+- [ReBAC Authorization](/architecture/rebac-authorization) — how grants are evaluated against `auth.users` rows (including external ones).
+- [Share Integration](/architecture/share-integration) — how the public-share-link flow relates to the email-invite flow (both create `access_grants` rows; only the former lives in `storage.shares`).
+- [Environment Variables](/config/env) — the full set of `OXICLOUD_*` knobs.

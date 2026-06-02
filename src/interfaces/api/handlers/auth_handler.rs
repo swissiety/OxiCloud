@@ -914,9 +914,17 @@ pub struct SendMagicLinkDto {
 /// the absence of the entire feature is visible from any other
 /// endpoint touching `/api/auth/magic-link/*`.
 ///
-/// Per-target-email rate limit is scheduled for PR 12 — without it,
-/// the endpoint could be used as an email-bombing primitive against a
-/// known recipient address.
+/// PR 12 rate limits:
+/// - **Per-source-IP**, 200/hour — bounds the cost of one attacker
+///   spreading low per-email volumes over many target addresses.
+/// - **Per-target-email**, 5/hour, keyed on the normalised email —
+///   stops the endpoint from being an email-bombing primitive against
+///   a single known recipient.
+/// Both caps return the uniform 200 (never 429 to anonymous callers,
+/// otherwise the status itself becomes an enumeration oracle); the
+/// real reason is recorded in the audit channel.
+/// Authenticated callers (Authorization header or access cookie
+/// present) bypass both limits.
 #[utoipa::path(
     post,
     path = "/api/auth/magic-link/send",
@@ -929,7 +937,7 @@ pub struct SendMagicLinkDto {
 )]
 pub async fn send_magic_link(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<SendMagicLinkDto>,
+    req: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, AppError> {
     let Some(invite_svc) = state.magic_link_invite_service.as_ref() else {
         return Err(AppError::new(
@@ -939,6 +947,91 @@ pub async fn send_magic_link(
         ));
     };
 
+    // Authentication signal — presence (not validity) of Bearer header
+    // OR access cookie. We deliberately don't decode the JWT here: a
+    // stale-cookie holder gets a 401 from any other endpoint they
+    // touch, and the worst-case bypass of these anti-flood caps is a
+    // narrow window where an attacker keeps a single expired cookie
+    // alive. False-negatives (a logged-in user being rate-limited
+    // resending to themselves) are the real cost we're avoiding.
+    let headers = req.headers().clone();
+    let is_authenticated = headers.contains_key(axum::http::header::AUTHORIZATION)
+        || crate::interfaces::api::cookie_auth::extract_cookie_value(
+            &headers,
+            crate::interfaces::api::cookie_auth::ACCESS_COOKIE,
+        )
+        .is_some();
+
+    let client_ip = crate::interfaces::middleware::rate_limit::extract_client_ip(&req);
+
+    // Body parsing — manual because Request<Body> already consumed
+    // any chance of a Json extractor. 4 KiB is generous for
+    // `{ "email": "..." }`.
+    let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024)
+        .await
+        .map_err(|_| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "Request body too large or unreadable",
+                "InvalidInput",
+            )
+        })?;
+    let body: SendMagicLinkDto = serde_json::from_slice(&body_bytes).map_err(|e| {
+        AppError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON body: {e}"),
+            "InvalidInput",
+        )
+    })?;
+
+    let uniform_ok = || {
+        let payload = serde_json::json!({
+            "message": "If an account exists for that email, a sign-in link will be sent.",
+        });
+        (StatusCode::OK, Json(payload)).into_response()
+    };
+
+    if !is_authenticated {
+        // Per-IP backstop fires first — covers the case where an
+        // attacker iterates many distinct emails to spread the
+        // per-email budget thin.
+        if state
+            .magic_link_send_per_ip_rate_limiter
+            .check_and_increment(&client_ip)
+            .is_err()
+        {
+            tracing::warn!(
+                target: "audit",
+                event = "auth.magic_link_send",
+                reason = "rate_limited_ip",
+                ip = %client_ip,
+                "Per-IP rate limit exceeded on /api/auth/magic-link/send"
+            );
+            return Ok(uniform_ok());
+        }
+
+        // Per-target-email cap, keyed on the normalised form so
+        // casing/IDN-host tricks don't multiply the budget. Malformed
+        // addresses skip this check and fall through to the service,
+        // which records its own audit entry under reason="malformed_email".
+        if let Ok(normalised) =
+            crate::domain::services::email_normalize::normalize_email(&body.email)
+            && state
+                .magic_link_send_per_email_rate_limiter
+                .check_and_increment(&normalised)
+                .is_err()
+        {
+            tracing::warn!(
+                target: "audit",
+                event = "auth.magic_link_send",
+                reason = "rate_limited_email",
+                ip = %client_ip,
+                "Per-target-email rate limit exceeded on /api/auth/magic-link/send"
+            );
+            return Ok(uniform_ok());
+        }
+    }
+
     // The service swallows every operational outcome and logs the truth
     // via the audit channel; we surface only an internal error (DB down,
     // etc.). Anti-enumeration means we always return the same body.
@@ -947,8 +1040,5 @@ pub async fn send_magic_link(
         .await
         .map_err(AppError::from)?;
 
-    let payload = serde_json::json!({
-        "message": "If an account exists for that email, a sign-in link will be sent.",
-    });
-    Ok((StatusCode::OK, Json(payload)).into_response())
+    Ok(uniform_ok())
 }

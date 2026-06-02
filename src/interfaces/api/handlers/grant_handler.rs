@@ -116,6 +116,27 @@ pub async fn create_grant(
                 )
                 .into_response();
             };
+            // PR 12 — per-sharer ceiling: 50 email-invitations / hour
+            // per caller. Hitting the cap returns 429 because the
+            // caller is authenticated and rate-limit visibility leaks
+            // nothing they don't already know about their own
+            // behaviour.
+            if state
+                .email_invite_rate_limiter
+                .check_and_increment(&caller_id.to_string())
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "audit",
+                    event = "grants.email_invite",
+                    reason = "rate_limited",
+                    caller_id = %caller_id,
+                    "Per-sharer email-invite rate limit exceeded"
+                );
+                return crate::interfaces::middleware::rate_limit::too_many_requests(
+                    state.email_invite_rate_limiter.retry_after(),
+                );
+            }
             match invite_svc.resolve_or_create_recipient(&email).await {
                 Ok(user) => (Subject::User(user.id()), Some(user)),
                 Err(e) => return AppError::from(e).into_response(),

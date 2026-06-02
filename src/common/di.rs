@@ -932,6 +932,38 @@ impl AppServiceFactory {
             user_profile_rate_limiter: Arc::new(
                 crate::interfaces::middleware::rate_limit::RateLimiter::new(60, 60, 50_000),
             ),
+            // PR 12 — per-sharer email-invite ceiling: caller_id-keyed.
+            // Defends against a compromised account spamming external
+            // invites (each invite mints a new external user + email).
+            // Limits come from MagicLinkConfig so tests / operators can
+            // tune them via OXICLOUD_MAGIC_LINK_INVITE_PER_CALLER_PER_HOUR.
+            email_invite_rate_limiter: Arc::new(
+                crate::interfaces::middleware::rate_limit::RateLimiter::new(
+                    self.config.magic_link.invite_per_caller_per_hour,
+                    3_600,
+                    50_000,
+                ),
+            ),
+            // PR 12 — per-target-email send ceiling on
+            // /api/auth/magic-link/send. Stops the endpoint from being
+            // an email-bombing primitive against a known address.
+            magic_link_send_per_email_rate_limiter: Arc::new(
+                crate::interfaces::middleware::rate_limit::RateLimiter::new(
+                    self.config.magic_link.send_per_email_per_hour,
+                    3_600,
+                    50_000,
+                ),
+            ),
+            // PR 12 — per-IP backstop on /api/auth/magic-link/send.
+            // Bounds the damage if an attacker spreads a low per-email
+            // rate across many target addresses.
+            magic_link_send_per_ip_rate_limiter: Arc::new(
+                crate::interfaces::middleware::rate_limit::RateLimiter::new(
+                    self.config.magic_link.send_per_ip_per_hour,
+                    3_600,
+                    50_000,
+                ),
+            ),
         };
         let email_bundle = build_email_sender(&self.config.smtp);
         app_state.email_sender = email_bundle.sender;
@@ -1316,6 +1348,26 @@ pub struct AppState {
     /// authenticated caller covers any legitimate UI rendering while
     /// throttling enumeration.
     pub user_profile_rate_limiter: Arc<crate::interfaces::middleware::rate_limit::RateLimiter>,
+    /// Per-sharer ceiling on `POST /api/grants` invitations whose
+    /// subject is `{ type: "email" }`. 50 per hour keyed on
+    /// `caller_id`. Anonymous attackers can't reach this code path
+    /// (the route is auth-protected); this defends against a
+    /// compromised internal account or a malicious admin.
+    pub email_invite_rate_limiter: Arc<crate::interfaces::middleware::rate_limit::RateLimiter>,
+    /// Per-target-email ceiling on `POST /api/auth/magic-link/send`. 5
+    /// per hour keyed on the **normalised** target email. Exceeding
+    /// the cap is silently absorbed: the handler still returns the
+    /// uniform 200 anti-enumeration response, but no new mail is
+    /// dispatched. Authenticated callers bypass this limit.
+    pub magic_link_send_per_email_rate_limiter:
+        Arc<crate::interfaces::middleware::rate_limit::RateLimiter>,
+    /// Per-source-IP backstop on `POST /api/auth/magic-link/send`. 200
+    /// per hour keyed on the trusted client IP (respects
+    /// `OXICLOUD_TRUST_PROXY_CIDR`). Bounds the cost of a single
+    /// attacker spreading 5/hr requests over a wide email list.
+    /// Authenticated callers bypass this limit.
+    pub magic_link_send_per_ip_rate_limiter:
+        Arc<crate::interfaces::middleware::rate_limit::RateLimiter>,
 }
 
 // All AppState construction is done via struct literal in build_app_state().

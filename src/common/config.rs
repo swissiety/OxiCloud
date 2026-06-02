@@ -714,6 +714,21 @@ pub struct MagicLinkConfig {
     /// `partner.com` does NOT match `eng.partner.com`. List every
     /// subdomain explicitly.
     pub allowed_email_domains: Vec<String>,
+    /// Per-sharer ceiling on email-typed grant invitations from
+    /// `POST /api/grants`. Keyed on `caller_id`. Exceeding the ceiling
+    /// returns 429. Default: 50/hour.
+    pub invite_per_caller_per_hour: u32,
+    /// Per-target-email ceiling on `POST /api/auth/magic-link/send`,
+    /// keyed on the normalised recipient address. Anti-bombing.
+    /// Exceeding the ceiling is silently absorbed (uniform 200) so
+    /// the response shape can't be used as an enumeration oracle.
+    /// Default: 5/hour.
+    pub send_per_email_per_hour: u32,
+    /// Per-source-IP backstop on `POST /api/auth/magic-link/send`,
+    /// keyed on the trusted client IP. Bounds the cost of an attacker
+    /// spreading low per-email volume across many target addresses.
+    /// Default: 200/hour.
+    pub send_per_ip_per_hour: u32,
 }
 
 impl Default for MagicLinkConfig {
@@ -722,6 +737,9 @@ impl Default for MagicLinkConfig {
             ttl_hours: 24,
             allow_external_users: true,
             allowed_email_domains: Vec::new(),
+            invite_per_caller_per_hour: 50,
+            send_per_email_per_hour: 5,
+            send_per_ip_per_hour: 200,
         }
     }
 }
@@ -1350,6 +1368,24 @@ impl AppConfig {
                 .filter(|d| !d.is_empty())
                 .collect();
         }
+        if let Ok(v) = env::var("OXICLOUD_MAGIC_LINK_INVITE_PER_CALLER_PER_HOUR")
+            && let Ok(n) = v.parse::<u32>()
+            && n > 0
+        {
+            config.magic_link.invite_per_caller_per_hour = n;
+        }
+        if let Ok(v) = env::var("OXICLOUD_MAGIC_LINK_SEND_PER_EMAIL_PER_HOUR")
+            && let Ok(n) = v.parse::<u32>()
+            && n > 0
+        {
+            config.magic_link.send_per_email_per_hour = n;
+        }
+        if let Ok(v) = env::var("OXICLOUD_MAGIC_LINK_SEND_PER_IP_PER_HOUR")
+            && let Ok(n) = v.parse::<u32>()
+            && n > 0
+        {
+            config.magic_link.send_per_ip_per_hour = n;
+        }
 
         config
     }
@@ -1410,9 +1446,8 @@ mod tests {
     #[test]
     fn allowlist_matches_case_insensitively() {
         let cfg = MagicLinkConfig {
-            ttl_hours: 24,
-            allow_external_users: true,
             allowed_email_domains: vec!["partner-a.com".to_string(), "partner-b.io".to_string()],
+            ..MagicLinkConfig::default()
         };
         assert!(cfg.is_email_allowed("alice@partner-a.com"));
         // Uppercase domain in the email — must still match.
@@ -1425,9 +1460,8 @@ mod tests {
     #[test]
     fn allowlist_does_not_match_subdomains_implicitly() {
         let cfg = MagicLinkConfig {
-            ttl_hours: 24,
-            allow_external_users: true,
             allowed_email_domains: vec!["partner.com".to_string()],
+            ..MagicLinkConfig::default()
         };
         assert!(cfg.is_email_allowed("alice@partner.com"));
         // Subdomain must be listed explicitly — exact match only.
@@ -1439,9 +1473,8 @@ mod tests {
     #[test]
     fn malformed_email_fails_closed() {
         let cfg = MagicLinkConfig {
-            ttl_hours: 24,
-            allow_external_users: true,
             allowed_email_domains: vec!["partner.com".to_string()],
+            ..MagicLinkConfig::default()
         };
         // No `@` — rejected even though allowlist is set.
         assert!(!cfg.is_email_allowed("not-an-email"));

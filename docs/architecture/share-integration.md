@@ -4,6 +4,8 @@ OxiCloud supports public file and folder sharing through signed share links. A s
 
 > **Where permission and expiration live now.** Both the granted permissions and the expiration timestamp are stored on the `storage.access_grants` row that represents the share, not on the share row itself. They are evaluated by the same `AuthorizationEngine` that handles user and group grants — see [ReBAC Authorization](/architecture/rebac-authorization). The `storage.shares` row keeps only the token-side metadata (public token, password hash, item name, access count).
 
+> **Sharing with people who do not yet have an account.** Token-based shares are anonymous; anyone with the URL can use them. To share with a specific person who isn't on the instance yet, the share modal accepts a raw email address and provisions the recipient as an *external user* on the fly. That flow is described in [Magic-link external authentication](/architecture/magic-link-auth), and the resulting grant is a regular per-user `access_grants` row — identical in evaluation to a grant on an internal recipient.
+
 ## What a Share Contains
 
 A share record (`storage.shares`) tracks:

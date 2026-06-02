@@ -355,9 +355,87 @@ HTTP 404
 
 
 # ─────────────────────────────────────────────────────────────
+# Step 16 — Rate-limit caps (PR 12). Test-only thresholds come
+#           from tests/common/server.env:
+#             OXICLOUD_MAGIC_LINK_INVITE_PER_CALLER_PER_HOUR=3
+#             OXICLOUD_MAGIC_LINK_SEND_PER_EMAIL_PER_HOUR=2
+#           Alice already burned 2 invite slots earlier (bob's
+#           folder + ext-share-2) and 1 send slot in Step 15a.
+# ─────────────────────────────────────────────────────────────
+
+# 16a — Alice's 3rd email-invite (3/3) succeeds — right at the
+#       cap. Fresh email so resolve_or_create_recipient mints a
+#       new external user we'll clean up below.
+POST {{base_url}}/api/grants
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{
+  "subject":  { "type": "email", "email": "ratelimit-test-1@externalcompany.com" },
+  "resource": { "type": "folder", "id": "{{ext_folder_id}}" },
+  "role":     "viewer"
+}
+
+HTTP 201
+[Captures]
+rl_user_1_id: jsonpath "$[0].subject.id"
+
+# 16b — 4th invite (4/3) is rejected with 429 + Retry-After. The
+#       cap is visible because Alice is authenticated and her own
+#       rate-limit state leaks nothing about other accounts.
+POST {{base_url}}/api/grants
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{
+  "subject":  { "type": "email", "email": "ratelimit-test-2@externalcompany.com" },
+  "resource": { "type": "folder", "id": "{{ext_folder_id}}" },
+  "role":     "viewer"
+}
+
+HTTP 429
+[Asserts]
+header "retry-after" exists
+jsonpath "$.retry_after_secs" >= 1
+
+# 16c — Anonymous /magic-link/send to bob (2/2 — at cap). Returns
+#       the same uniform 200 a successful issuance would; the
+#       audit log distinguishes the two.
+POST {{base_url}}/api/auth/magic-link/send
+Content-Type: application/json
+{ "email": "bob@externalcompany.com" }
+
+HTTP 200
+[Asserts]
+jsonpath "$.message" contains "sign-in link"
+
+# 16d — 3rd anonymous send to bob (3/2 — over cap). Anti-enumeration:
+#       must NOT return 429, must NOT change the response shape.
+POST {{base_url}}/api/auth/magic-link/send
+Content-Type: application/json
+{ "email": "bob@externalcompany.com" }
+
+HTTP 200
+[Asserts]
+jsonpath "$.message" contains "sign-in link"
+
+# 16e — Authenticated callers bypass both anti-flood caps. Alice
+#       resends to bob with her Bearer token; the per-email and
+#       per-IP counters are not consulted (a logged-in user
+#       resending should never be throttled). Still returns 200.
+POST {{base_url}}/api/auth/magic-link/send
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{ "email": "bob@externalcompany.com" }
+
+HTTP 200
+[Asserts]
+jsonpath "$.message" contains "sign-in link"
+
+
+# ─────────────────────────────────────────────────────────────
 # Step 12 — Cleanup. Alice trashes the two test folders and
-#           deletes bob via the admin API so the suite's
-#           storage-check sweep at run.sh end sees a clean DB.
+#           deletes bob + the two rate-limit-test externals via
+#           the admin API so the suite's storage-check sweep at
+#           run.sh end sees a clean DB.
 # ─────────────────────────────────────────────────────────────
 DELETE {{base_url}}/api/folders/{{ext_folder_id_2}}
 Authorization: Bearer {{alice_token}}
@@ -370,6 +448,11 @@ Authorization: Bearer {{alice_token}}
 HTTP 204
 
 DELETE {{base_url}}/api/admin/users/{{bob_user_id}}
+Authorization: Bearer {{alice_token}}
+
+HTTP *
+
+DELETE {{base_url}}/api/admin/users/{{rl_user_1_id}}
 Authorization: Bearer {{alice_token}}
 
 HTTP *
