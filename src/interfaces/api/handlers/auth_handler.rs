@@ -79,16 +79,20 @@ pub fn setup_route() -> Router<Arc<AppState>> {
 pub async fn register(
     State(state): State<Arc<AppState>>,
     Json(dto): Json<RegisterDto>,
-) -> Result<impl IntoResponse, AppError> {
-    // Add detailed logging for debugging
-    tracing::info!("Registration attempt for user: {}", dto.username);
+) -> Result<axum::response::Response, AppError> {
+    // Display the supplied identifier in operational logs without
+    // panicking on the None branch — the user may have registered
+    // email-only with no username yet.
+    let log_identifier = dto
+        .username
+        .as_deref()
+        .unwrap_or(dto.email.as_str())
+        .to_string();
+    tracing::info!("Registration attempt for: {}", log_identifier);
 
     // Verify auth service exists
     let auth_service = match state.auth_service.as_ref() {
-        Some(service) => {
-            tracing::info!("Auth service found, proceeding with registration");
-            service
-        }
+        Some(service) => service,
         None => {
             tracing::error!("Auth service not configured");
             return Err(AppError::internal_error(
@@ -97,10 +101,13 @@ pub async fn register(
         }
     };
 
-    // Fix #5: Block password registration when OIDC-only mode is active
-    if auth_service
-        .auth_application_service
-        .password_login_disabled()
+    // Block password registration when OIDC-only mode is active. The
+    // email-only signup path is allowed because it doesn't store a
+    // password — the user later authenticates via magic-link.
+    if dto.password.is_some()
+        && auth_service
+            .auth_application_service
+            .password_login_disabled()
     {
         return Err(AppError::new(
             StatusCode::FORBIDDEN,
@@ -120,22 +127,45 @@ pub async fn register(
         ));
     }
 
-    // Registration logic (admin detection, fresh-install handling, duplicate
-    // checks) is all inside the service layer. Call it directly.
-    match auth_service
-        .auth_application_service
-        .register(dto.clone())
-        .await
-    {
-        Ok(user) => {
-            tracing::info!("Registration successful for user: {}", dto.username);
-            Ok((StatusCode::CREATED, Json(user)))
-        }
+    let was_passwordless = dto.password.is_none();
+    let email = dto.email.clone();
+
+    // Registration logic (duplicate checks, hashing, user creation) is
+    // all inside the service layer.
+    let user = match auth_service.auth_application_service.register(dto).await {
+        Ok(u) => u,
         Err(err) => {
-            tracing::error!("Registration failed for user {}: {}", dto.username, err);
-            Err(err.into())
+            tracing::error!("Registration failed for {}: {}", log_identifier, err);
+            return Err(err.into());
         }
+    };
+    tracing::info!("Registration successful for: {}", log_identifier);
+
+    // Email-only signup: dispatch a welcome magic-link so the user can
+    // land their first session without a password. Best-effort — SMTP
+    // failures don't fail the registration. Response shape is uniform
+    // (200 + anti-enumeration message) so the user is told to check
+    // their email regardless of whether SMTP was actually wired.
+    if was_passwordless {
+        if let Some(invite) = state.magic_link_invite_service.as_ref()
+            && let Err(e) = invite.send_login_link(&email).await
+        {
+            tracing::warn!(
+                target: "audit",
+                event = "auth.register_welcome_mail_failed",
+                user_id = %user.id,
+                email = %email,
+                error = %e,
+                "register: welcome magic-link send failed (user created)",
+            );
+        }
+        let payload = serde_json::json!({
+            "message": "Check your email for a sign-in link to complete registration.",
+        });
+        return Ok((StatusCode::OK, Json(payload)).into_response());
     }
+
+    Ok((StatusCode::CREATED, Json(user)).into_response())
 }
 
 /// Authenticate with username and password.

@@ -80,9 +80,21 @@ pub struct LoginDto {
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct RegisterDto {
-    pub username: String,
+    /// Optional handle (2-64 chars, no `@`). When omitted, the user can
+    /// claim one later via the profile-edit endpoint. Users without a
+    /// username cannot use NextCloud clients or create app passwords
+    /// (Basic-Auth resolves users by username); web UI / native API
+    /// works fine without one.
+    #[serde(default)]
+    pub username: Option<String>,
     pub email: String,
-    pub password: String,
+    /// Optional password (≥8 chars when present). When omitted, a
+    /// welcome magic-link is mailed to `email` for first-session
+    /// bootstrap. The user can later set a password via the
+    /// change-password endpoint to switch to classic username/email +
+    /// password login.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// DTO for the one-time initial admin setup endpoint (`/api/setup`).

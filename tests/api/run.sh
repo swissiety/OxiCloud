@@ -91,6 +91,7 @@ log "Running Hurl tests..."
 hurl --variables-file "$API_DIR/test.env" --file-root "$REPO_ROOT/tests" --test --jobs 1 \
   "$API_DIR/setup.hurl" \
   "$API_DIR/auth_login.hurl" \
+  "$API_DIR/registration.hurl" \
   "$API_DIR/files-folders.hurl" \
   "$API_DIR/favorites.hurl" \
   "$API_DIR/trash.hurl" \

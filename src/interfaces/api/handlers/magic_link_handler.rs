@@ -101,7 +101,7 @@ async fn redeem_magic_link(
 }
 
 fn build_success_response(state: &Arc<AppState>, redemption: MagicLinkRedemption) -> Response {
-    let target = redirect_target(redemption.resource_kind, redemption.resource_id);
+    let target = redirect_target(&redemption);
 
     let mut response = (StatusCode::FOUND, [(LOCATION, target.as_str())]).into_response();
 
@@ -119,12 +119,23 @@ fn build_success_response(state: &Arc<AppState>, redemption: MagicLinkRedemption
 
 /// Build the SPA hash-route the redemption should land on. Mirrors the
 /// front-end's `deserializeHash()` parser at `static/js/app/main.js`.
-fn redirect_target(kind: Option<MagicLinkResourceKind>, id: Option<uuid::Uuid>) -> String {
-    match (kind, id) {
+///
+/// - **Resource token** (folder invitation): deep-link to the resource.
+/// - **NULL-resource token + external user**: land on `/#/sharedwithme`
+///   (their entry point — they own no folders themselves).
+/// - **NULL-resource token + internal user**: land on `/#/files` (the
+///   user has a home folder; the "shared with me" view would be empty
+///   on first signup, so home is the better welcome). Internal users
+///   on NULL-resource tokens come from the email-only-signup welcome
+///   path (PR 18) or from a magic-link they requested themselves
+///   while password-eligible-and-lenient-mode (PR 19).
+fn redirect_target(redemption: &MagicLinkRedemption) -> String {
+    match (redemption.resource_kind, redemption.resource_id) {
         (Some(MagicLinkResourceKind::Folder), Some(folder_id)) => {
             format!("/#/files/folder/{}", folder_id)
         }
-        _ => "/#/sharedwithme".to_string(),
+        _ if redemption.auth.user.is_external => "/#/sharedwithme".to_string(),
+        _ => "/#/files".to_string(),
     }
 }
 

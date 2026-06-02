@@ -255,17 +255,20 @@ impl AuthApplicationService {
     }
 
     pub async fn register(&self, dto: RegisterDto) -> Result<UserDto, DomainError> {
-        // Check for duplicate user
-        if self
-            .user_storage
-            .get_user_by_username(&dto.username)
-            .await
-            .is_ok()
+        // Username uniqueness (only when a username was supplied — None
+        // is the "claim later" path, multiple NULLs are allowed by the
+        // UNIQUE index per Postgres semantics).
+        if let Some(ref username) = dto.username
+            && self
+                .user_storage
+                .get_user_by_username(username)
+                .await
+                .is_ok()
         {
             return Err(DomainError::new(
                 ErrorKind::AlreadyExists,
                 "User",
-                format!("User '{}' already exists", dto.username),
+                format!("User '{}' already exists", username),
             ));
         }
 
@@ -287,27 +290,30 @@ impl AuthApplicationService {
         //   1. The one-time /api/setup endpoint (first boot)
         //   2. The admin panel (admin_create_user)
         let role = UserRole::User;
-
-        // Quota based on role, capped to available disk space
         let quota = self.capped_quota(&role);
 
-        // Validate password length before hashing
-        if dto.password.len() < 8 {
-            return Err(DomainError::new(
-                ErrorKind::InvalidInput,
-                "User",
-                "Password must be at least 8 characters long",
-            ));
-        }
+        // Validate password length before hashing — only when one is
+        // supplied. Omitted password means the user opts into the
+        // magic-link bootstrap path.
+        let password_hash = match dto.password {
+            Some(ref pw) => {
+                if pw.len() < 8 {
+                    return Err(DomainError::new(
+                        ErrorKind::InvalidInput,
+                        "User",
+                        "Password must be at least 8 characters long",
+                    ));
+                }
+                Some(self.password_hasher.hash_password(pw).await?)
+            }
+            None => None,
+        };
+        let was_passwordless = password_hash.is_none();
 
-        // Hash the password using the infrastructure service
-        let password_hash = self.password_hasher.hash_password(&dto.password).await?;
-
-        // Create user with the pre-generated hash
         let user = User::new(
-            dto.email,
-            Some(dto.username.clone()),
-            Some(password_hash),
+            dto.email.clone(),
+            dto.username.clone(),
+            password_hash,
             None,
             None,
             role,
@@ -324,6 +330,7 @@ impl AuthApplicationService {
 
         // Save user
         let created_user = self.user_storage.create_user(user).await?;
+        let _ = was_passwordless; // handler dispatches the welcome mail on this path
 
         // Lifecycle: HomeFolderLifecycleHook handles personal-folder
         // creation (was inlined here pre-PR 3); audit log + future
