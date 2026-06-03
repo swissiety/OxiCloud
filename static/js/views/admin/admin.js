@@ -241,7 +241,7 @@ async function loadUsers() {
                 return (
                     '<tr>' +
                     '<td><div class="user-info"><span class="user-name">' +
-                    escapeHtml(u.username) +
+                    escapeHtml(u.username || u.email || '—') +
                     (isSelf ? ` <span class="user-self-badge">${escapeHtml(i18n.t('admin.you_badge'))}</span>` : '') +
                     '</span><span class="user-email">' +
                     escapeHtml(u.email) +
@@ -274,7 +274,7 @@ async function loadUsers() {
                     '<button class="btn btn-sm btn-secondary admin-action-btn" data-action="quota" data-uid="' +
                     _escJs(u.id) +
                     '" data-uname="' +
-                    _escJs(u.username) +
+                    _escJs(u.username || u.email) +
                     '" data-quota="' +
                     u.storage_quota_bytes +
                     '" title="' +
@@ -285,7 +285,7 @@ async function loadUsers() {
                         : '<button class="btn btn-sm btn-secondary admin-action-btn" data-action="reset-pw" data-uid="' +
                           _escJs(u.id) +
                           '" data-uname="' +
-                          _escJs(u.username) +
+                          _escJs(u.username || u.email) +
                           '" title="' +
                           escapeHtml(i18n.t('admin.reset_password_title')) +
                           '"><i class="fas fa-key"></i></button>') +
@@ -316,7 +316,7 @@ async function loadUsers() {
                     '<button class="btn btn-sm btn-danger admin-action-btn" data-action="delete" data-uid="' +
                     _escJs(u.id) +
                     '" data-uname="' +
-                    _escJs(u.username) +
+                    _escJs(u.username || u.email) +
                     '" title="' +
                     escapeHtml(i18n.t('admin.delete_title')) +
                     '"' +

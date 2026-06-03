@@ -85,7 +85,7 @@ async function _refreshUserCache() {
         // Refresh top-right avatars if userMenu module is loaded on this page
         // (profile.html is a standalone page, userMenu is only in index.html)
         // — so we update #user-avatar / #user-menu-avatar directly if present
-        const initials = (user.username || '?').substring(0, 2).toUpperCase();
+        const initials = (user.username || user.email || '?').substring(0, 2).toUpperCase();
         const topEl = /** @type {HTMLElement|null} */ (document.getElementById('user-avatar'));
         const dropEl = /** @type {HTMLElement|null} */ (document.getElementById('user-menu-avatar'));
         if (topEl || dropEl) {
@@ -187,7 +187,7 @@ async function _saveImage(image) {
             // Update large avatar immediately
             const raw = localStorage.getItem('oxicloud_user');
             const user = raw ? JSON.parse(raw) : null;
-            const initials = (user?.username || '?').substring(0, 2).toUpperCase();
+            const initials = (user?.username || user?.email || '?').substring(0, 2).toUpperCase();
             _renderAvatar(user?.image, initials);
             _closeEditPanel();
         } else {
@@ -289,9 +289,9 @@ async function init() {
         }
         const user = await resp.json();
 
-        const initials = (user.username || '?').substring(0, 2).toUpperCase();
+        const initials = (user.username || user.email || '?').substring(0, 2).toUpperCase();
         _renderAvatar(user.image, initials);
-        document.getElementById('p-username').textContent = user.username;
+        document.getElementById('p-username').textContent = user.username || user.email || '—';
         document.getElementById('p-email').textContent = user.email || '';
 
         const badge = document.getElementById('p-role-badge');
@@ -314,7 +314,7 @@ async function init() {
             oidcNote?.classList.remove('hidden');
         }
 
-        document.getElementById('p-detail-username').textContent = user.username;
+        document.getElementById('p-detail-username').textContent = user.username || user.email || '—';
         document.getElementById('p-detail-email').textContent = user.email || '—';
         document.getElementById('p-detail-role').textContent = user.role === 'admin' ? i18n.t('profile.role_admin') : i18n.t('profile.role_user');
         document.getElementById('p-detail-login').textContent = timeAgo(user.last_login_at);

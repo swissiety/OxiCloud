@@ -203,7 +203,9 @@ function updateUserMenuData() {
     const storageFill = document.getElementById('user-menu-storage-fill');
     const storageText = document.getElementById('user-menu-storage-text');
 
-    if (userData.username && userData.id) {
+    // Username is optional (PR 16) — gate on `id` only; the avatar
+    // mount needs the UUID, not the handle.
+    if (userData.id) {
         _mountAvatarVignettes(userData.id);
     }
 
@@ -237,8 +239,10 @@ async function fetchAppVersion() {
 function showUserProfileModal() {
     const USER_DATA_KEY = 'oxicloud_user';
     const userData = JSON.parse(localStorage.getItem(USER_DATA_KEY) || '{}');
-    const username = userData.username || 'User';
+    // Username is optional (PR 16); fall back to email so usernameless
+    // recipients (magic-link sign-ins) still get a recognizable label.
     const email = userData.email || '';
+    const username = userData.username || email || 'User';
     const role = userData.role || 'user';
     const initials = username.substring(0, 2).toUpperCase();
     const usedBytes = userData.storage_used_bytes || 0;
