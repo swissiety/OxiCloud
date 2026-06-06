@@ -707,8 +707,14 @@ impl FileReadPort for FileBlobReadRepository {
             return Ok(None);
         }
 
-        // Last segment is the filename, preceding segments are the folder path
-        let filename = segments[segments.len() - 1];
+        // Last segment is the filename, preceding segments are the
+        // folder path. NFC-normalize the filename so a NextCloud
+        // client's NFD-encoded path still hits the NFC row stored
+        // by a web upload — see `normalize_storage_name` for the
+        // full rationale.
+        let filename = crate::domain::services::path_service::normalize_storage_name(
+            segments[segments.len() - 1],
+        );
         let folder_path = segments[..segments.len() - 1].join("/");
 
         let row = if folder_path.is_empty() {

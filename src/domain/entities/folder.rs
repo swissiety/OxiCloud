@@ -1,6 +1,8 @@
 use uuid::Uuid;
 
-use crate::domain::services::path_service::{StoragePath, validate_storage_name};
+use crate::domain::services::path_service::{
+    StoragePath, normalize_storage_name, validate_storage_name,
+};
 
 // Re-export entity errors from the centralized module
 pub use super::entity_errors::{FolderError, FolderResult};
@@ -80,6 +82,7 @@ impl Folder {
         parent_id: Option<String>,
         owner_id: Option<Uuid>,
     ) -> FolderResult<Self> {
+        let name = normalize_storage_name(&name);
         // Validate folder name
         if let Err(reason) = validate_storage_name(&name) {
             return Err(FolderError::InvalidFolderName(format!("{name}: {reason}")));
@@ -171,6 +174,7 @@ impl Folder {
         modified_at: u64,
         tree_modified_at: u64,
     ) -> FolderResult<Self> {
+        let name = normalize_storage_name(&name);
         if let Err(reason) = validate_storage_name(&name) {
             return Err(FolderError::InvalidFolderName(format!("{name}: {reason}")));
         }
@@ -272,10 +276,13 @@ impl Folder {
         let storage_path = StoragePath::from_string(&path);
 
         // Create directly without validation to avoid errors in DTO
-        // conversions. `tree_modified_at` defaults to `modified_at`:
-        // DTO round-trips lose the real rollup signal, so callers
-        // that need a freshly-rolled-up etag must reload from the
+        // conversions. Still NFC-normalize so DTO-reconstructed
+        // entities maintain the storage invariant.
+        // `tree_modified_at` defaults to `modified_at`: DTO
+        // round-trips lose the real rollup signal, so callers that
+        // need a freshly-rolled-up etag must reload from the
         // repository.
+        let name = normalize_storage_name(&name);
         Self {
             id,
             name,
@@ -293,6 +300,7 @@ impl Folder {
 
     /// Creates a new version of the folder with updated name
     pub fn with_name(&self, new_name: String) -> FolderResult<Self> {
+        let new_name = normalize_storage_name(&new_name);
         if let Err(reason) = validate_storage_name(&new_name) {
             return Err(FolderError::InvalidFolderName(format!(
                 "{new_name}: {reason}"

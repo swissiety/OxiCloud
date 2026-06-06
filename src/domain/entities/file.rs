@@ -1,6 +1,8 @@
 use uuid::Uuid;
 
-use crate::domain::services::path_service::{StoragePath, validate_storage_name};
+use crate::domain::services::path_service::{
+    StoragePath, normalize_storage_name, validate_storage_name,
+};
 
 // Re-export entity errors from the centralized module
 pub use super::entity_errors::{FileError, FileResult};
@@ -107,6 +109,7 @@ impl File {
         mime_type: String,
         folder_id: Option<String>,
     ) -> FileResult<Self> {
+        let name = normalize_storage_name(&name);
         if let Err(reason) = validate_storage_name(&name) {
             return Err(FileError::InvalidFileName(format!("{name}: {reason}")));
         }
@@ -143,6 +146,7 @@ impl File {
         created_at: u64,
         modified_at: u64,
     ) -> FileResult<Self> {
+        let name = normalize_storage_name(&name);
         if let Err(reason) = validate_storage_name(&name) {
             return Err(FileError::InvalidFileName(format!("{name}: {reason}")));
         }
@@ -204,6 +208,7 @@ impl File {
         owner_id: Option<Uuid>,
         blob_hash: String,
     ) -> FileResult<Self> {
+        let name = normalize_storage_name(&name);
         if let Err(reason) = validate_storage_name(&name) {
             return Err(FileError::InvalidFileName(format!("{name}: {reason}")));
         }
@@ -345,7 +350,11 @@ impl File {
         // Create storage_path from string
         let storage_path = StoragePath::from_string(&path);
 
-        // Create directly without validation to avoid errors in DTO conversions
+        // Create directly without validation to avoid errors in DTO
+        // conversions. Still NFC-normalize so even DTO-reconstructed
+        // entities maintain the storage invariant.
+        let name = normalize_storage_name(&name);
+
         Self {
             id,
             name,
@@ -365,6 +374,7 @@ impl File {
 
     /// Creates a new version of the file with updated name
     pub fn with_name(&self, new_name: String) -> FileResult<Self> {
+        let new_name = normalize_storage_name(&new_name);
         if let Err(reason) = validate_storage_name(&new_name) {
             return Err(FileError::InvalidFileName(format!("{new_name}: {reason}")));
         }
