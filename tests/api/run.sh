@@ -62,24 +62,39 @@ OXICLOUD_SERVER_PORT=$SERVER_PORT
 OXICLOUD_STORAGE_PATH="$REPO_ROOT/tests/api/storage"
 set +a
 
-# ensure storage is empty before starting
-echo "Wipe $OXICLOUD_STORAGE_PATH to ensure clean startup"
-rm -rf "$OXICLOUD_STORAGE_PATH"
-mkdir -p "$OXICLOUD_STORAGE_PATH"
+# ensure storage is empty before starting (regex-gated rm -rf)
+# shellcheck source=../common/wipe-storage.sh
+source "$COMMON/wipe-storage.sh"
+wipe_storage "$OXICLOUD_STORAGE_PATH"
 
 # ── 3. Start OxiCloud server ──────────────────────────────────────────────────
 
 BUILD_TARGET="${BUILD_TARGET:-debug}"
 OXICLOUD_BIN="$REPO_ROOT/target/$BUILD_TARGET/oxicloud"
 
-if [[ -x "$OXICLOUD_BIN" ]]; then
-  log "Starting pre-built OxiCloud server ($BUILD_TARGET) on port $SERVER_PORT..."
-  "$OXICLOUD_BIN" &
-else
-  log "Building and starting OxiCloud server on port $SERVER_PORT..."
-  cd "$REPO_ROOT"
-  cargo run &
+# Build synchronously (no time cap — clean builds take minutes) BEFORE
+# starting the server, so the `/ready` poll below only times what we
+# actually want it to time: server startup, not compilation. Earlier
+# this ran `cargo run &` directly, which conflated the two and tripped
+# the 120 s readiness timeout on any `cargo clean` run.
+if [[ ! -x "$OXICLOUD_BIN" ]]; then
+  log "Building OxiCloud server ($BUILD_TARGET) — this can take a few minutes after \`cargo clean\`..."
+  # Cargo's debug profile is the implicit default (`cargo build` alone)
+  # — there is NO `--profile debug` flag (it would error). Only the
+  # release path needs an explicit flag.
+  case "$BUILD_TARGET" in
+    debug)   (cd "$REPO_ROOT" && cargo build           2>&1 | tail -n 20) || die "cargo build failed" ;;
+    release) (cd "$REPO_ROOT" && cargo build --release 2>&1 | tail -n 20) || die "cargo build --release failed" ;;
+    *)       die "Unsupported BUILD_TARGET='$BUILD_TARGET' (expected 'debug' or 'release')" ;;
+  esac
 fi
+
+if [[ ! -x "$OXICLOUD_BIN" ]]; then
+  die "Build completed but $OXICLOUD_BIN is missing — wrong BUILD_TARGET?"
+fi
+
+log "Starting OxiCloud server ($BUILD_TARGET) on port $SERVER_PORT..."
+"$OXICLOUD_BIN" &
 SERVER_PID=$!
 log "Waiting for server at $base_url..."
 wait_for_http "$base_url/ready" 120
@@ -100,10 +115,20 @@ fi
 # ── 4. Run Hurl tests ─────────────────────────────────────────────────────────
 
 log "Running Hurl tests..."
+# NC baseline tests (groups A + B + C from BASELINE_TESTS_NC_WEBDAV.md)
+# are interleaved early because they use a separate code surface and
+# their failures should not be masked by later test regressions.
+# The auth-failure / lockout file (group P) runs LAST — it locks out
+# a throwaway username so admin Basic Auth stays usable for everything
+# above it.
 hurl --variables-file "$API_DIR/test.env" --file-root "$REPO_ROOT/tests" --test --jobs 1 \
   "$API_DIR/setup.hurl" \
   "$API_DIR/auth_login.hurl" \
   "$API_DIR/registration.hurl" \
+  "$API_DIR/nc_status_capabilities.hurl" \
+  "$API_DIR/nc_login_flow_v2.hurl" \
+  "$API_DIR/nc_ocs_user_info.hurl" \
+  "$API_DIR/nc_avatar_preview.hurl" \
   "$API_DIR/files-folders.hurl" \
   "$API_DIR/favorites.hurl" \
   "$API_DIR/trash.hurl" \
@@ -117,7 +142,10 @@ hurl --variables-file "$API_DIR/test.env" --file-root "$REPO_ROOT/tests" --test 
   "$API_DIR/subject_groups.hurl" \
   "$API_DIR/grants_nested_groups.hurl" \
   "$API_DIR/external_users.hurl" \
-  "$API_DIR/chunked_upload_cap.hurl"
+  "$API_DIR/nc_second_user_setup.hurl" \
+  "$API_DIR/nc_admin_views_other_user.hurl" \
+  "$API_DIR/chunked_upload_cap.hurl" \
+  "$API_DIR/nc_auth_failures.hurl"
 
 #bash "$API_DIR/dedup_bulk_upload.sh"
 

@@ -218,15 +218,22 @@ jobs:
       - name: Set execute bit on pre-built binary
         run: chmod +x target/release/oxicloud
 
-      - name: Install Hurl and b3sum
+      - name: Install Hurl, b3sum, and xq
         env:
           HURL_MAJOR: "8"
+          # sibprogrammer/xq — standalone Go binary, real XPath via libxml2.
+          # Pinned to match the dev-box version so the test scripts can rely
+          # on syntax stability. Bump in lockstep with the dev install.
+          XQ_VERSION: "1.3.0"
         run: |
           HURL_VERSION=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
             https://api.github.com/repos/Orange-OpenSource/hurl/releases \
             | jq -r "map(select(.tag_name | startswith(\"${HURL_MAJOR}.\"))) | first | .tag_name")
           curl -fLO "https://github.com/Orange-OpenSource/hurl/releases/download/${HURL_VERSION}/hurl_${HURL_VERSION}_amd64.deb"
           sudo apt-get install -y "./hurl_${HURL_VERSION}_amd64.deb" b3sum
+          curl -fLO "https://github.com/sibprogrammer/xq/releases/download/v${XQ_VERSION}/xq_${XQ_VERSION}_linux_amd64.tar.gz"
+          tar -xzf "xq_${XQ_VERSION}_linux_amd64.tar.gz" xq
+          sudo install -m 0755 xq /usr/local/bin/xq
 
       - name: Run Hurl API tests
         run: bash tests/api/run.sh

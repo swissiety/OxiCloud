@@ -62,7 +62,12 @@ OXICLOUD_SERVER_PORT=$SERVER_PORT
 OXICLOUD_STORAGE_PATH="$REPO_ROOT/tests/api/storage"
 set +a
 
-mkdir -p "$OXICLOUD_STORAGE_PATH"
+# ensure storage is empty before starting (regex-gated rm -rf).
+# Previously this script only ran `mkdir -p`, so a standalone webdav run
+# inherited state from a prior api run — now both runners wipe uniformly.
+# shellcheck source=../common/wipe-storage.sh
+source "$COMMON/wipe-storage.sh"
+wipe_storage "$OXICLOUD_STORAGE_PATH"
 
 # ── 3. Start OxiCloud server ──────────────────────────────────────────────────
 
