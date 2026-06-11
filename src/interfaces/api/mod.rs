@@ -81,6 +81,9 @@ use crate::interfaces::api::handlers::file_handler::MoveFilePayload;
         handlers::file_handler::list_files_query,
         handlers::file_handler::upload_file_with_thumbnails,
         handlers::file_handler::create_file_by_hash,
+        handlers::delta_upload_handler::delta_negotiate,
+        handlers::delta_upload_handler::delta_upload_chunks,
+        handlers::delta_upload_handler::delta_commit,
         handlers::file_handler::download_file,
         handlers::file_handler::get_thumbnail,
         handlers::file_handler::upload_thumbnail,
@@ -262,6 +265,13 @@ use crate::interfaces::api::handlers::file_handler::MoveFilePayload;
             ResourceContentDto,
             // File schemas
             FileDto,
+            // Delta-upload schemas
+            crate::application::services::delta_upload_service::ChunkRef,
+            crate::application::services::delta_upload_service::DeltaNegotiateRequest,
+            crate::application::services::delta_upload_service::DeltaNegotiateResponse,
+            crate::application::services::delta_upload_service::DeltaChunksResponse,
+            crate::application::services::delta_upload_service::DeltaCommitRequest,
+            handlers::delta_upload_handler::DeltaStillMissingResponse,
             MoveFilePayload,
             PaginationDto,
             PaginationRequestDto,

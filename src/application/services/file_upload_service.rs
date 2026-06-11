@@ -238,6 +238,71 @@ impl FileUploadService {
         Ok(dto)
     }
 
+    /// Swap an existing file's content to an already-ingested blob — the
+    /// update mode of the delta-upload commit. The caller needs `Write`
+    /// permission on the file; the blob reference is consumed (released on
+    /// failure by the write port, like every other registration path).
+    pub async fn update_file_content_by_id_with_perms(
+        &self,
+        caller_id: Uuid,
+        file_id: &str,
+        blob: StoredBlob,
+    ) -> Result<FileDto, DomainError> {
+        let Some(InstantUploadDeps { authz, .. }) = &self.instant_upload else {
+            return Err(DomainError::internal_error(
+                "FileUpload",
+                "instant upload is not wired (authz/dedup/quota missing)",
+            ));
+        };
+        let Some(file_read) = &self.file_read else {
+            return Err(DomainError::internal_error(
+                "FileUpload",
+                "read port is not wired",
+            ));
+        };
+
+        let file_uuid = Uuid::parse_str(file_id)
+            .map_err(|_| DomainError::not_found("File", file_id.to_string()))?;
+        authz
+            .require(
+                Subject::User(caller_id),
+                Permission::Update,
+                Resource::File(file_uuid),
+            )
+            .await?;
+
+        let file = file_read.get_file(file_id).await?;
+        let (new_hash, updated_at) = self
+            .file_write
+            .update_file_content_with_blob(file_id, &blob.hash, blob.size, None)
+            .await?;
+        // The file maps to a different blob now — stale cached content must
+        // never be served for the rest of its TTI window.
+        if let Some(cc) = &self.content_cache {
+            cc.invalidate(file_id).await;
+        }
+
+        let parts = file.into_parts();
+        let updated = crate::domain::entities::file::File::with_timestamps_and_blob_hash(
+            parts.id,
+            parts.name,
+            parts.storage_path,
+            blob.size,
+            parts.mime_type,
+            parts.folder_id,
+            parts.created_at,
+            updated_at as u64,
+            parts.owner_id,
+            new_hash,
+        )
+        .map_err(|e| DomainError::internal_error("FileUpload", format!("rebuild entity: {e}")))?;
+        let dto = FileDto::from(updated);
+        if let Some(hook) = &self.file_lifecycle_hook {
+            hook.on_file_updated(file_id, &dto.content_hash, &dto.mime_type);
+        }
+        Ok(dto)
+    }
+
     // ── private helpers ──────────────────────────────────────────
 
     /// Optionally update storage usage after a successful upload.

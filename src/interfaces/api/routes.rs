@@ -54,6 +54,9 @@ use crate::interfaces::api::handlers::batch_handler::{self, BatchHandlerState};
 use crate::interfaces::api::handlers::chunked_upload_handler::{
     cancel_upload, complete_upload, create_upload, get_upload_status, upload_chunk,
 };
+use crate::interfaces::api::handlers::delta_upload_handler::{
+    delta_commit, delta_negotiate, delta_upload_chunks,
+};
 use crate::interfaces::api::handlers::file_handler::{
     create_file_by_hash, delete_file, download_file, get_file_metadata, get_thumbnail,
     list_files_query, move_file_simple, rename_file, upload_file_with_thumbnails, upload_thumbnail,
@@ -230,6 +233,9 @@ pub fn create_api_routes(app_state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/", get(list_files_query))
         .route("/upload", post(upload_file_with_thumbnails))
         .route("/by-hash", post(create_file_by_hash))
+        .route("/delta/negotiate", post(delta_negotiate))
+        .route("/delta/chunks", put(delta_upload_chunks))
+        .route("/delta/commit", post(delta_commit))
         .route("/{id}", get(download_file))
         .route(
             "/{id}/thumbnail/{size}",

@@ -461,6 +461,18 @@ impl AppServiceFactory {
             ),
         );
 
+        // Delta-upload protocol — chunk negotiation over the same dedup
+        // store. Bounded by the same whole-file ceiling as byte uploads.
+        let delta_upload_service = Arc::new(
+            crate::application::services::delta_upload_service::DeltaUploadService::new(
+                core.dedup_service.clone(),
+                file_upload_service.clone(),
+                storage_usage.clone(),
+                authz.clone(),
+                self.config.storage.max_upload_size as u64,
+            ),
+        );
+
         let file_retrieval_service = Arc::new(FileRetrievalService::new_with_cache(
             repos.file_read_repository.clone(),
             core.file_content_cache.clone(),
@@ -505,6 +517,7 @@ impl AppServiceFactory {
             // Traits for abstraction
             folder_service,
             file_upload_service,
+            delta_upload_service,
             file_retrieval_service,
             file_management_service,
             file_use_case_factory,
@@ -1040,6 +1053,13 @@ impl AppServiceFactory {
             user_profile_rate_limiter: Arc::new(
                 crate::interfaces::middleware::rate_limit::RateLimiter::new(60, 60, 50_000),
             ),
+            // Delta upload: 240 requests / minute / caller. Generous for a
+            // real client (chunk PUTs carry up to 100 MB each) while
+            // stopping pin/negotiate floods; 50 000 tracked callers bound
+            // the memory like the other limiters.
+            delta_upload_rate_limiter: Arc::new(
+                crate::interfaces::middleware::rate_limit::RateLimiter::new(240, 60, 50_000),
+            ),
             // PR 12 — per-sharer email-invite ceiling: caller_id-keyed.
             // Defends against a compromised account spamming external
             // invites (each invite mints a new external user + email).
@@ -1377,6 +1397,8 @@ pub struct ApplicationServices {
     // Traits for abstraction
     pub folder_service: Arc<FolderService>,
     pub file_upload_service: Arc<FileUploadService>,
+    pub delta_upload_service:
+        Arc<crate::application::services::delta_upload_service::DeltaUploadService>,
     pub file_retrieval_service: Arc<FileRetrievalService>,
     pub file_management_service: Arc<FileManagementService>,
     pub file_use_case_factory: Arc<dyn FileUseCaseFactory>,
@@ -1496,6 +1518,9 @@ pub struct AppState {
     /// authenticated caller covers any legitimate UI rendering while
     /// throttling enumeration.
     pub user_profile_rate_limiter: Arc<crate::interfaces::middleware::rate_limit::RateLimiter>,
+    /// Per-caller flood guard for the delta-upload endpoints
+    /// (negotiate / chunks / commit share one budget).
+    pub delta_upload_rate_limiter: Arc<crate::interfaces::middleware::rate_limit::RateLimiter>,
     /// Per-sharer ceiling on `POST /api/grants` invitations whose
     /// subject is `{ type: "email" }`. 50 per hour keyed on
     /// `caller_id`. Anonymous attackers can't reach this code path

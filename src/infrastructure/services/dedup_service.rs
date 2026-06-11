@@ -65,11 +65,11 @@ use crate::domain::errors::{DomainError, ErrorKind};
 // ── CDC Constants ────────────────────────────────────────────────────────────
 
 /// Minimum CDC chunk size (64 KB).
-const CDC_MIN_CHUNK: usize = 65_536;
+pub const CDC_MIN_CHUNK: usize = 65_536;
 /// Average CDC chunk size (256 KB).
-const CDC_AVG_CHUNK: usize = 262_144;
+pub const CDC_AVG_CHUNK: usize = 262_144;
 /// Maximum CDC chunk size (1 MB).
-const CDC_MAX_CHUNK: usize = 1_048_576;
+pub const CDC_MAX_CHUNK: usize = 1_048_576;
 
 // ── CDC helper types ─────────────────────────────────────────────────────────
 
@@ -402,10 +402,42 @@ impl DedupService {
         S: Stream<Item = Result<Bytes, std::io::Error>> + Send,
     {
         let outcome = self.ingest_chunks_from_stream(source).await?;
+        tracing::debug!(
+            "CDC stream ingested: {} ({} bytes, {} chunks, {} written)",
+            &outcome.file_hash[..12],
+            outcome.total_size,
+            outcome.chunk_hashes.len(),
+            outcome.newly_written,
+        );
         let distinct = outcome.distinct_hashes();
-        let total_size = outcome.total_size;
-        let file_hash = outcome.file_hash.clone();
+        self.attach_manifest(
+            &outcome.file_hash,
+            &outcome.chunk_hashes,
+            &outcome.chunk_sizes,
+            outcome.total_size,
+            content_type,
+            &distinct,
+        )
+        .await
+    }
 
+    /// Attach a manifest to chunk references the caller already holds (one
+    /// per distinct chunk hash) — the shared accounting tail of both
+    /// [`store_from_stream`] and the delta-upload commit.
+    ///
+    /// On a lost insert race or an already-existing manifest, the existing
+    /// manifest's ref_count is bumped FIRST and only then are the held chunk
+    /// references released (`distinct_held`); the reverse order could leave
+    /// the caller's file row without any manifest reference behind it.
+    pub async fn attach_manifest(
+        &self,
+        file_hash: &str,
+        chunk_hashes: &[String],
+        chunk_sizes: &[u64],
+        total_size: u64,
+        content_type: Option<String>,
+        distinct_held: &[String],
+    ) -> Result<DedupResultDto, DomainError> {
         // A bounded retry covers the rare interleaving where the manifest
         // that beat our INSERT is deleted again before our ref bump lands.
         for _ in 0..3 {
@@ -415,17 +447,11 @@ impl DedupService {
                  VALUES ($1, $2, $3, $4, $5, $6, 1)
                  ON CONFLICT (file_hash) DO NOTHING",
             )
-            .bind(&file_hash)
-            .bind(&outcome.chunk_hashes)
-            .bind(
-                outcome
-                    .chunk_sizes
-                    .iter()
-                    .map(|s| *s as i64)
-                    .collect::<Vec<_>>(),
-            )
+            .bind(file_hash)
+            .bind(chunk_hashes)
+            .bind(chunk_sizes.iter().map(|s| *s as i64).collect::<Vec<_>>())
             .bind(total_size as i64)
-            .bind(outcome.chunk_hashes.len() as i32)
+            .bind(chunk_hashes.len() as i32)
             .bind(&content_type)
             .execute(self.pool.as_ref())
             .await
@@ -436,44 +462,251 @@ impl DedupService {
 
             if inserted > 0 {
                 tracing::info!(
-                    "NEW BLOB (CDC stream): {} ({} bytes, {} chunks, {} written)",
+                    "NEW BLOB (CDC): {} ({} bytes, {} chunks)",
                     &file_hash[..12],
                     total_size,
-                    outcome.chunk_hashes.len(),
-                    outcome.newly_written,
+                    chunk_hashes.len(),
                 );
-                self.fire_blob_creation_hooks(&file_hash, content_type.as_deref());
+                self.fire_blob_creation_hooks(file_hash, content_type.as_deref());
                 return Ok(DedupResultDto::NewBlob {
-                    hash: file_hash,
+                    hash: file_hash.to_string(),
                     size: total_size,
                 });
             }
 
             // The manifest already exists — either this exact content was
             // stored before or an identical concurrent upload just won the
-            // race. Bump ITS ref_count first and only then hand back this
-            // session's chunk references; the reverse order could leave the
-            // caller's file row without any manifest reference behind it.
-            if let Some(existing_size) = self.bump_manifest_if_exists(&file_hash).await? {
-                self.release_chunk_refs(self.pool.as_ref(), &distinct).await;
+            // race. Bump ITS ref_count, then hand back the held references.
+            if let Some(existing_size) = self.bump_manifest_if_exists(file_hash).await? {
+                self.release_chunk_refs(self.pool.as_ref(), distinct_held)
+                    .await;
                 tracing::info!(
                     "DEDUP HIT (manifest): {} ({} bytes saved)",
                     &file_hash[..12],
                     existing_size,
                 );
                 return Ok(DedupResultDto::ExistingBlob {
-                    hash: file_hash,
+                    hash: file_hash.to_string(),
                     size: existing_size as u64,
                     saved_bytes: existing_size as u64,
                 });
             }
         }
 
-        self.release_chunk_refs(self.pool.as_ref(), &distinct).await;
+        self.release_chunk_refs(self.pool.as_ref(), distinct_held)
+            .await;
         Err(DomainError::internal_error(
             "Dedup",
             format!("Manifest insert/bump kept racing for {file_hash}"),
         ))
+    }
+
+    // ── Delta-upload primitives ──────────────────────────────────
+    //
+    // The delta protocol ("upload only what changed") lets a client claim
+    // chunks by hash instead of sending their bytes. Two invariants keep
+    // that from becoming a content oracle or a poisoning vector:
+    //
+    // 1. **Ownership**: without bytes, a caller may only claim chunks that
+    //    are already reachable through their own (non-trashed) files, or
+    //    unreferenced orphans (ref_count = 0 — i.e. "I just uploaded it").
+    //    Everything else must be uploaded; the store dedups it on write.
+    // 2. **Verification**: a declared file_hash is never trusted — the
+    //    commit re-reads the proposed chunk sequence server-side and
+    //    recomputes BLAKE3 before any manifest row exists. A forged hash
+    //    would otherwise poison future whole-file dedup hits for OTHER
+    //    users uploading the genuine content.
+
+    /// Of `hashes` (distinct), the subset `caller_id` may claim without
+    /// uploading bytes: chunks referenced by manifests of the caller's
+    /// non-trashed files, or directly referenced as (legacy) whole-file
+    /// blobs. Backed by the GIN index on `chunk_manifests.chunk_hashes`.
+    pub async fn claimable_chunks(
+        &self,
+        caller_id: uuid::Uuid,
+        hashes: &[String],
+    ) -> Result<HashSet<String>, DomainError> {
+        if hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        sqlx::query_scalar::<_, String>(
+            "SELECT c.h FROM UNNEST($1::text[]) AS c(h)
+              WHERE EXISTS (
+                        SELECT 1
+                          FROM storage.files f
+                          JOIN storage.chunk_manifests m ON m.file_hash = f.blob_hash
+                         WHERE f.user_id = $2 AND NOT f.is_trashed
+                           AND m.chunk_hashes @> ARRAY[c.h]
+                    )
+                 OR EXISTS (
+                        SELECT 1 FROM storage.files f2
+                         WHERE f2.user_id = $2 AND NOT f2.is_trashed
+                           AND f2.blob_hash = c.h
+                    )",
+        )
+        .bind(hashes)
+        .bind(caller_id)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map(|rows| rows.into_iter().collect())
+        .map_err(|e| DomainError::internal_error("Dedup", format!("claimable_chunks query: {e}")))
+    }
+
+    /// Pin one reference on each of `hashes` (distinct) that the caller is
+    /// entitled to claim — owned chunks (see [`claimable_chunks`]) or
+    /// unreferenced orphans (`ref_count = 0`, the just-uploaded state).
+    /// One statement: entitlement check and bump are atomic per row, so a
+    /// concurrent last-reference delete can never be resurrected and a
+    /// non-entitled hash is simply not returned.
+    ///
+    /// Returns the set actually pinned; the caller compares against its
+    /// input and reports the difference as `still_missing`.
+    pub async fn pin_claimable_chunks(
+        &self,
+        caller_id: uuid::Uuid,
+        hashes: &[String],
+    ) -> Result<HashSet<String>, DomainError> {
+        if hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        sqlx::query_scalar::<_, String>(
+            "UPDATE storage.blobs b
+                SET ref_count = ref_count + 1
+              WHERE b.hash = ANY($1)
+                AND ( b.ref_count = 0
+                      OR EXISTS (
+                             SELECT 1
+                               FROM storage.files f
+                               JOIN storage.chunk_manifests m ON m.file_hash = f.blob_hash
+                              WHERE f.user_id = $2 AND NOT f.is_trashed
+                                AND m.chunk_hashes @> ARRAY[b.hash::text]
+                         )
+                      OR EXISTS (
+                             SELECT 1 FROM storage.files f2
+                              WHERE f2.user_id = $2 AND NOT f2.is_trashed
+                                AND f2.blob_hash = b.hash
+                         ) )
+              RETURNING b.hash",
+        )
+        .bind(hashes)
+        .bind(caller_id)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map(|rows| rows.into_iter().collect())
+        .map_err(|e| {
+            DomainError::internal_error("Dedup", format!("pin_claimable_chunks query: {e}"))
+        })
+    }
+
+    /// Release one reference per distinct hash — the public counterpart of
+    /// [`pin_claimable_chunks`] for aborted commits. Best-effort.
+    pub async fn release_pinned_chunks(&self, hashes: &[String]) {
+        self.release_chunk_refs(self.pool.as_ref(), hashes).await;
+    }
+
+    /// Store client-provided loose chunks (delta upload, step 2).
+    ///
+    /// Each element of `frames` is one chunk's raw bytes (the wire framing
+    /// is the interface layer's concern). The hash is ALWAYS computed
+    /// server-side — a declared hash is never trusted for content
+    /// addressing. Chunks are written unsynced, made durable with one
+    /// batched sweep, then registered at `ref_count = 0`: unreferenced
+    /// orphans that either get pinned by a following commit or swept by
+    /// the periodic GC if the client never returns. `ON CONFLICT DO
+    /// NOTHING` keeps existing rows' reference counts untouched.
+    ///
+    /// Returns `(hash, size)` per frame, in input order.
+    pub async fn store_loose_chunks<S>(&self, frames: S) -> Result<Vec<(String, u64)>, DomainError>
+    where
+        S: Stream<Item = Result<Bytes, DomainError>> + Send,
+    {
+        futures::pin_mut!(frames);
+
+        let mut received: Vec<(String, u64)> = Vec::new();
+        let mut new_rows: Vec<(String, i64)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        while let Some(frame) = frames.next().await {
+            let data = frame?;
+            if data.len() > CDC_MAX_CHUNK {
+                return Err(DomainError::validation_error(format!(
+                    "Chunk frame of {} bytes exceeds the {CDC_MAX_CHUNK}-byte maximum",
+                    data.len()
+                )));
+            }
+            let hash = blake3::hash(&data).to_hex().to_string();
+            received.push((hash.clone(), data.len() as u64));
+            if seen.insert(hash.clone()) {
+                let len = data.len() as i64;
+                self.backend
+                    .put_blob_from_bytes_unsynced(&hash, data)
+                    .await?;
+                new_rows.push((hash, len));
+            }
+        }
+
+        if !new_rows.is_empty() {
+            // Durability before visibility — same invariant as the ingest
+            // engine: no PG row may ever point at unsynced bytes.
+            let hashes: Vec<String> = new_rows.iter().map(|(h, _)| h.clone()).collect();
+            let sizes: Vec<i64> = new_rows.iter().map(|(_, s)| *s).collect();
+            self.backend.sync_blobs(&hashes).await?;
+            sqlx::query(
+                "INSERT INTO storage.blobs (hash, size, ref_count)
+                 SELECT h, s, 0 FROM UNNEST($1::text[], $2::bigint[]) AS t(h, s)
+                 ON CONFLICT (hash) DO NOTHING",
+            )
+            .bind(&hashes)
+            .bind(&sizes)
+            .execute(self.pool.as_ref())
+            .await
+            .map_err(|e| {
+                DomainError::internal_error("Dedup", format!("Failed to register chunks: {e}"))
+            })?;
+        }
+
+        Ok(received)
+    }
+
+    /// Verification read for the delta commit: stream the proposed chunk
+    /// sequence from the backend, recompute the whole-file BLAKE3 and
+    /// capture the first bytes for MIME sniffing. The caller must hold a
+    /// pin on every chunk (so a concurrent GC cannot pull bytes out from
+    /// under the read). Also validates each chunk's actual size against
+    /// the declared one — the manifest's Range arithmetic depends on it.
+    pub async fn hash_chunk_sequence(
+        &self,
+        chunks: &[(String, u64)],
+        sniff_len: usize,
+    ) -> Result<(String, Vec<u8>), DomainError> {
+        let mut hasher = blake3::Hasher::new();
+        let mut head: Vec<u8> = Vec::with_capacity(sniff_len.min(16 * 1024));
+
+        for (hash, declared_size) in chunks {
+            let mut stream = self.backend.get_blob_stream(hash).await?;
+            let mut actual: u64 = 0;
+            while let Some(part) = stream.next().await {
+                let part = part.map_err(|e| {
+                    DomainError::internal_error(
+                        "Dedup",
+                        format!("Verification read of chunk {hash}: {e}"),
+                    )
+                })?;
+                actual += part.len() as u64;
+                hasher.update(&part);
+                if head.len() < sniff_len {
+                    let take = (sniff_len - head.len()).min(part.len());
+                    head.extend_from_slice(&part[..take]);
+                }
+            }
+            if actual != *declared_size {
+                return Err(DomainError::validation_error(format!(
+                    "Chunk {hash} is {actual} bytes, manifest declares {declared_size}"
+                )));
+            }
+        }
+
+        Ok((hasher.finalize().to_hex().to_string(), head))
     }
 
     /// Bump a manifest's ref_count if it exists; returns its total_size.
@@ -2700,5 +2933,327 @@ mod rechunk_integration_tests {
         assert_eq!(ranged, &data[1_100_000..1_100_064]);
 
         cleanup(&pool, &hash, &files).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Integration tests for the delta-upload primitives — the entitlement and
+// verification rules the chunk-negotiation protocol stands on. Same gating
+// and DB conventions as the re-chunk suite above.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(integration_tests)]
+#[allow(dead_code)]
+mod delta_upload_integration_tests {
+    use super::*;
+    use crate::infrastructure::services::local_blob_backend::LocalBlobBackend;
+    use crate::integration_test_support::{ensure_clean_test_db, test_db_url};
+    use sqlx::Row;
+    use sqlx::postgres::PgPoolOptions;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    async fn test_pool() -> Arc<PgPool> {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&test_db_url())
+            .await
+            .expect("connect to test DB — run tests/common/spawn-db.sh first");
+        ensure_clean_test_db(&pool).await;
+        Arc::new(pool)
+    }
+
+    async fn seed_user(pool: &PgPool) -> Uuid {
+        sqlx::query("SELECT id FROM auth.users LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .map(|r| r.get::<Uuid, _>("id"))
+            .expect("auth.users must be seeded (init-test-schema.sh)")
+    }
+
+    async fn local_svc(pool: &Arc<PgPool>, dir: &TempDir) -> DedupService {
+        let backend = Arc::new(LocalBlobBackend::new(&dir.path().join("blobs")));
+        backend.initialize().await.expect("init backend");
+        DedupService::new(backend, pool.clone(), pool.clone())
+    }
+
+    /// Store `data` through the streaming path and give `user_id` a file
+    /// row referencing it — making its chunks claimable by that user.
+    async fn seed_owned_content(
+        svc: &DedupService,
+        pool: &PgPool,
+        user_id: Uuid,
+        data: &[u8],
+        label: &str,
+    ) -> (String, Vec<String>, Uuid) {
+        let source = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(data))]);
+        let stored = svc
+            .store_from_stream(source, Some("application/octet-stream".into()))
+            .await
+            .expect("store");
+        let file_hash = stored.hash().to_string();
+        let chunks: Vec<String> = sqlx::query_scalar(
+            "SELECT UNNEST(chunk_hashes) FROM storage.chunk_manifests WHERE file_hash = $1",
+        )
+        .bind(&file_hash)
+        .fetch_all(pool)
+        .await
+        .expect("chunks");
+
+        let file_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO storage.files (name, user_id, blob_hash, size)
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!(
+            "rust-test-delta-{label}-{}",
+            &Uuid::new_v4().to_string()[..8]
+        ))
+        .bind(user_id)
+        .bind(&file_hash)
+        .bind(data.len() as i64)
+        .fetch_one(pool)
+        .await
+        .expect("file row");
+        (file_hash, chunks, file_id)
+    }
+
+    async fn blob_ref(pool: &PgPool, hash: &str) -> Option<i32> {
+        sqlx::query_scalar("SELECT ref_count FROM storage.blobs WHERE hash = $1")
+            .bind(hash)
+            .fetch_optional(pool)
+            .await
+            .expect("blob query")
+    }
+
+    async fn cleanup(pool: &PgPool, file_hash: &str, file_id: Uuid, extra_hashes: &[String]) {
+        let chunks: Option<Vec<String>> = sqlx::query_scalar(
+            "SELECT chunk_hashes FROM storage.chunk_manifests WHERE file_hash = $1",
+        )
+        .bind(file_hash)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        let _ = sqlx::query("DELETE FROM storage.files WHERE id = $1")
+            .bind(file_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM storage.chunk_manifests WHERE file_hash = $1")
+            .bind(file_hash)
+            .execute(pool)
+            .await;
+        let mut to_drop = chunks.unwrap_or_default();
+        to_drop.push(file_hash.to_string());
+        to_drop.extend_from_slice(extra_hashes);
+        let _ = sqlx::query("DELETE FROM storage.blobs WHERE hash = ANY($1)")
+            .bind(&to_drop)
+            .execute(pool)
+            .await;
+    }
+
+    fn content(len: usize, salt: u8) -> Vec<u8> {
+        let mut data: Vec<u8> = (0..len)
+            .map(|i| {
+                ((i % 251) as u8)
+                    .wrapping_add(salt)
+                    .wrapping_add((i / 7919) as u8)
+            })
+            .collect();
+        data.extend_from_slice(Uuid::new_v4().as_bytes());
+        data
+    }
+
+    // ── Entitlement: claimable vs pin ────────────────────────────
+    #[tokio::test]
+    async fn claim_and_pin_respect_ownership_and_orphans() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let svc = local_svc(&pool, &dir).await;
+        let user = seed_user(&pool).await;
+
+        // Owned content (multi-chunk), one foreign chunk (ref 1, no file
+        // row for this user), one orphan (ref 0), one unknown hash.
+        let data = content(3 * 1024 * 1024, 21);
+        let (file_hash, owned_chunks, file_id) =
+            seed_owned_content(&svc, &pool, user, &data, "claim").await;
+        assert!(owned_chunks.len() >= 3, "3 MiB must split into ≥3 chunks");
+
+        let foreign = blake3::hash(format!("foreign-{}", Uuid::new_v4()).as_bytes())
+            .to_hex()
+            .to_string();
+        let orphan = blake3::hash(format!("orphan-{}", Uuid::new_v4()).as_bytes())
+            .to_hex()
+            .to_string();
+        sqlx::query(
+            "INSERT INTO storage.blobs (hash, size, ref_count) VALUES ($1, 10, 1), ($2, 10, 0)",
+        )
+        .bind(&foreign)
+        .bind(&orphan)
+        .execute(pool.as_ref())
+        .await
+        .expect("seed foreign+orphan");
+        let unknown = blake3::hash(format!("unknown-{}", Uuid::new_v4()).as_bytes())
+            .to_hex()
+            .to_string();
+
+        let mut probe: Vec<String> = owned_chunks.clone();
+        probe.push(foreign.clone());
+        probe.push(orphan.clone());
+        probe.push(unknown.clone());
+
+        // claimable: only the owned chunks (advisory view — orphans are
+        // intentionally NOT advertised; the commit pin may still take them).
+        let claimable = svc.claimable_chunks(user, &probe).await.expect("claimable");
+        for c in &owned_chunks {
+            assert!(claimable.contains(c), "owned chunk {c} must be claimable");
+        }
+        assert!(
+            !claimable.contains(&foreign),
+            "foreign chunk must not be claimable"
+        );
+        assert!(
+            !claimable.contains(&unknown),
+            "unknown chunk must not be claimable"
+        );
+
+        // pin: owned + orphan succeed; foreign and unknown are refused.
+        let pinned = svc.pin_claimable_chunks(user, &probe).await.expect("pin");
+        for c in &owned_chunks {
+            assert!(pinned.contains(c), "owned chunk {c} must pin");
+        }
+        assert!(
+            pinned.contains(&orphan),
+            "ref-0 orphan must pin (just-uploaded state)"
+        );
+        assert!(
+            !pinned.contains(&foreign),
+            "foreign owned chunk must NOT pin"
+        );
+        assert!(!pinned.contains(&unknown), "unknown hash must NOT pin");
+
+        // Ref counts moved exactly where they should.
+        assert_eq!(blob_ref(&pool, &orphan).await, Some(1), "orphan 0→1");
+        assert_eq!(
+            blob_ref(&pool, &foreign).await,
+            Some(1),
+            "foreign untouched"
+        );
+        assert_eq!(
+            blob_ref(&pool, &owned_chunks[0]).await,
+            Some(2),
+            "owned chunk 1→2 (manifest + pin)"
+        );
+
+        // Release restores the original counts (clamped at 0).
+        let pinned_vec: Vec<String> = pinned.into_iter().collect();
+        svc.release_pinned_chunks(&pinned_vec).await;
+        assert_eq!(blob_ref(&pool, &orphan).await, Some(0));
+        assert_eq!(blob_ref(&pool, &owned_chunks[0]).await, Some(1));
+
+        cleanup(&pool, &file_hash, file_id, &[foreign, orphan]).await;
+    }
+
+    // ── Loose chunk store ────────────────────────────────────────
+    #[tokio::test]
+    async fn loose_chunks_register_as_orphans_without_touching_existing_refs() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let svc = local_svc(&pool, &dir).await;
+        let user = seed_user(&pool).await;
+
+        // An owned chunk that the client redundantly re-uploads.
+        let data = content(100 * 1024, 22);
+        let (file_hash, owned_chunks, file_id) =
+            seed_owned_content(&svc, &pool, user, &data, "loose").await;
+        let owned_chunk_bytes = {
+            let mut stream = svc.read_blob_stream(&file_hash).await.expect("stream");
+            let mut out = Vec::new();
+            while let Some(part) = stream.next().await {
+                out.extend_from_slice(&part.expect("part"));
+            }
+            out
+        };
+
+        let fresh = content(50 * 1024, 23);
+        let frames = stream::iter(vec![
+            Ok::<_, DomainError>(Bytes::from(fresh.clone())),
+            Ok(Bytes::from(fresh.clone())), // duplicate frame
+            Ok(Bytes::from(owned_chunk_bytes.clone())), // already-referenced chunk
+        ]);
+
+        let received = svc.store_loose_chunks(frames).await.expect("store loose");
+        assert_eq!(received.len(), 3, "every frame is answered, in order");
+        assert_eq!(
+            received[0].0, received[1].0,
+            "duplicate frames share a hash"
+        );
+        let fresh_hash = received[0].0.clone();
+
+        assert_eq!(
+            blob_ref(&pool, &fresh_hash).await,
+            Some(0),
+            "fresh chunk lands as an unreferenced orphan"
+        );
+        assert_eq!(
+            blob_ref(&pool, &owned_chunks[0]).await,
+            Some(1),
+            "re-uploading an existing chunk must not disturb its refs"
+        );
+
+        // The orphan's bytes are really there and addressable.
+        assert_eq!(
+            svc.backend().blob_exists(&fresh_hash).await.unwrap(),
+            true,
+            "orphan chunk bytes must exist in the backend"
+        );
+
+        cleanup(&pool, &file_hash, file_id, &[fresh_hash]).await;
+    }
+
+    // ── Verification read ────────────────────────────────────────
+    #[tokio::test]
+    async fn hash_chunk_sequence_recomputes_and_validates_sizes() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let svc = local_svc(&pool, &dir).await;
+        let user = seed_user(&pool).await;
+
+        let data = content(2 * 1024 * 1024 + 137, 24);
+        let (file_hash, _chunks, file_id) =
+            seed_owned_content(&svc, &pool, user, &data, "verify").await;
+
+        let manifest: (Vec<String>, Vec<i64>) = sqlx::query_as(
+            "SELECT chunk_hashes, chunk_sizes FROM storage.chunk_manifests WHERE file_hash = $1",
+        )
+        .bind(&file_hash)
+        .fetch_one(pool.as_ref())
+        .await
+        .expect("manifest");
+        let sequence: Vec<(String, u64)> = manifest
+            .0
+            .iter()
+            .cloned()
+            .zip(manifest.1.iter().map(|s| *s as u64))
+            .collect();
+
+        let (computed, head) = svc
+            .hash_chunk_sequence(&sequence, 16)
+            .await
+            .expect("verification read");
+        assert_eq!(computed, file_hash, "recomputed hash must match");
+        assert_eq!(
+            &head[..],
+            &data[..16],
+            "sniff head must be the file's first bytes"
+        );
+
+        // A wrong declared size must be rejected — Range arithmetic
+        // depends on manifest sizes being true.
+        let mut lying = sequence.clone();
+        lying[0].1 += 1;
+        assert!(
+            svc.hash_chunk_sequence(&lying, 0).await.is_err(),
+            "size lie must fail verification"
+        );
+
+        cleanup(&pool, &file_hash, file_id, &[]).await;
     }
 }
