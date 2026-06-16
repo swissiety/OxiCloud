@@ -863,6 +863,19 @@ async fn handle_move(
         .ok_or_else(|| AppError::bad_request("Missing Destination header"))?
         .to_string();
 
+    // RFC 4918 §9.9.3: the `Overwrite` header has the default value `T`.
+    // `F` MUST cause the request to fail with 412 when the destination
+    // already exists; `T` (or absent) MUST replace the destination as if
+    // it didn't exist (the response then drops from 201 Created to 204
+    // No Content per §9.9.4 because the URI's resource was replaced
+    // rather than newly created).
+    let overwrite_forbidden = req
+        .headers()
+        .get("overwrite")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("F"))
+        .unwrap_or(false);
+
     // Parse destination path: extract subpath after /remote.php/dav/files/{user}/
     let dest_subpath = extract_nc_subpath_from_dest(&destination, &user.username)
         .ok_or_else(|| AppError::bad_request("Invalid Destination URL"))?;
@@ -871,6 +884,58 @@ async fn handle_move(
     let folder_service = &state.applications.folder_service;
     let file_service = &state.applications.file_retrieval_service;
     let file_mgmt = &state.applications.file_management_service;
+
+    // ── Destination-collision precondition (RFC 4918 §9.9.4) ──────────
+    // Resolved once up-front so the file/folder branches below don't
+    // each have to repeat the check. `dest_existed_before` becomes the
+    // 204-vs-201 selector at response time.
+    let dest_internal_precheck = nc_to_internal_path(&user.username, &dest_subpath)?;
+    let dest_existing_file = file_service
+        .get_file_by_path(&dest_internal_precheck)
+        .await
+        .ok();
+    let dest_existing_folder = folder_service
+        .get_folder_by_path(&dest_internal_precheck)
+        .await
+        .ok();
+    let dest_existed_before = dest_existing_file.is_some() || dest_existing_folder.is_some();
+
+    if dest_existed_before {
+        if overwrite_forbidden {
+            return Ok(Response::builder()
+                .status(StatusCode::PRECONDITION_FAILED)
+                .body(Body::empty())
+                .unwrap());
+        }
+        // Overwrite: T (or absent) → delete the existing destination first,
+        // then proceed with the move. Trashing is fine: per RFC the source
+        // resource appears at the destination URI; what happens to the
+        // overwritten one is up to the server.
+        if let Some(existing_file) = &dest_existing_file {
+            file_mgmt
+                .delete_and_cleanup_with_perms(&existing_file.id, user.id)
+                .await
+                .map_err(|e| {
+                    AppError::internal_error(format!("Failed to overwrite destination file: {}", e))
+                })?;
+        } else if let Some(existing_folder) = &dest_existing_folder {
+            folder_service
+                .delete_folder_with_perms(&existing_folder.id, user.id)
+                .await
+                .map_err(|e| {
+                    AppError::internal_error(format!(
+                        "Failed to overwrite destination folder: {}",
+                        e
+                    ))
+                })?;
+        }
+    }
+
+    let final_status = if dest_existed_before {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::CREATED
+    };
 
     // Try as file first.
     if let Ok(file) = file_service.get_file_by_path(&src_internal).await {
@@ -915,7 +980,7 @@ async fn handle_move(
 
         // Return ETag and OC-ETag so Nextcloud clients can track the moved file.
         let dest_internal = nc_to_internal_path(&user.username, &dest_subpath)?;
-        let mut builder = Response::builder().status(StatusCode::CREATED);
+        let mut builder = Response::builder().status(final_status);
         if let Ok(moved) = file_service.get_file_by_path(&dest_internal).await {
             // Route through `FileDto::etag` so the MOVE response
             // matches what a subsequent PROPFIND on the destination
@@ -991,7 +1056,7 @@ async fn handle_move(
         }
 
         return Ok(Response::builder()
-            .status(StatusCode::CREATED)
+            .status(final_status)
             .body(Body::empty())
             .unwrap());
     }

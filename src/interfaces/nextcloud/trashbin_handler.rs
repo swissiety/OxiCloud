@@ -108,15 +108,40 @@ async fn handle_restore(
         .as_ref()
         .ok_or_else(|| AppError::internal_error("Trash service not available"))?;
 
-    trash_svc
-        .restore_item(&id, user.id)
-        .await
-        .map_err(|e| AppError::internal_error(format!("Failed to restore item: {}", e)))?;
-
-    Ok(Response::builder()
-        .status(StatusCode::CREATED)
-        .body(Body::empty())
-        .unwrap())
+    match trash_svc.restore_item(&id, user.id).await {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::CREATED)
+            .body(Body::empty())
+            .unwrap()),
+        Err(e) => {
+            // Collision at the original path — a live file/folder is sitting
+            // where the trashed one wants to come back to. Mirrors the G4/G5
+            // semantics in webdav_handler::handle_move ("Overwrite: F to an
+            // existing path → 412"); restore has no Overwrite header so the
+            // refusal is unconditional. The caller can resolve by renaming
+            // or trashing the conflicting live resource first.
+            //
+            // We string-match for the unique-index / duplicate-key signature
+            // because restore_item currently re-wraps every storage error as
+            // InternalError, so the original DomainError::AlreadyExists kind
+            // is not propagated. A follow-up should thread the kind through
+            // and let this be a kind-based check.
+            let msg = format!("{}", e);
+            if msg.contains("duplicate key")
+                || msg.contains("unique constraint")
+                || msg.to_ascii_lowercase().contains("already exists")
+            {
+                return Ok(Response::builder()
+                    .status(StatusCode::PRECONDITION_FAILED)
+                    .body(Body::empty())
+                    .unwrap());
+            }
+            Err(AppError::internal_error(format!(
+                "Failed to restore item: {}",
+                e
+            )))
+        }
+    }
 }
 
 // ──────────────────── DELETE (empty trash) ────────────────────
