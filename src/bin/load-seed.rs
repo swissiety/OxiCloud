@@ -255,25 +255,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     println!("[load-seed] inserting grants…");
-    // Grant the grantee read on shared_subtree.root.
+    // Grant the grantee the viewer role on shared_subtree.root — the read
+    // bundle the share_cascade_rebac scenario exercises.
     insert_grant(
         &pool,
         "user",
         grantee.id,
         "folder",
         shared_subtree.root,
-        "read",
+        "viewer",
         admin.id,
     )
     .await?;
-    // Grant the outermost group read on group_subtree.root.
+    // Grant the outermost group the viewer role on group_subtree.root.
     insert_grant(
         &pool,
         "group",
         nested_groups.root,
         "folder",
         group_subtree.root,
-        "read",
+        "viewer",
         admin.id,
     )
     .await?;
@@ -711,20 +712,29 @@ async fn insert_grant(
     subject_id: Uuid,
     resource_type: &str,
     resource_id: Uuid,
-    permission: &str,
+    role: &str,
     granted_by: Uuid,
 ) -> Result<(), sqlx::Error> {
+    // D-Prep replaced `storage.access_grants` (one row per Permission) with
+    // `storage.role_grants` (one row per role assignment; the role expands to
+    // a permission bundle in-code at engine read time). The seeder now writes
+    // role names ('viewer'/'editor'/etc.) instead of individual permissions.
+    //
+    // The `role` column was promoted from TEXT to the `storage.grant_role`
+    // enum by migration 20260801000000_role_grants_enum, so the cast on $5
+    // is required — sqlx binds Rust &str as TEXT, which postgres won't
+    // implicitly coerce into the enum.
     sqlx::query(
-        "INSERT INTO storage.access_grants
-            (subject_type, subject_id, resource_type, resource_id, permission, granted_by)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (subject_type, subject_id, resource_type, resource_id, permission) DO NOTHING",
+        "INSERT INTO storage.role_grants
+            (subject_type, subject_id, resource_type, resource_id, role, granted_by)
+         VALUES ($1, $2, $3, $4, $5::storage.grant_role, $6)
+         ON CONFLICT (subject_type, subject_id, resource_type, resource_id) DO NOTHING",
     )
     .bind(subject_type)
     .bind(subject_id)
     .bind(resource_type)
     .bind(resource_id)
-    .bind(permission)
+    .bind(role)
     .bind(granted_by)
     .execute(pool)
     .await?;
