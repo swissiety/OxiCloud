@@ -16,6 +16,7 @@ pub mod grant_handler;
 pub mod i18n_handler;
 pub mod magic_link_handler;
 pub mod music_handler;
+pub mod people_handler;
 pub mod photos_handler;
 pub mod recent_handler;
 pub mod search_handler;

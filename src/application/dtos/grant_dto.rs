@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::application::dtos::cursor::{CursorListResponse, CursorQuery, PageCursor};
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
-use crate::domain::services::authorization::{Grant, Permission, Resource, Subject};
+use crate::domain::services::authorization::{Grant, Permission, Resource, Role, Subject};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Subject / Resource / Permission DTOs
@@ -95,6 +95,7 @@ pub enum PermissionDto {
     Comment,
     Delete,
     Update,
+    Manage,
 }
 
 impl From<PermissionDto> for Permission {
@@ -106,6 +107,7 @@ impl From<PermissionDto> for Permission {
             PermissionDto::Comment => Permission::Comment,
             PermissionDto::Delete => Permission::Delete,
             PermissionDto::Update => Permission::Update,
+            PermissionDto::Manage => Permission::Manage,
         }
     }
 }
@@ -119,57 +121,58 @@ impl From<Permission> for PermissionDto {
             Permission::Comment => PermissionDto::Comment,
             Permission::Delete => PermissionDto::Delete,
             Permission::Update => PermissionDto::Update,
+            Permission::Manage => PermissionDto::Manage,
         }
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Roles (DTO-layer sugar)
+// Roles — the load-bearing model for ReBAC grants
 // ════════════════════════════════════════════════════════════════════════════
+//
+// One row per role assignment in `storage.role_grants.role` (a
+// `storage.grant_role` ENUM). The engine expands the bundle at query time
+// via `Role::expand()` on the domain enum. Adding a role is two edits:
+// the variant + match arm on `Role`, and an `ALTER TYPE
+// storage.grant_role ADD VALUE 'name'` migration.
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+/// Wire-format wrapper around the domain `Role` enum. Carries the
+/// serde/utoipa derives. Maps 1:1 to/from `Role` via `From`.
+///
+/// The historical `"admin"` alias for `Owner` (used during the D-Prep
+/// dual-write window for cached clients) has been retired in the cleanup
+/// PR — the OxiCloud UI emits `"owner"` exclusively. Stragglers receive
+/// a 422 on POST/PUT, which surfaces the upgrade cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
-pub enum Role {
+pub enum RoleDto {
     Viewer,
-    //Commenter,
+    Commenter,
+    Contributor,
     Editor,
-    //Manager,
-    Admin,
+    Owner,
 }
 
-impl Role {
-    /// Expands a role into its constituent raw permissions. Storage and
-    /// engine know nothing about roles — the server normalizes here before
-    /// writing rows.
-    pub fn expand(self) -> &'static [Permission] {
-        match self {
-            Role::Viewer => &[Permission::Read],
-            /* reserved for future
-            Role::Commenter => &[Permission::Read, Permission::Comment],
-            */
-            Role::Editor => &[
-                Permission::Read,
-                Permission::Comment,
-                Permission::Create,
-                Permission::Update,
-            ],
-            /* reserved for future
-            Role::Manager => &[
-                Permission::Read,
-                Permission::Comment,
-                Permission::Create,
-                Permission::Update,
-                Permission::Share,
-            ],
-            */
-            Role::Admin => &[
-                Permission::Read,
-                Permission::Comment,
-                Permission::Create,
-                Permission::Update,
-                Permission::Share,
-                Permission::Delete,
-            ],
+impl From<RoleDto> for Role {
+    fn from(r: RoleDto) -> Self {
+        match r {
+            RoleDto::Viewer => Role::Viewer,
+            RoleDto::Commenter => Role::Commenter,
+            RoleDto::Contributor => Role::Contributor,
+            RoleDto::Editor => Role::Editor,
+            RoleDto::Owner => Role::Owner,
+        }
+    }
+}
+
+impl From<Role> for RoleDto {
+    fn from(r: Role) -> Self {
+        match r {
+            Role::Viewer => RoleDto::Viewer,
+            Role::Commenter => RoleDto::Commenter,
+            Role::Contributor => RoleDto::Contributor,
+            Role::Editor => RoleDto::Editor,
+            Role::Owner => RoleDto::Owner,
         }
     }
 }
@@ -206,17 +209,18 @@ pub enum SubjectInputDto {
     },
 }
 
-/// `POST /api/grants` — accepts either `permissions` (explicit) or `role`.
-/// Server-side validation requires exactly one of the two to be present.
+/// `POST /api/grants` — create or refresh a role assignment.
+///
+/// Strictly role-keyed since the cleanup PR: callers send exactly one
+/// role; the engine writes a single row in `storage.role_grants`. The
+/// historical per-permission shape (`permissions: [...]`) was dropped —
+/// the OxiCloud UI is the only known caller and it already sends `role`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateGrantDto {
     pub subject: SubjectInputDto,
     pub resource: ResourceDto,
-    #[serde(default)]
-    pub permissions: Option<Vec<PermissionDto>>,
-    #[serde(default)]
-    pub role: Option<Role>,
-    /// Optional expiry for every grant in this request. RFC 3339 / ISO 8601.
+    pub role: RoleDto,
+    /// Optional expiry for the grant. RFC 3339 / ISO 8601.
     #[serde(default)]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -226,7 +230,7 @@ pub struct CreateGrantDto {
 pub struct UpdateRoleDto {
     pub subject: SubjectDto,
     pub resource: ResourceDto,
-    pub role: Role,
+    pub role: RoleDto,
     /// Optional expiry applied to every grant written or updated by this call.
     #[serde(default)]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -241,7 +245,10 @@ pub struct GrantDto {
     pub id: Uuid,
     pub subject: SubjectDto,
     pub resource: ResourceDto,
-    pub permission: PermissionDto,
+    /// Role-keyed since D-Prep cleanup — one row in `storage.role_grants`
+    /// is one `GrantDto`. The bundle of underlying permissions is implied
+    /// by the role and recomputed client-side from the same lookup table.
+    pub role: RoleDto,
     pub granted_by: Uuid,
     pub granted_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,7 +261,7 @@ impl From<Grant> for GrantDto {
             id: g.id,
             subject: g.subject.into(),
             resource: g.resource.into(),
-            permission: g.permission.into(),
+            role: g.role.into(),
             granted_by: g.granted_by,
             granted_at: g.granted_at,
             expires_at: g.expires_at,
@@ -430,12 +437,34 @@ pub struct SharedWithMeItemDto {
 }
 
 /// Derive the closest-matching role label from a set of permissions.
-/// Maps the permission set to `"admin"`, `"editor"`, or `"viewer"`.
+///
+/// **Legacy helper for the dual-write window.** Once D-Prep ships and the
+/// engine reads `role_grants.role` directly, this function becomes unused
+/// and is dropped in the cleanup PR. Kept here so callers that still hit
+/// `access_grants` and reconstruct a role for display can stay working
+/// during the transition.
+///
+/// Emits the new five-role roster on output (`"viewer"` / `"commenter"` /
+/// `"contributor"` / `"editor"` / `"owner"`). Note this is **lossy** for
+/// permission sets that don't match a bundle exactly — but D-Prep's
+/// pre-flight refuses to migrate any such cluster, so post-migration data
+/// only contains bundle-shaped sets.
 pub fn role_from_permissions(perms: &[Permission]) -> &'static str {
-    if perms.contains(&Permission::Delete) && perms.contains(&Permission::Share) {
-        "admin"
-    } else if perms.contains(&Permission::Create) || perms.contains(&Permission::Update) {
+    let has_read = perms.contains(&Permission::Read);
+    let has_comment = perms.contains(&Permission::Comment);
+    let has_create = perms.contains(&Permission::Create);
+    let has_update = perms.contains(&Permission::Update);
+    let has_delete = perms.contains(&Permission::Delete);
+    let has_share = perms.contains(&Permission::Share);
+
+    if has_delete && has_share {
+        "owner"
+    } else if has_create && has_update {
         "editor"
+    } else if has_read && has_create && !has_update {
+        "contributor"
+    } else if has_read && has_comment && !has_create && !has_update {
+        "commenter"
     } else {
         "viewer"
     }
@@ -457,7 +486,12 @@ pub struct OutgoingResourceGrantDto {
     pub subject_id: Uuid,
     /// Human-readable label (username for users, share name for tokens).
     pub subject_display: String,
-    /// Derived role label: `"viewer"` | `"editor"` | `"admin"`.
+    /// Role label: `"viewer"` | `"commenter"` | `"contributor"` | `"editor"`
+    /// | `"owner"`. Emitted by `role_from_permissions()` during the dual-write
+    /// window; once D-Prep cleanup lands this is read directly from
+    /// `storage.role_grants.role`. The legacy `"admin"` spelling is no longer
+    /// emitted — clients that cached it must accept `"owner"` too (the API
+    /// `Role::parse` still accepts `"admin"` on input for one release).
     pub role: String,
     pub granted_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]

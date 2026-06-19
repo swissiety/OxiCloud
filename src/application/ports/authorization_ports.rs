@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::common::errors::DomainError;
 use crate::domain::services::authorization::{
     Grant, GrantCursor, IncomingGrantSummary, OutgoingResourceSummary, Permission, Resource,
-    ResourceKind, Subject,
+    ResourceKind, Role, Subject,
 };
 
 pub trait AuthorizationEngine: Send + Sync + 'static {
@@ -90,11 +90,7 @@ pub trait AuthorizationEngine: Send + Sync + 'static {
 
     /// Resources explicitly granted to `subject`. Direct grants only — no
     /// cascade expansion. Used by `GET /api/grants/incoming`.
-    async fn list_incoming_grants(
-        &self,
-        subject: Subject,
-        permission_filter: Option<Permission>,
-    ) -> Result<Vec<Grant>, DomainError>;
+    async fn list_incoming_grants(&self, subject: Subject) -> Result<Vec<Grant>, DomainError>;
 
     /// Cursor-paginated list of resources explicitly granted to `subject`,
     /// optionally filtered by resource kind. Multiple permission rows for the
@@ -139,38 +135,20 @@ pub trait AuthorizationEngine: Send + Sync + 'static {
         reverse: bool,
     ) -> Result<(Vec<OutgoingResourceSummary>, Option<GrantCursor>), DomainError>;
 
-    /// Create a grant. Idempotent — duplicates are absorbed by the UNIQUE
-    /// constraint; if the row already exists its `expires_at` is updated.
-    async fn grant(
-        &self,
-        granted_by: Uuid,
-        subject: Subject,
-        permission: Permission,
-        resource: Resource,
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Grant, DomainError>;
-
-    /// Update `expires_at` on every grant row for the given subject.
-    /// Used when a share's expiry is changed — one call updates all
-    /// permission rows for that token in a single UPDATE.
+    /// Update `expires_at` for every role grant belonging to `subject`.
+    /// Used by `share_service` when a token-share's expiry is refreshed —
+    /// the subject (token) maps to a small fixed set of role grants, so a
+    /// single UPDATE covers them. Resource-scoped expiry changes go through
+    /// `set_role` (which carries `expires_at` as part of its UPSERT).
     async fn set_expiry_for_subject(
         &self,
         subject: Subject,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), DomainError>;
 
-    /// Update `expires_at` on every grant row for the given `(subject, resource)`
-    /// pair. Used by `set_role` to sync the expiry of retained grants when the
-    /// caller changes expiry without changing permissions.
-    async fn set_expiry_on_resource(
-        &self,
-        subject: Subject,
-        resource: Resource,
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<(), DomainError>;
-
-    /// Revoke a specific grant by its UUID. Returns `Ok(())` whether or not
-    /// the row existed (idempotent revoke).
+    /// Revoke a single role grant by its UUID. Idempotent — returns `Ok(())`
+    /// whether or not the row existed. The id comes from a prior listing
+    /// or `find_grant_full_by_id` lookup.
     async fn revoke(&self, grant_id: Uuid) -> Result<(), DomainError>;
 
     /// Removes every grant whose `resource` matches. Called by lifecycle
@@ -181,4 +159,30 @@ pub trait AuthorizationEngine: Send + Sync + 'static {
     /// Removes every grant whose `subject` matches. Called when a user/token
     /// /group is deleted. Returns the count of rows removed.
     async fn revoke_all_for_subject(&self, subject: Subject) -> Result<usize, DomainError>;
+
+    // ── Role-keyed grant operations ────────────────────────────────────────
+    // These are the only grant write path. Lifecycle hook bulk-deletes
+    // (`revoke_all_for_*` above) wipe matching rows directly, so callers
+    // using those paths don't need to invoke `clear_role` separately.
+
+    /// Set the role for a `(subject, resource)` pair. Idempotent via the
+    /// UNIQUE `(subject_type, subject_id, resource_type, resource_id)`
+    /// constraint — `ON CONFLICT` updates the role + expires_at if they
+    /// changed, which is exactly the right semantics for an atomic role
+    /// change (e.g. promoting Viewer → Editor in one UPDATE with no race
+    /// window, no DELETE+INSERT).
+    async fn set_role(
+        &self,
+        granted_by: Uuid,
+        subject: Subject,
+        role: Role,
+        resource: Resource,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Grant, DomainError>;
+
+    /// Remove the role for a `(subject, resource)` pair. Idempotent —
+    /// succeeds whether or not the row existed. Called after `revoke`
+    /// succeeds to keep the two tables in sync during dual-write; after
+    /// cleanup this is the canonical role-revocation entry point.
+    async fn clear_role(&self, subject: Subject, resource: Resource) -> Result<(), DomainError>;
 }

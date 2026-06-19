@@ -161,7 +161,9 @@ impl IngestGuard {
     ) {
         if !pinned.is_empty()
             && let Err(e) = sqlx::query(
-                "UPDATE storage.blobs SET ref_count = GREATEST(ref_count - 1, 0)
+                "UPDATE storage.blobs
+                    SET ref_count   = GREATEST(ref_count - 1, 0),
+                        orphaned_at = CASE WHEN GREATEST(ref_count - 1, 0) = 0 THEN now() ELSE orphaned_at END
                   WHERE hash = ANY($1)",
             )
             .bind(&pinned)
@@ -190,8 +192,8 @@ impl IngestGuard {
             );
         }
         if let Err(e) = sqlx::query(
-            "INSERT INTO storage.blobs (hash, size, ref_count)
-             SELECT h, s, 0 FROM UNNEST($1::text[], $2::bigint[]) AS t(h, s)
+            "INSERT INTO storage.blobs (hash, size, ref_count, orphaned_at)
+             SELECT h, s, 0, now() FROM UNNEST($1::text[], $2::bigint[]) AS t(h, s)
              ON CONFLICT (hash) DO NOTHING",
         )
         .bind(&hashes)
@@ -379,6 +381,16 @@ impl DedupService {
     /// with the ≤ 1 MiB chunk in flight this bounds peak RAM per upload to
     /// ~9 MiB regardless of file size.
     const FLUSH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Grace period (seconds) a blob must stay orphaned (`ref_count = 0`)
+    /// before [`garbage_collect`](Self::garbage_collect) may physically delete
+    /// it. Mirrors git's `gc.pruneExpire`: content that became unreferenced
+    /// only moments ago is never reaped, so a concurrent uploader about to pin
+    /// a just-orphaned chunk — or a delta-upload client that registered loose
+    /// chunks at `ref_count = 0` and is about to commit their manifest — cannot
+    /// race the sweep. Must comfortably exceed the longest plausible gap
+    /// between registering a chunk and referencing it (any in-flight upload).
+    const GC_ORPHAN_GRACE_SECS: i64 = 60 * 60; // 1 hour
 
     /// Store content with CDC deduplication, straight from a byte stream —
     /// the single write path for every upload surface (REST multipart,
@@ -738,8 +750,8 @@ impl DedupService {
             let sizes: Vec<i64> = new_rows.iter().map(|(_, s)| *s).collect();
             self.backend.sync_blobs(&hashes).await?;
             sqlx::query(
-                "INSERT INTO storage.blobs (hash, size, ref_count)
-                 SELECT h, s, 0 FROM UNNEST($1::text[], $2::bigint[]) AS t(h, s)
+                "INSERT INTO storage.blobs (hash, size, ref_count, orphaned_at)
+                 SELECT h, s, 0, now() FROM UNNEST($1::text[], $2::bigint[]) AS t(h, s)
                  ON CONFLICT (hash) DO NOTHING",
             )
             .bind(&hashes)
@@ -923,7 +935,7 @@ impl DedupService {
                 "INSERT INTO storage.blobs (hash, size, ref_count)
                  SELECT h, s, 1 FROM UNNEST($1::text[], $2::bigint[]) AS t(h, s)
                  ON CONFLICT (hash) DO UPDATE
-                   SET ref_count = storage.blobs.ref_count + 1",
+                   SET ref_count = storage.blobs.ref_count + 1, orphaned_at = NULL",
             )
             .bind(&new_hashes)
             .bind(&new_sizes)
@@ -971,7 +983,7 @@ impl DedupService {
         // session's reference NOW; hashes not returned don't exist and are
         // ours to write.
         let pinned: HashSet<String> = sqlx::query_scalar::<_, String>(
-            "UPDATE storage.blobs SET ref_count = ref_count + 1
+            "UPDATE storage.blobs SET ref_count = ref_count + 1, orphaned_at = NULL
               WHERE hash = ANY($1)
               RETURNING hash",
         )
@@ -1123,7 +1135,9 @@ impl DedupService {
 
         // Legacy blob
         let rows_affected =
-            sqlx::query("UPDATE storage.blobs SET ref_count = ref_count + 1 WHERE hash = $1")
+            sqlx::query(
+                "UPDATE storage.blobs SET ref_count = ref_count + 1, orphaned_at = NULL WHERE hash = $1",
+            )
                 .bind(hash)
                 .execute(self.pool.as_ref())
                 .await
@@ -1150,9 +1164,13 @@ impl DedupService {
     ///
     /// For CDC manifests: decrements manifest ref_count.  When it reaches 0
     /// the manifest is deleted and all chunk ref_counts are decremented;
-    /// chunks that reach 0 are deleted from both PG and the blob backend.
+    /// chunks that reach 0 are left for [`garbage_collect`](Self::garbage_collect)
+    /// to reclaim once they have been orphaned past the grace window — unlinking
+    /// them here would race a concurrent upload re-referencing the same chunk.
     ///
-    /// For legacy blobs: uses a single TX with `SELECT … FOR UPDATE`.
+    /// For legacy blobs: uses a single TX with `SELECT … FOR UPDATE`. A legacy
+    /// whole-file hash can never be re-created by an ingest (uploads are always
+    /// CDC now), so its file is unlinked eagerly — there is no writer to race.
     pub async fn remove_reference(&self, hash: &str) -> Result<bool, DomainError> {
         // ── CDC manifest path ────────────────────────────────────
         let manifest = sqlx::query_as::<_, (i32, Vec<String>)>(
@@ -1173,7 +1191,12 @@ impl DedupService {
         self.remove_legacy_reference(hash).await
     }
 
-    /// Remove a manifest reference.  Handles chunk cleanup when last ref is removed.
+    /// Remove a manifest reference.  When the last reference is removed the
+    /// manifest is deleted and its chunks are dereferenced, but the chunk files
+    /// are NOT unlinked here: a chunk hash can be re-uploaded concurrently, so
+    /// unlinking right after the commit would race that re-reference (the same
+    /// TOCTOU the GC grace window guards). Newly-orphaned chunks are stamped and
+    /// reclaimed by [`garbage_collect`](Self::garbage_collect).
     async fn remove_manifest_reference(
         &self,
         file_hash: &str,
@@ -1199,7 +1222,7 @@ impl DedupService {
         };
 
         if current_rc <= 1 {
-            // Last reference — delete manifest and decrement chunks
+            // Last reference — delete the manifest and dereference its chunks.
             sqlx::query("DELETE FROM storage.chunk_manifests WHERE file_hash = $1")
                 .bind(file_hash)
                 .execute(&mut *tx)
@@ -1208,45 +1231,36 @@ impl DedupService {
                     DomainError::internal_error("Dedup", format!("Delete manifest: {}", e))
                 })?;
 
-            // Batch decrement chunk ref_counts
-            sqlx::query("UPDATE storage.blobs SET ref_count = ref_count - 1 WHERE hash = ANY($1)")
-                .bind(chunk_hashes)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    DomainError::internal_error("Dedup", format!("Decrement chunks: {}", e))
-                })?;
-
-            // Find chunks that reached 0
-            let zero_chunks: Vec<String> = sqlx::query_scalar(
-                "DELETE FROM storage.blobs WHERE hash = ANY($1) AND ref_count <= 0 RETURNING hash",
+            // Decrement chunk ref_counts and stamp orphaned_at on the ones that
+            // reach 0. We deliberately do NOT delete the chunk rows or unlink
+            // their files here: a chunk hash can be re-uploaded concurrently, so
+            // unlinking right after this commit would race that re-reference
+            // (the TOCTOU the grace window guards). garbage_collect() reclaims
+            // them safely once orphaned past the grace window. GREATEST clamps
+            // the single-chunk case where the PG file-delete trigger already
+            // decremented the row (file_hash == chunk_hash).
+            sqlx::query(
+                "UPDATE storage.blobs
+                    SET ref_count   = GREATEST(ref_count - 1, 0),
+                        orphaned_at = CASE WHEN GREATEST(ref_count - 1, 0) = 0 THEN now() ELSE orphaned_at END
+                  WHERE hash = ANY($1)",
             )
             .bind(chunk_hashes)
-            .fetch_all(&mut *tx)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                DomainError::internal_error("Dedup", format!("Delete zero chunks: {}", e))
-            })?;
+            .map_err(|e| DomainError::internal_error("Dedup", format!("Decrement chunks: {}", e)))?;
 
             tx.commit()
                 .await
                 .map_err(|e| DomainError::internal_error("Dedup", format!("Commit: {}", e)))?;
 
-            // Delete blob files AFTER commit
-            for chunk_hash in &zero_chunks {
-                if let Err(e) = self.backend.delete_blob(chunk_hash).await {
-                    tracing::warn!("Failed to delete chunk blob {}: {}", chunk_hash, e);
-                }
-            }
-
-            // Bug 4 fix: notify hooks — e.g. thumbnail cleanup keyed by file_hash
+            // File content is gone — drop its blob-keyed thumbnails now.
             self.fire_blob_hooks(file_hash);
 
             tracing::info!(
-                "MANIFEST DELETED: {} ({} chunks, {} orphan chunks removed)",
+                "MANIFEST DELETED: {} ({} chunks dereferenced; orphans reclaimed by GC)",
                 &file_hash[..12],
-                chunk_hashes.len(),
-                zero_chunks.len()
+                chunk_hashes.len()
             );
             Ok(true)
         } else {
@@ -1810,9 +1824,13 @@ impl DedupService {
 
     /// Garbage collect orphaned manifests and blobs.
     ///
-    /// Phase 1: Delete manifests with ref_count = 0, then decrement
-    /// chunk ref_counts for their chunks.
-    /// Phase 2: Delete blobs (chunks + legacy) with ref_count = 0.
+    /// Phase 1: Delete manifests with ref_count = 0 (or no referencing file),
+    /// then decrement chunk ref_counts for their chunks.
+    /// Phase 2: Delete blobs (chunks + legacy) that are unreferenced
+    /// (ref_count = 0), no longer listed by any manifest or file, and have
+    /// been orphaned for at least [`GC_ORPHAN_GRACE_SECS`](Self::GC_ORPHAN_GRACE_SECS).
+    /// The grace window and reference cross-checks together make the sweep safe
+    /// against a concurrent uploader re-referencing a just-orphaned chunk.
     pub async fn garbage_collect(&self) -> Result<(u64, u64), DomainError> {
         const BATCH_SIZE: i64 = 500;
 
@@ -1855,9 +1873,12 @@ impl DedupService {
                 // single-chunk file case where the PG file-delete trigger already
                 // decremented blobs.ref_count (because file_hash == chunk_hash);
                 // without the clamp this would underflow the CHECK constraint.
+                // Stamp orphaned_at so chunks freed here get the same GC grace
+                // window as any other newly-orphaned blob.
                 sqlx::query(
                     "UPDATE storage.blobs
-                        SET ref_count = GREATEST(ref_count - 1, 0)
+                        SET ref_count   = GREATEST(ref_count - 1, 0),
+                            orphaned_at = CASE WHEN GREATEST(ref_count - 1, 0) = 0 THEN now() ELSE orphaned_at END
                       WHERE hash = ANY($1)",
                 )
                 .bind(chunk_hashes)
@@ -1880,17 +1901,44 @@ impl DedupService {
         }
 
         // ── Phase 2: GC orphaned blobs/chunks ────────────────────
+        // A blob row is collectible only when ALL of these hold:
+        //   • ref_count <= 0, AND
+        //   • it has been orphaned for at least GC_ORPHAN_GRACE_SECS (or has a
+        //     NULL orphaned_at — a pre-migration row or a path that never
+        //     stamped it; those are safe to take immediately), AND
+        //   • no manifest still lists it as a chunk, AND
+        //   • no file still points at it directly (legacy whole-file blob).
+        //
+        // The two NOT EXISTS guards mirror Phase 1's file cross-check: a stale
+        // ref_count = 0 on still-referenced content can then only delay
+        // collection, never delete live bytes. The grace window keeps a
+        // concurrent uploader that is about to pin a just-orphaned chunk from
+        // racing the row-delete → file-unlink gap (see GC_ORPHAN_GRACE_SECS).
+        // The ctid snapshot already protects against a pin that commits DURING
+        // the DELETE (the pin rewrites the row's ctid, so it drops out of the
+        // set); grace covers the remaining post-commit unlink window.
         loop {
             let batch: Vec<(String, i64)> = sqlx::query_as(
                 "DELETE FROM storage.blobs
                   WHERE ctid = ANY(
-                      SELECT ctid FROM storage.blobs
-                       WHERE ref_count <= 0
+                      SELECT b.ctid FROM storage.blobs b
+                       WHERE b.ref_count <= 0
+                         AND (b.orphaned_at IS NULL
+                              OR b.orphaned_at < now() - ($2::int * interval '1 second'))
+                         AND NOT EXISTS (
+                             SELECT 1 FROM storage.chunk_manifests m
+                              WHERE m.chunk_hashes @> ARRAY[b.hash]
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM storage.files f
+                              WHERE f.blob_hash = b.hash
+                         )
                        LIMIT $1
                   )
                   RETURNING hash, size",
             )
             .bind(BATCH_SIZE)
+            .bind(Self::GC_ORPHAN_GRACE_SECS as i32)
             .fetch_all(self.maintenance_pool.as_ref())
             .await
             .map_err(|e| DomainError::internal_error("Dedup", format!("GC blobs: {e}")))?;
@@ -1898,15 +1946,33 @@ impl DedupService {
             if batch.is_empty() {
                 break;
             }
+            let n = batch.len();
 
-            for (hash, size) in &batch {
-                if let Err(e) = self.backend.delete_blob(hash).await {
-                    tracing::warn!("Failed to delete orphan blob {hash}: {e}");
-                }
+            // The rows are already gone, so a concurrent re-upload of identical
+            // content recreates both row and file (durability before
+            // visibility); the grace window above keeps that race vanishingly
+            // narrow. Unlink the backing files with bounded fan-out so a large
+            // sweep doesn't serialise on a slow (e.g. S3) backend.
+            let backend = self.backend.clone();
+            let deleted: Vec<(String, i64)> = stream::iter(batch)
+                .map(|(hash, size)| {
+                    let backend = backend.clone();
+                    async move {
+                        if let Err(e) = backend.delete_blob(&hash).await {
+                            tracing::warn!("Failed to delete orphan blob {hash}: {e}");
+                        }
+                        (hash, size)
+                    }
+                })
+                .buffer_unordered(Self::CHUNK_UPLOAD_CONCURRENCY)
+                .collect()
+                .await;
+
+            for (hash, size) in &deleted {
                 self.fire_blob_hooks(hash);
                 total_bytes += *size as u64;
             }
-            total_deleted += batch.len() as u64;
+            total_deleted += n as u64;
 
             tokio::task::yield_now().await;
         }
@@ -2256,7 +2322,9 @@ impl DedupService {
             return;
         }
         if let Err(e) = sqlx::query(
-            "UPDATE storage.blobs SET ref_count = GREATEST(ref_count - 1, 0)
+            "UPDATE storage.blobs
+                SET ref_count   = GREATEST(ref_count - 1, 0),
+                    orphaned_at = CASE WHEN GREATEST(ref_count - 1, 0) = 0 THEN now() ELSE orphaned_at END
               WHERE hash = ANY($1)",
         )
         .bind(chunk_hashes)
@@ -3297,6 +3365,173 @@ mod delta_upload_integration_tests {
         );
 
         cleanup(&pool, &file_hash, file_id, &[fresh_hash]).await;
+    }
+
+    // ── Garbage collection: grace window + reference cross-checks ─
+    #[tokio::test]
+    async fn garbage_collect_honours_grace_window_and_references() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let svc = local_svc(&pool, &dir).await;
+        let user = seed_user(&pool).await;
+
+        // (A) An aged orphan (orphaned well past the grace window) with no
+        //     references → must be collected (row + backing file).
+        // (B) A freshly orphaned blob (orphaned_at = now()) → must survive: a
+        //     concurrent uploader could still be about to pin it.
+        let aged = blake3::hash(format!("aged-{}", Uuid::new_v4()).as_bytes())
+            .to_hex()
+            .to_string();
+        let fresh = blake3::hash(format!("fresh-{}", Uuid::new_v4()).as_bytes())
+            .to_hex()
+            .to_string();
+        for h in [&aged, &fresh] {
+            svc.backend()
+                .put_blob_from_bytes_unsynced(h, Bytes::from_static(b"xyz"))
+                .await
+                .expect("write blob");
+        }
+        svc.backend()
+            .sync_blobs(&[aged.clone(), fresh.clone()])
+            .await
+            .expect("sync");
+        sqlx::query(
+            "INSERT INTO storage.blobs (hash, size, ref_count, orphaned_at) VALUES
+                ($1, 3, 0, now() - interval '2 hours'),
+                ($2, 3, 0, now())",
+        )
+        .bind(&aged)
+        .bind(&fresh)
+        .execute(pool.as_ref())
+        .await
+        .expect("seed orphans");
+
+        // (C) A chunk still listed by a live file's manifest, but whose
+        //     blobs.ref_count has drifted to 0 and aged past the grace window.
+        //     The manifest cross-check must keep it (and its bytes) alive — a
+        //     stale ref_count must never delete referenced content.
+        let data = content(3 * 1024 * 1024, 71);
+        let (file_hash, owned_chunks, file_id) =
+            seed_owned_content(&svc, &pool, user, &data, "gc").await;
+        let referenced = owned_chunks[0].clone();
+        sqlx::query(
+            "UPDATE storage.blobs
+                SET ref_count = 0, orphaned_at = now() - interval '2 hours'
+              WHERE hash = $1",
+        )
+        .bind(&referenced)
+        .execute(pool.as_ref())
+        .await
+        .expect("drift referenced chunk");
+
+        let (deleted, _bytes) = svc.garbage_collect().await.expect("gc");
+        assert!(deleted >= 1, "the aged orphan must be collected");
+
+        // Aged orphan fully gone.
+        assert!(
+            blob_ref(&pool, &aged).await.is_none(),
+            "aged orphan row removed"
+        );
+        assert!(
+            !svc.backend().blob_exists(&aged).await.unwrap(),
+            "aged orphan file unlinked"
+        );
+        // Fresh orphan preserved by the grace window.
+        assert_eq!(
+            blob_ref(&pool, &fresh).await,
+            Some(0),
+            "fresh orphan survives the grace window"
+        );
+        assert!(
+            svc.backend().blob_exists(&fresh).await.unwrap(),
+            "fresh orphan bytes kept"
+        );
+        // Referenced chunk preserved by the manifest cross-check despite ref 0.
+        assert_eq!(
+            blob_ref(&pool, &referenced).await,
+            Some(0),
+            "referenced chunk row kept"
+        );
+        assert!(
+            svc.backend().blob_exists(&referenced).await.unwrap(),
+            "referenced chunk bytes kept"
+        );
+
+        let _ = sqlx::query("DELETE FROM storage.blobs WHERE hash = ANY($1)")
+            .bind(vec![aged, fresh])
+            .execute(pool.as_ref())
+            .await;
+        cleanup(&pool, &file_hash, file_id, &[]).await;
+    }
+
+    // ── Manifest dereference defers chunk reclamation to GC ──────
+    #[tokio::test]
+    async fn manifest_dereference_defers_chunk_reclamation_to_gc() {
+        let pool = test_pool().await;
+        let dir = TempDir::new().unwrap();
+        let svc = local_svc(&pool, &dir).await;
+        let user = seed_user(&pool).await;
+
+        // Single-owner multi-chunk CDC file → its chunks are uniquely owned.
+        let data = content(3 * 1024 * 1024, 91);
+        let (file_hash, chunks, file_id) =
+            seed_owned_content(&svc, &pool, user, &data, "deref").await;
+        assert!(chunks.len() >= 3, "3 MiB must split into ≥3 chunks");
+
+        // The delete_file_permanently sequence: drop the file row (PG trigger)
+        // then dereference the manifest.
+        sqlx::query("DELETE FROM storage.files WHERE id = $1")
+            .bind(file_id)
+            .execute(pool.as_ref())
+            .await
+            .expect("delete file row");
+        assert!(
+            svc.remove_reference(&file_hash).await.expect("deref"),
+            "last reference removed"
+        );
+
+        // Manifest is gone immediately…
+        let manifest_rc: Option<i32> = sqlx::query_scalar(
+            "SELECT ref_count FROM storage.chunk_manifests WHERE file_hash = $1",
+        )
+        .bind(&file_hash)
+        .fetch_optional(pool.as_ref())
+        .await
+        .expect("manifest query");
+        assert!(manifest_rc.is_none(), "manifest deleted");
+
+        // …but the chunk rows + bytes survive at ref_count 0: no inline unlink
+        // that could race a concurrent re-upload of the same chunk.
+        for c in &chunks {
+            assert_eq!(
+                blob_ref(&pool, c).await,
+                Some(0),
+                "chunk dereferenced, not yet deleted"
+            );
+            assert!(
+                svc.backend().blob_exists(c).await.unwrap(),
+                "chunk bytes kept until GC reclaims them"
+            );
+        }
+
+        // Age the orphans past the grace window; GC then reclaims rows + files.
+        sqlx::query(
+            "UPDATE storage.blobs SET orphaned_at = now() - interval '2 hours' WHERE hash = ANY($1)",
+        )
+        .bind(&chunks)
+        .execute(pool.as_ref())
+        .await
+        .expect("age orphans");
+        svc.garbage_collect().await.expect("gc");
+        for c in &chunks {
+            assert!(blob_ref(&pool, c).await.is_none(), "chunk row reclaimed");
+            assert!(
+                !svc.backend().blob_exists(c).await.unwrap(),
+                "chunk file reclaimed"
+            );
+        }
+
+        cleanup(&pool, &file_hash, file_id, &[]).await;
     }
 
     // ── Verification read ────────────────────────────────────────

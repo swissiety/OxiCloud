@@ -3,6 +3,7 @@
  * Photo grid grouped by day/month/year, with infinite scroll and multi-select.
  */
 
+import { Modal } from '../../components/modal.js';
 import { getCsrfHeaders } from '../../core/csrf.js';
 import { i18n } from '../../core/i18n.js';
 import { thumbnail } from '../thumbnail.js';
@@ -12,6 +13,14 @@ import { photosLightbox } from './photosLightbox.js';
 
 /**
  * @typedef {'daily'|'monthly'|'yearly'} PhotoModeEnum
+ */
+
+/**
+ * @typedef {Object} PhotoGroup
+ * @property {string} label
+ * @property {FileItem[]} files
+ * @property {HTMLElement} section
+ * @property {boolean} materialized
  */
 
 const photosView = {
@@ -25,18 +34,32 @@ const photosView = {
     exhausted: false,
     /** @type {Set<string>} Selected item IDs */
     selected: new Set(),
-    /** @type {IntersectionObserver|null} */
-    _observer: null,
+    /** @type {IntersectionObserver|null} Materializes/dematerializes group tiles by viewport proximity */
+    _materializeObserver: null,
+    /** @type {IntersectionObserver|null} Infinite-scroll trigger on the sentinel */
+    _sentinelObserver: null,
     /** @type {HTMLElement|null} */
     _container: null,
+    /** @type {HTMLElement|null} The infinite-scroll sentinel element */
+    _sentinelEl: null,
     /** @type {boolean} */
     _initialized: false,
     /** @type {PhotoModeEnum} */
     groupMode: 'monthly',
+    /** @type {'square'|'justified'} */
+    layoutMode: 'square',
     /** @type {Map<string, string>} fileId → thumbnail URL (persists across re-renders) */
     _videoThumbCache: new Map(),
-    /** @type {number} Items already rendered in the DOM */
-    _renderedCount: 0,
+    /** @type {Map<string, PhotoGroup>} group label → group record (DOM + data) */
+    _groupData: new Map(),
+    /** @type {string[]} Ordered group labels (timeline order) */
+    _groupOrder: [],
+    /** @type {(() => void)|null} Debounced window resize handler */
+    _resizeHandler: null,
+    /** @type {number} */
+    _resizeTimer: 0,
+    /** @type {string|null} Anchor id for shift-range selection */
+    _selectAnchorId: null,
 
     PAGE_SIZE: 200,
 
@@ -60,6 +83,7 @@ const photosView = {
         }
         if (!this._initialized) {
             this.groupMode = /** @type {'daily'|'monthly'|'yearly'} */ (localStorage.getItem('oxicloud-photos-group')) || 'monthly';
+            this.layoutMode = /** @type {'square'|'justified'} */ (localStorage.getItem('oxicloud-photos-layout')) || 'square';
             this._initialized = true;
         }
     },
@@ -73,7 +97,9 @@ const photosView = {
         this.nextCursor = null;
         this.exhausted = false;
         this.selected.clear();
-        this._renderedCount = 0;
+        this._groupData = new Map();
+        this._groupOrder = [];
+        this._destroyObserver();
         this._container.innerHTML = '';
         this._loadPage();
     },
@@ -84,6 +110,7 @@ const photosView = {
             this._container.classList.remove('active');
         }
         this._destroyObserver();
+        this._unbindResize();
         this._hideSelectionBar();
     },
 
@@ -97,7 +124,17 @@ const photosView = {
         if (this.groupMode === mode) return;
         this.groupMode = mode;
         localStorage.setItem('oxicloud-photos-group', mode);
-        this._renderedCount = 0;
+        this._renderFull();
+    },
+
+    /**
+     * Switch tile layout (square crop vs justified aspect-preserving rows).
+     * @param {'square'|'justified'} mode
+     */
+    setLayoutMode(mode) {
+        if (this.layoutMode === mode) return;
+        this.layoutMode = mode;
+        localStorage.setItem('oxicloud-photos-layout', mode);
         this._renderFull();
     },
 
@@ -149,18 +186,29 @@ const photosView = {
         }
     },
 
-    // ── Rendering ───────────────────────────────────────────────────
-    // Two render paths:
-    //   _renderFull()   — full DOM rebuild (first load, group-mode change, delete)
-    //   _appendBatch(n) — append-only for infinite-scroll pages (O(batch))
+    // ── Virtualized rendering ───────────────────────────────────────
+    // The timeline can hold tens of thousands of items, so we never keep
+    // every tile in the DOM. Each date-group is a <section> with a header
+    // (always present, cheap) and a grid that is *materialized* (tiles in
+    // the DOM) only while near the viewport, and *dematerialized* (emptied,
+    // its height frozen as a spacer) once it scrolls far away. An
+    // IntersectionObserver rooted on the scroll container drives the swap,
+    // so the DOM node count stays bounded by a few screens regardless of
+    // library size.
+    //   _renderFull()   — rebuild the group skeleton (first load, mode switch, delete)
+    //   _appendBatch(n) — append new groups for infinite-scroll pages
 
-    /** Full DOM rebuild — first load, group-mode switch, or after deletions. */
+    /** Rebuild the group skeleton — first load, group-mode switch, or deletions. */
     _renderFull() {
         if (!this._container) return;
         this._destroyObserver();
+        this._groupData = new Map();
+        this._groupOrder = [];
 
         this._container.classList.remove('photos-group-daily', 'photos-group-monthly', 'photos-group-yearly');
         this._container.classList.add(`photos-group-${this.groupMode}`);
+        this._container.classList.remove('photos-layout-square', 'photos-layout-justified');
+        this._container.classList.add(`photos-layout-${this.layoutMode}`);
 
         if (this.items.length === 0 && this.exhausted) {
             this._renderEmpty();
@@ -168,89 +216,257 @@ const photosView = {
         }
         if (this.items.length === 0) return;
 
-        const groups = this._groupItems(this.items);
-        let html = this._renderToolbar();
+        // Toolbar via innerHTML, then append group <section>s + sentinel as
+        // real elements so we keep references for the observer.
+        this._container.innerHTML = this._renderToolbar();
+        this._container.onclick = (e) => this._handleClick(e);
+        this._container.onkeydown = (e) => this._handleKeydown(e);
 
+        const groups = this._groupItems(this.items);
         for (const [label, files] of groups) {
-            html += `<div class="photos-day-header" data-group="${this._escAttr(label)}">${this._escHtml(label)}<span class="photos-day-count">${files.length}</span></div>`;
-            html += '<div class="photos-grid">';
-            for (const file of files) html += this._renderTile(file);
-            html += '</div>';
+            /** @type {PhotoGroup} */
+            const rec = { label, files, section: this._buildGroupEl(label, files), materialized: false };
+            this._groupData.set(label, rec);
+            this._groupOrder.push(label);
+            this._container.appendChild(rec.section);
         }
 
-        html += '<div class="photos-sentinel"></div>';
-        this._container.innerHTML = html;
-        this._container.onclick = (e) => this._handleClick(e);
-        this._fadeInTiles();
-        this._renderedCount = this.items.length;
-        this._observeSentinel();
-        this._setupVideoThumbnails();
+        const sentinel = document.createElement('div');
+        sentinel.className = 'photos-sentinel';
+        this._container.appendChild(sentinel);
+        this._sentinelEl = sentinel;
+
+        this._setupObservers();
+        this._eagerMaterialize();
+        this._bindResize();
     },
 
-    /** Append-only render for infinite scroll — inserts only the items
-     *  from this.items[startIndex..] without destroying existing DOM.
-     *  Complexity: O(batch) instead of O(total_items).
+    /** Append new groups for an infinite-scroll page without rebuilding the
+     *  existing skeleton. The first new group may continue the previous tail
+     *  label, in which case we merge into it. Complexity: O(new groups).
      * @param {number} startIndex
      */
     _appendBatch(startIndex) {
-        if (!this._container) return;
-        this._destroyObserver();
-
-        const newItems = this.items.slice(startIndex);
-        if (newItems.length === 0) {
-            this._observeSentinel();
-            return;
-        }
-
-        const newGroups = this._groupItems(newItems);
-        const sentinel = this._container.querySelector('.photos-sentinel');
-        if (!sentinel) {
-            // Fallback: sentinel missing — full rebuild
-            this._renderedCount = 0;
+        if (!this._container || !this._sentinelEl) {
             this._renderFull();
             return;
         }
+        const newItems = this.items.slice(startIndex);
+        if (newItems.length === 0) return;
 
+        const newGroups = this._groupItems(newItems);
         for (const [label, files] of newGroups) {
-            let tilesHtml = '';
-            for (const file of files) tilesHtml += this._renderTile(file);
-
-            // Does this date-group already exist in the DOM?
-            const existingHeader = this._container.querySelector(`.photos-day-header[data-group="${CSS.escape(label)}"]`);
-
-            if (existingHeader) {
-                // Append tiles to existing grid and update count badge
-                const grid = existingHeader.nextElementSibling;
-                if (grid?.classList.contains('photos-grid')) {
-                    grid.insertAdjacentHTML('beforeend', tilesHtml);
-                    const countSpan = existingHeader.querySelector('.photos-day-count');
-                    if (countSpan) countSpan.textContent = String(grid.children.length);
+            const existing = this._groupData.get(label);
+            if (existing) {
+                // Continuation of a group already in the timeline.
+                existing.files = existing.files.concat(files);
+                const countEl = existing.section.querySelector('.photos-day-count');
+                if (countEl) countEl.textContent = String(existing.files.length);
+                const grid = /** @type {HTMLElement|null} */ (existing.section.querySelector('.photos-grid'));
+                if (grid) {
+                    if (existing.materialized) {
+                        if (this.layoutMode === 'justified') {
+                            // Justified rows must repack against the whole group.
+                            grid.innerHTML = this._renderGroupTiles(existing.files);
+                        } else {
+                            let tilesHtml = '';
+                            for (const file of files) tilesHtml += this._renderTile(file);
+                            grid.insertAdjacentHTML('beforeend', tilesHtml);
+                        }
+                        this._setupVideoThumbnails(grid);
+                        this._fadeInTiles(grid);
+                    } else {
+                        grid.style.minHeight = `${this._estimateHeight(existing.files.length)}px`;
+                    }
                 }
             } else {
-                // New group — insert header + grid before sentinel
-                const sectionHtml =
-                    `<div class="photos-day-header" data-group="${this._escAttr(label)}">${this._escHtml(label)}<span class="photos-day-count">${files.length}</span></div>` +
-                    `<div class="photos-grid">${tilesHtml}</div>`;
-                sentinel.insertAdjacentHTML('beforebegin', sectionHtml);
+                /** @type {PhotoGroup} */
+                const rec = { label, files, section: this._buildGroupEl(label, files), materialized: false };
+                this._groupData.set(label, rec);
+                this._groupOrder.push(label);
+                this._container.insertBefore(rec.section, this._sentinelEl);
+                this._materializeObserver?.observe(rec.section);
             }
         }
+    },
 
-        this._renderedCount = this.items.length;
-        this._observeSentinel();
-        this._setupVideoThumbnails(startIndex);
-        this._fadeInTiles();
+    /** Build a dematerialized group section (header + empty grid spacer).
+     * @param {string} label
+     * @param {FileItem[]} files
+     * @returns {HTMLElement}
+     */
+    _buildGroupEl(label, files) {
+        const section = document.createElement('section');
+        section.className = 'photos-group';
+        section.dataset.group = label;
+        section.innerHTML =
+            `<div class="photos-day-header" data-group="${this._escAttr(label)}">${this._escHtml(label)}<span class="photos-day-count">${files.length}</span></div>` +
+            `<div class="photos-grid" style="min-height:${this._estimateHeight(files.length)}px"></div>`;
+        return section;
+    },
+
+    /** Wire the two IntersectionObservers (materialization + infinite scroll). */
+    _setupObservers() {
+        const root = this._container?.parentElement || null;
+
+        if (!('IntersectionObserver' in window)) {
+            // Degrade gracefully: render every group (legacy behaviour).
+            for (const label of this._groupOrder) {
+                const rec = this._groupData.get(label);
+                if (rec) this._materializeGroup(rec.section);
+            }
+            return;
+        }
+
+        this._materializeObserver = new IntersectionObserver(
+            (entries) => {
+                for (const entry of entries) {
+                    const section = /** @type {HTMLElement} */ (entry.target);
+                    if (entry.isIntersecting) this._materializeGroup(section);
+                    else this._dematerializeGroup(section);
+                }
+            },
+            { root, rootMargin: '1200px 0px' }
+        );
+        for (const label of this._groupOrder) {
+            const rec = this._groupData.get(label);
+            if (rec) this._materializeObserver.observe(rec.section);
+        }
+
+        if (this._sentinelEl) {
+            this._sentinelObserver = new IntersectionObserver(
+                (entries) => {
+                    if (entries[0].isIntersecting) this._loadPage();
+                },
+                { root, rootMargin: '600px 0px' }
+            );
+            this._sentinelObserver.observe(this._sentinelEl);
+        }
+    },
+
+    /** Synchronously materialize the first groups within ~1.5 viewports so
+     *  the initial paint has tiles before the observer's first callback. */
+    _eagerMaterialize() {
+        const budget = (this._container?.parentElement?.clientHeight || window.innerHeight) * 1.5;
+        let acc = 0;
+        for (const label of this._groupOrder) {
+            const rec = this._groupData.get(label);
+            if (!rec) continue;
+            this._materializeGroup(rec.section);
+            acc += rec.section.offsetHeight;
+            if (acc > budget) break;
+        }
+    },
+
+    /** Fill a group's grid with tiles (idempotent).
+     * @param {HTMLElement} section
+     */
+    _materializeGroup(section) {
+        const rec = this._groupData.get(section.dataset.group || '');
+        if (!rec || rec.materialized) return;
+        rec.materialized = true;
+        const grid = /** @type {HTMLElement|null} */ (section.querySelector('.photos-grid'));
+        if (!grid) return;
+        grid.innerHTML = this._renderGroupTiles(rec.files);
+        grid.style.minHeight = '';
+        this._setupVideoThumbnails(grid);
+        this._fadeInTiles(grid);
+    },
+
+    /** Empty a group's grid, freezing its current height as a spacer.
+     * @param {HTMLElement} section
+     */
+    _dematerializeGroup(section) {
+        const rec = this._groupData.get(section.dataset.group || '');
+        if (!rec?.materialized) return;
+        rec.materialized = false;
+        const grid = /** @type {HTMLElement|null} */ (section.querySelector('.photos-grid'));
+        if (!grid) return;
+        grid.style.minHeight = `${grid.offsetHeight}px`;
+        grid.innerHTML = '';
+    },
+
+    /** Current grid geometry (columns / gap / square tile px) for the active
+     *  mode, used to estimate off-screen group heights.
+     * @returns {{cols: number, gap: number, tile: number}}
+     */
+    _gridMetrics() {
+        const width = this._gridWidth();
+        const mobile = window.matchMedia('(max-width: 768px)').matches;
+        let min;
+        let gap;
+        if (this.groupMode === 'yearly') {
+            min = mobile ? 80 : 120;
+            gap = mobile ? 4 : 10;
+        } else if (this.groupMode === 'monthly') {
+            min = mobile ? 110 : 180;
+            gap = mobile ? 2 : 14;
+        } else {
+            min = mobile ? 100 : 150;
+            gap = mobile ? 2 : 12;
+        }
+        const cols = Math.max(1, Math.floor((width + gap) / (min + gap)));
+        const tile = (width - (cols - 1) * gap) / cols;
+        return { cols, gap, tile };
+    },
+
+    /** Estimated pixel height of a grid holding `count` square tiles.
+     * @param {number} count
+     * @returns {number}
+     */
+    _estimateHeight(count) {
+        if (this.layoutMode === 'justified') {
+            const width = this._gridWidth();
+            const target = window.matchMedia('(max-width: 768px)').matches ? 150 : 200;
+            const perRow = Math.max(1, Math.round(width / (target * 1.4)));
+            const rows = Math.max(1, Math.ceil(count / perRow));
+            return Math.round(rows * target + (rows - 1) * 8);
+        }
+        const { cols, gap, tile } = this._gridMetrics();
+        const rows = Math.max(1, Math.ceil(count / cols));
+        return Math.round(rows * tile + (rows - 1) * gap);
+    },
+
+    /** Re-estimate spacer heights for dematerialized groups after a resize. */
+    _bindResize() {
+        if (this._resizeHandler) return;
+        this._resizeHandler = () => {
+            clearTimeout(this._resizeTimer);
+            this._resizeTimer = window.setTimeout(() => this._onResize(), 150);
+        };
+        window.addEventListener('resize', this._resizeHandler);
+    },
+
+    _onResize() {
+        if (!this._container?.classList.contains('active')) return;
+        for (const label of this._groupOrder) {
+            const rec = this._groupData.get(label);
+            if (!rec || rec.materialized) continue;
+            const grid = /** @type {HTMLElement|null} */ (rec.section.querySelector('.photos-grid'));
+            if (grid) grid.style.minHeight = `${this._estimateHeight(rec.files.length)}px`;
+        }
+    },
+
+    _unbindResize() {
+        if (this._resizeHandler) {
+            window.removeEventListener('resize', this._resizeHandler);
+            this._resizeHandler = null;
+        }
+        clearTimeout(this._resizeTimer);
     },
 
     /**
      * Generate HTML for a single photo/video tile
      * @param {FileItem} file
+     * @param {string} [sizeStyle] Inline `width:..;height:..` for justified rows.
      */
-    _renderTile(file) {
+    _renderTile(file, sizeStyle) {
         const isVideo = file.mime_type?.startsWith('video/');
         const selected = this.selected.has(file.id) ? ' selected' : '';
         const cachedThumb = isVideo && this._videoThumbCache.has(file.id) ? this._videoThumbCache.get(file.id) : null;
         const thumbUrl = cachedThumb || `/api/files/${file.id}/thumbnail/preview`;
-        let h = `<div class="photo-tile${selected}" data-id="${this._escAttr(file.id)}" data-mime="${this._escAttr(file.mime_type)}" data-name="${this._escAttr(file.name)}">`;
+        const styleAttr = sizeStyle ? ` style="${sizeStyle}"` : '';
+        let h = `<div class="photo-tile${selected}" data-id="${this._escAttr(file.id)}" data-mime="${this._escAttr(file.mime_type)}" data-name="${this._escAttr(file.name)}" tabindex="0" role="button" aria-label="${this._escAttr(file.name)}"${styleAttr}>`;
         h += `<div class="photo-check"><i class="fas fa-check"></i></div>`;
         const srcset = cachedThumb
             ? ''
@@ -262,11 +478,84 @@ const photosView = {
     },
 
     /**
+     * Inner HTML for a group's grid in the current layout mode.
+     * @param {FileItem[]} files
+     * @returns {string}
+     */
+    _renderGroupTiles(files) {
+        if (this.layoutMode !== 'justified') {
+            let html = '';
+            for (const file of files) html += this._renderTile(file);
+            return html;
+        }
+        const rows = this._justifiedRows(files, this._gridWidth());
+        let html = '';
+        for (const row of rows) {
+            html += `<div class="photos-jrow" style="height:${row.height}px">`;
+            for (const t of row.tiles) {
+                html += this._renderTile(t.file, `width:${t.w}px;height:${t.h}px`);
+            }
+            html += '</div>';
+        }
+        return html;
+    },
+
+    /**
+     * Pack files into justified rows (Flickr-style): each full row is scaled so
+     * it fills the container width while preserving every tile's aspect ratio.
+     * Missing dimensions fall back to a 1:1 aspect.
+     * @param {FileItem[]} files
+     * @param {number} width Available content width in px.
+     * @returns {Array<{height: number, tiles: Array<{file: FileItem, w: number, h: number}>}>}
+     */
+    _justifiedRows(files, width) {
+        const gap = 8;
+        const target = window.matchMedia('(max-width: 768px)').matches ? 150 : 200;
+        /** @type {Array<{height: number, tiles: Array<{file: FileItem, w: number, h: number}>}>} */
+        const rows = [];
+        /** @type {Array<{file: FileItem, aspect: number}>} */
+        let cur = [];
+        let aspectSum = 0;
+        for (const file of files) {
+            let aspect = file.width && file.height ? file.width / file.height : 1;
+            if (!Number.isFinite(aspect) || aspect <= 0) aspect = 1;
+            aspect = Math.min(Math.max(aspect, 0.4), 3);
+            cur.push({ file, aspect });
+            aspectSum += aspect;
+            const rowWidth = aspectSum * target + (cur.length - 1) * gap;
+            if (rowWidth >= width) {
+                const h = (width - (cur.length - 1) * gap) / aspectSum;
+                rows.push({
+                    height: Math.round(h),
+                    tiles: cur.map((t) => ({ file: t.file, w: Math.max(1, Math.round(t.aspect * h)), h: Math.round(h) }))
+                });
+                cur = [];
+                aspectSum = 0;
+            }
+        }
+        if (cur.length) {
+            rows.push({
+                height: target,
+                tiles: cur.map((t) => ({ file: t.file, w: Math.max(1, Math.round(t.aspect * target)), h: target }))
+            });
+        }
+        return rows;
+    },
+
+    /** Current grid content width in px (for layout / height estimates). */
+    _gridWidth() {
+        const sample = /** @type {HTMLElement|null} */ (this._container?.querySelector('.photos-grid'));
+        return sample?.clientWidth || (this._container?.clientWidth || 1200) - 16;
+    },
+
+    /**
      * Fade tiles in as their thumbnails finish loading (kills the pop-in).
      * Idempotent — only wires images not already marked loaded.
+     * @param {ParentNode} [scope] Limit to a subtree (a group grid); defaults to the whole container.
      */
-    _fadeInTiles() {
-        this._container?.querySelectorAll('.photo-tile img:not(.is-loaded)').forEach((el) => {
+    _fadeInTiles(scope) {
+        const root = scope || this._container;
+        root?.querySelectorAll('.photo-tile img:not(.is-loaded)').forEach((el) => {
             const img = /** @type {HTMLImageElement} */ (el);
             if (img.complete) {
                 img.classList.add('is-loaded');
@@ -278,40 +567,25 @@ const photosView = {
         });
     },
 
-    /** (Re-)observe the sentinel element for infinite scroll */
-    _observeSentinel() {
-        this._destroyObserver();
-        const sentinel = this._container?.querySelector('.photos-sentinel');
-        if (sentinel && !this.exhausted) {
-            this._observer = new IntersectionObserver(
-                (entries) => {
-                    if (entries[0].isIntersecting) this._loadPage();
-                },
-                { rootMargin: '400px' }
-            );
-            this._observer.observe(sentinel);
-        }
-    },
-
     // ── Client-side video thumbnail generation ──────────────────────
     // Uses the browser's native video decoder (<video> + <canvas>) to
     // extract a frame, show it immediately, and upload to the server
     // for permanent caching.  Zero server-side dependencies (no ffmpeg).
 
-    /** Attach error handlers to video tile images; on failure, extract a
-     *  frame from the video using the browser's built-in codec. */
-    /** @param {number} [startIndex=0] When > 0, only process video tiles
-     *  for items[startIndex..] — avoids re-scanning the entire DOM. */
-    _setupVideoThumbnails(startIndex = 0) {
-        const tiles = /** @type {NodeListOf<HTMLDivElement>} */ (this._container?.querySelectorAll('.photo-tile[data-mime^="video/"]'));
-        const newIds = startIndex > 0 ? new Set(this.items.slice(startIndex).map((f) => f.id)) : null;
+    /** Attach error handlers to video tile images within a freshly
+     *  materialized grid; on failure, extract a frame from the video using
+     *  the browser's built-in codec.
+     * @param {ParentNode} [scope] Subtree to scan; defaults to the whole container.
+     */
+    _setupVideoThumbnails(scope) {
+        const root = scope || this._container;
+        const tiles = /** @type {NodeListOf<HTMLDivElement>|undefined} */ (root?.querySelectorAll('.photo-tile[data-mime^="video/"]'));
 
         if (!tiles) return;
 
         for (const tile of tiles) {
             const fileId = tile.dataset.id;
             if (!fileId) continue;
-            if (newIds && !newIds.has(fileId)) continue;
             if (this._videoThumbCache.has(fileId)) continue;
 
             const img = tile.querySelector('img');
@@ -356,7 +630,16 @@ const photosView = {
             ['monthly', i18n.t('photos.view_monthly')],
             ['yearly', i18n.t('photos.view_yearly')]
         ];
-        let html = '<div class="photos-toolbar"><div class="view-toggle">';
+        let html = '<div class="photos-toolbar">';
+
+        // Layout toggle (square crop ↔ justified rows)
+        html += '<div class="view-toggle photos-layout-toggle">';
+        html += `<button class="toggle-btn${this.layoutMode === 'square' ? ' active' : ''}" data-layout-mode="square" title="${this._escAttr(i18n.t('photos.layout_square'))}" aria-label="${this._escAttr(i18n.t('photos.layout_square'))}"><i class="fas fa-table-cells"></i></button>`;
+        html += `<button class="toggle-btn${this.layoutMode === 'justified' ? ' active' : ''}" data-layout-mode="justified" title="${this._escAttr(i18n.t('photos.layout_justified'))}" aria-label="${this._escAttr(i18n.t('photos.layout_justified'))}"><i class="fas fa-grip"></i></button>`;
+        html += '</div>';
+
+        // Grouping toggle (day / month / year)
+        html += '<div class="view-toggle">';
         for (const [mode, label] of modes) {
             const active = this.groupMode === mode ? ' active' : '';
             html += `<button class="toggle-btn${active}" data-group-mode="${mode}">${this._escHtml(label)}</button>`;
@@ -420,15 +703,28 @@ const photosView = {
             return;
         }
 
+        const layoutBtn = /** @type {HTMLButtonElement} */ (target.closest('[data-layout-mode]'));
+        if (layoutBtn) {
+            this.setLayoutMode(/** @type {'square'|'justified'} */ (layoutBtn.dataset.layoutMode));
+            return;
+        }
+
         const tile = /** @type {HTMLDivElement} */ (target.closest('.photo-tile'));
         if (!tile) return;
 
         const id = tile.dataset.id;
         const check = target.closest('.photo-check');
 
+        // Shift-click extends the selection from the last anchor.
+        if (id && e.shiftKey && this._selectAnchorId) {
+            this._selectRange(this._selectAnchorId, id);
+            return;
+        }
+
         // If clicking checkbox or in selection mode, toggle select
         if (check || this.selected.size > 0) {
             this._toggleSelect(id, tile);
+            this._selectAnchorId = id || null;
             return;
         }
 
@@ -437,6 +733,49 @@ const photosView = {
         if (idx >= 0) {
             photosLightbox.open(this.items, idx);
         }
+    },
+
+    /**
+     * Select every item between the anchor and the target (inclusive), in
+     * timeline order. Tracked in the Set so it survives dematerialized
+     * groups; currently-visible tiles get the class applied immediately.
+     * @param {string} anchorId
+     * @param {string} toId
+     */
+    _selectRange(anchorId, toId) {
+        const a = this.items.findIndex((f) => f.id === anchorId);
+        const b = this.items.findIndex((f) => f.id === toId);
+        if (a < 0 || b < 0) return;
+        const lo = Math.min(a, b);
+        const hi = Math.max(a, b);
+        for (let i = lo; i <= hi; i++) this.selected.add(this.items[i].id);
+        this._container?.querySelectorAll('.photo-tile').forEach((el) => {
+            const t = /** @type {HTMLElement} */ (el);
+            if (t.dataset.id && this.selected.has(t.dataset.id)) t.classList.add('selected');
+        });
+        this._selectAnchorId = toId;
+        this._updateSelectionBar();
+    },
+
+    /**
+     * Keyboard activation for focused tiles: Enter opens the lightbox (or
+     * toggles selection when in selection mode); Space toggles selection.
+     * @param {KeyboardEvent} e
+     */
+    _handleKeydown(e) {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const target = /** @type {Element} */ (e.target);
+        const tile = /** @type {HTMLDivElement} */ (target.closest('.photo-tile'));
+        if (!tile) return;
+        e.preventDefault();
+        const id = tile.dataset.id;
+        if (e.key === ' ' || this.selected.size > 0) {
+            this._toggleSelect(id, tile);
+            this._selectAnchorId = id || null;
+            return;
+        }
+        const idx = this.items.findIndex((f) => f.id === id);
+        if (idx >= 0) photosLightbox.open(this.items, idx);
     },
 
     /**
@@ -493,7 +832,13 @@ const photosView = {
         const bar_delete = /** @type {HTMLButtonElement} */ (bar.querySelector('#photos-sel-delete'));
         if (bar_delete) {
             bar_delete.onclick = async () => {
-                if (!confirm('Delete selected items?')) return;
+                const ok = await Modal.confirmDialog({
+                    title: i18n.t('photos.delete_title'),
+                    message: i18n.t('photos.delete_selected_confirm'),
+                    confirmText: i18n.t('actions.delete'),
+                    icon: 'fa-trash'
+                });
+                if (!ok) return;
 
                 // One batch request per chunk instead of one DELETE per photo.
                 // The photos view is files-only, so every id is a file id.
@@ -526,7 +871,6 @@ const photosView = {
                 if (trashed.size > 0) {
                     this.items = this.items.filter((f) => !trashed.has(f.id));
                     for (const id of trashed) this.selected.delete(id);
-                    this._renderedCount = 0;
                     this._renderFull();
                 }
                 // Refresh (or hide) the bar to reflect any items left selected.
@@ -571,9 +915,13 @@ const photosView = {
     },
 
     _destroyObserver() {
-        if (this._observer) {
-            this._observer.disconnect();
-            this._observer = null;
+        if (this._materializeObserver) {
+            this._materializeObserver.disconnect();
+            this._materializeObserver = null;
+        }
+        if (this._sentinelObserver) {
+            this._sentinelObserver.disconnect();
+            this._sentinelObserver = null;
         }
     },
 

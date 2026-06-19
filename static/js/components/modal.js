@@ -436,6 +436,47 @@ const Modal = {
         requestAnimationFrame(() => {
             this.overlay.classList.add('active');
         });
+    },
+
+    /**
+     * Confirmation dialog (replacement for window.confirm()).
+     * Built on openPanel, so it inherits the overlay, animation, focus-trap,
+     * Escape and click-outside handling.
+     * @param {Object} options
+     * @param {string} options.title
+     * @param {string} options.message
+     * @param {string} [options.confirmText]
+     * @param {string} [options.cancelText]
+     * @param {string} [options.icon] - Font Awesome class, default 'fa-circle-question'
+     * @returns {Promise<boolean>} true if confirmed, false otherwise
+     */
+    confirmDialog({ title, message, confirmText = null, cancelText = null, icon = 'fa-circle-question' }) {
+        return new Promise((resolve) => {
+            if (!this.overlay) {
+                resolve(false);
+                return;
+            }
+            const content = document.createElement('p');
+            content.className = 'modal-confirm-message';
+            content.textContent = message;
+
+            let settled = false;
+            const done = (/** @type {boolean} */ value) => {
+                if (settled) return;
+                settled = true;
+                resolve(value);
+            };
+
+            this.openPanel({
+                title,
+                icon,
+                content,
+                confirmText: confirmText ?? i18n.t('actions.confirm'),
+                cancelText: cancelText ?? i18n.t('actions.cancel'),
+                onConfirm: () => done(true),
+                onCancel: () => done(false)
+            });
+        });
     }
 };
 

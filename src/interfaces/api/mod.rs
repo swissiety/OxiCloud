@@ -23,7 +23,7 @@ use crate::application::dtos::folder_dto::{
 use crate::application::dtos::folder_listing_dto::FolderListingDto;
 use crate::application::dtos::grant_dto::{
     CreateGrantDto, GrantDto, OutgoingResourceItemDto, PermissionDto, ResourceContentDto,
-    ResourceDto, ResourceTypeDto, Role, SharedWithMeDto, SharedWithMeItemDto, SubjectDto,
+    ResourceDto, ResourceTypeDto, RoleDto, SharedWithMeDto, SharedWithMeItemDto, SubjectDto,
     SubjectTypeDto, UpdateRoleDto,
 };
 use crate::application::dtos::i18n_dto::{
@@ -164,6 +164,7 @@ use crate::interfaces::api::handlers::file_handler::MoveFilePayload;
         handlers::recent_handler::clear_recent_items,
         // Photos handler (free function)
         handlers::photos_handler::list_photos,
+        handlers::photos_handler::list_photos_geo,
         // Batch handlers (free functions)
         handlers::batch_handler::move_files_batch,
         handlers::batch_handler::copy_files_batch,
@@ -351,7 +352,7 @@ use crate::interfaces::api::handlers::file_handler::MoveFilePayload;
             ResourceTypeDto,
             ResourceDto,
             PermissionDto,
-            Role,
+            RoleDto,
             CreateGrantDto,
             UpdateRoleDto,
             GrantDto,

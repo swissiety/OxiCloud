@@ -73,13 +73,6 @@ function _looksLikeEmail(q) {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(q);
 }
 
-/** Permissions that belong to each role (must mirror the Rust DTO). */
-const ROLE_PERMISSIONS = {
-    viewer: ['read'],
-    editor: ['read', 'comment', 'create', 'update'],
-    admin: ['read', 'comment', 'create', 'update', 'share', 'delete']
-};
-
 /**
  * Fetch up to ~8 ReBAC subject groups whose name matches `q`. Authenticated
  * endpoint; returns `[]` on any failure so the autocomplete degrades to
@@ -107,14 +100,20 @@ async function _searchGroups(q) {
 }
 
 /**
- * Derive the highest role a set of grants represents for one subject.
+ * Pick the displayed role for a member row. Server-side every Grant
+ * carries an explicit role since the cleanup PR, so this just reads it.
+ * The server may emit `commenter` or `contributor` (full enum), but the
+ * picker only exposes Viewer/Editor/Owner — collapse the two unexposed
+ * roles to the closest neighbour so the UI never renders an unknown
+ * option.
  * @param {Grant[]} subjectGrants
  * @returns {ShareRoleEnum}
  */
 function _roleFromGrants(subjectGrants) {
-    const perms = new Set(subjectGrants.map((g) => g.permission));
-    if (perms.has('delete') || perms.has('share')) return 'admin';
-    if (perms.has('create') || perms.has('update')) return 'editor';
+    const role = subjectGrants[0]?.role;
+    if (role === 'owner' || role === 'editor' || role === 'viewer') return role;
+    if (role === 'commenter') return 'viewer';
+    if (role === 'contributor') return 'editor';
     return 'viewer';
 }
 
@@ -363,7 +362,7 @@ const shareModal = {
         for (const [val, label] of [
             ['viewer', i18n.t('share.role.canView', 'Can view')],
             ['editor', i18n.t('share.role.canEdit', 'Can edit')],
-            ['admin', i18n.t('share.role.canManage', 'Can manage')]
+            ['owner', i18n.t('share.role.canManage', 'Can manage')]
         ]) {
             const opt = document.createElement('option');
             opt.value = val;
@@ -606,7 +605,7 @@ const shareModal = {
                 granted_at: '',
                 granted_by: '',
                 subject: { type: subjectType, id: contact.id },
-                permission: /** @type {import('../core/types.js').PermissionTypeEnum} */ (ROLE_PERMISSIONS[this._stagedRole][0]),
+                role: this._stagedRole,
                 resource: { type: this._itemType, id: this._item?.id ?? '' }
             };
             this._localMembers.push({
@@ -649,7 +648,7 @@ const shareModal = {
         // matching the UX contract and the kebab-menu / role-select dropdown
         // order. Renaming the labels from "Manager"/"Editor"/"Viewer" to
         // "Can manage"/"Can edit"/"Can view" left this iteration order stale.
-        const groups = /** @type {ShareRoleEnum[]} */ (['admin', 'editor', 'viewer']);
+        const groups = /** @type {ShareRoleEnum[]} */ (['owner', 'editor', 'viewer']);
         let memberIndex = 0;
 
         for (const role of groups) {
@@ -663,7 +662,7 @@ const shareModal = {
             header.className = 'smd-group-header';
 
             const labelMap = {
-                admin: i18n.t('share.role.canManage', 'Can manage'),
+                owner: i18n.t('share.role.canManage', 'Can manage'),
                 editor: i18n.t('share.role.canEdit', 'Can edit'),
                 viewer: i18n.t('share.role.canView', 'Can view')
             };
@@ -711,7 +710,7 @@ const shareModal = {
         for (const [val, label] of [
             ['viewer', i18n.t('share.role.canView', 'Can view')],
             ['editor', i18n.t('share.role.canEdit', 'Can edit')],
-            ['admin', i18n.t('share.role.canManage', 'Can manage')]
+            ['owner', i18n.t('share.role.canManage', 'Can manage')]
         ]) {
             const opt = document.createElement('option');
             opt.value = val;

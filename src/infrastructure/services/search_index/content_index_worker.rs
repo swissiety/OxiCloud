@@ -56,6 +56,11 @@ const PREVIEW_BYTES: usize = 16 * 1024;
 /// 1.5 s interval).
 const ORPHAN_SWEEP_TICKS: u64 = 2400;
 
+/// Backoff before the supervisor restarts the drain loop after an abnormal
+/// exit (a panic). Long enough that a tight crash-loop can't busy-spin, short
+/// enough that indexing resumes promptly.
+const WORKER_RESTART_BACKOFF_SECS: u64 = 5;
+
 pub struct ContentIndexWorker {
     maintenance_pool: Arc<PgPool>,
     dedup: Arc<DedupService>,
@@ -86,49 +91,77 @@ impl ContentIndexWorker {
         }
     }
 
-    /// Spawn the indexing loop. Fire-and-forget: the loop logs and survives
-    /// every error (an exited loop would silently freeze the index while the
-    /// queue grows), and the first drain runs immediately to absorb rows left
-    /// over from a previous run or the migration backfill.
+    /// Spawn the indexing loop, supervised. The drain loop logs and survives
+    /// every *operational* error (a failed drain just retries next tick), but a
+    /// panic in the loop body would otherwise kill the task and silently freeze
+    /// the index while the dirty queue grows unbounded. The supervisor restarts
+    /// the loop after a panic (with backoff) so indexing self-heals. The first
+    /// drain runs immediately to absorb rows left over from a previous run or
+    /// the migration backfill.
     #[instrument(skip(self))]
     pub fn start(self, needs_reseed: bool) {
         info!(
             "Starting content-index worker (every {}ms, batch {}, reseed: {})",
             self.interval_ms, DRAIN_BATCH, needs_reseed
         );
+        let worker = Arc::new(self);
         tokio::spawn(async move {
-            if let Err(e) = self.prepare(needs_reseed).await {
+            // Reseed/version cleanup runs once, not on every restart.
+            if let Err(e) = worker.prepare(needs_reseed).await {
                 error!("Content-index prepare failed (continuing with queue as-is): {e}");
             }
 
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_millis(self.interval_ms));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut ticks: u64 = 0;
+            // run_loop() never returns under normal operation, so any exit is
+            // abnormal: a panic surfaces as a JoinError; a plain return would
+            // be a logic bug. Either way, log loudly and restart.
             loop {
-                ticker.tick().await;
-                for _ in 0..MAX_BATCHES_PER_TICK {
-                    match self.drain_once().await {
-                        Ok(0) => break,
-                        Ok(drained) => {
-                            debug!("Content-index drain: processed {drained} queue row(s)");
-                            if drained < DRAIN_BATCH as usize {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Content-index drain failed (queue preserved, will retry): {e}");
+                let w = worker.clone();
+                match tokio::spawn(async move { w.run_loop().await }).await {
+                    Ok(()) => error!(
+                        "Content-index drain loop returned unexpectedly; \
+                         restarting in {WORKER_RESTART_BACKOFF_SECS}s"
+                    ),
+                    Err(e) if e.is_panic() => error!(
+                        "Content-index drain loop panicked ({e}); \
+                         restarting in {WORKER_RESTART_BACKOFF_SECS}s"
+                    ),
+                    Err(_) => return, // task cancelled — runtime shutting down
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(WORKER_RESTART_BACKOFF_SECS))
+                    .await;
+            }
+        });
+    }
+
+    /// The perpetual drain loop. Extracted from [`start`](Self::start) so the
+    /// supervisor can run it in a child task and restart it after a panic.
+    async fn run_loop(&self) {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(self.interval_ms));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ticks: u64 = 0;
+        loop {
+            ticker.tick().await;
+            for _ in 0..MAX_BATCHES_PER_TICK {
+                match self.drain_once().await {
+                    Ok(0) => break,
+                    Ok(drained) => {
+                        debug!("Content-index drain: processed {drained} queue row(s)");
+                        if drained < DRAIN_BATCH as usize {
                             break;
                         }
                     }
-                }
-
-                ticks += 1;
-                if ticks.is_multiple_of(ORPHAN_SWEEP_TICKS) {
-                    self.sweep_orphaned_text().await;
+                    Err(e) => {
+                        error!("Content-index drain failed (queue preserved, will retry): {e}");
+                        break;
+                    }
                 }
             }
-        });
+
+            ticks += 1;
+            if ticks.is_multiple_of(ORPHAN_SWEEP_TICKS) {
+                self.sweep_orphaned_text().await;
+            }
+        }
     }
 
     /// Spawn the discard-only janitor used when content search is DISABLED:

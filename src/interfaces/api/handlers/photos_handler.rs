@@ -4,11 +4,12 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::application::dtos::file_dto::FileDto;
+use crate::application::dtos::geo_dto::GeoBounds;
 use crate::common::di::AppState;
 use crate::interfaces::middleware::auth::AuthUser;
 
@@ -19,6 +20,20 @@ pub struct PhotosQueryParams {
     pub before: Option<i64>,
     /// Max items to return (default 200, max 500).
     pub limit: Option<i64>,
+}
+
+/// Photos-timeline item: a `FileDto` plus the image's original pixel
+/// dimensions (from EXIF/metadata), flattened into the same JSON shape so
+/// the gallery can lay tiles out at their true aspect ratio without a
+/// second per-file metadata round-trip.
+#[derive(Serialize)]
+struct PhotoDto {
+    #[serde(flatten)]
+    file: FileDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
 }
 
 /// Lists all image/video files for the authenticated user, sorted by
@@ -55,17 +70,22 @@ pub async fn list_photos(
         .list_media_files(user_id, params.before, limit)
         .await
     {
-        Ok((files, sort_dates)) => {
+        Ok((files, sort_dates, dims)) => {
             info!("Photos: returned {} media files for user", files.len());
 
-            // Convert to DTOs with sort_date populated
-            let dtos: Vec<FileDto> = files
+            // Convert to DTOs with sort_date + pixel dimensions populated.
+            let dtos: Vec<PhotoDto> = files
                 .into_iter()
                 .zip(sort_dates.iter())
-                .map(|(file, &sd)| {
+                .zip(dims.iter())
+                .map(|((file, &sd), &(w, h))| {
                     let mut dto = FileDto::from(file);
                     dto.sort_date = Some(sd as u64);
-                    dto
+                    PhotoDto {
+                        file: dto,
+                        width: w.map(|v| v.max(0) as u32),
+                        height: h.map(|v| v.max(0) as u32),
+                    }
                 })
                 .collect();
 
@@ -86,6 +106,79 @@ pub async fn list_photos(
                 Json(serde_json::json!({
                     "error": format!("Failed to list photos: {}", err)
                 })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Query parameters for the photos map (clustered) endpoint.
+#[derive(Deserialize)]
+pub struct GeoQueryParams {
+    /// Bounding box as `west,south,east,north` (decimal degrees).
+    pub bbox: String,
+    /// Slippy-map zoom level (0–20); controls cluster granularity.
+    pub zoom: Option<u8>,
+}
+
+/// Lists the caller's geotagged photos aggregated into map clusters within a
+/// bounding box. Gated on `OXICLOUD_ENABLE_PLACES` (the route is only mounted
+/// when the Places service is present).
+#[utoipa::path(
+    get,
+    path = "/api/photos/geo",
+    params(
+        ("bbox" = String, Query, description = "Bounding box 'west,south,east,north' (decimal degrees)"),
+        ("zoom" = Option<u8>, Query, description = "Map zoom level (0-20), controls cluster size")
+    ),
+    responses(
+        (status = 200, description = "Geotagged photos aggregated into map clusters"),
+        (status = 400, description = "Invalid bounding box"),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "photos"
+)]
+pub async fn list_photos_geo(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Query(params): Query<GeoQueryParams>,
+) -> impl IntoResponse {
+    let Some(places) = state.places_service.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Places feature is disabled" })),
+        )
+            .into_response();
+    };
+
+    let coords: Vec<f64> = params
+        .bbox
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect();
+    if coords.len() != 4 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bbox must be 'west,south,east,north'" })),
+        )
+            .into_response();
+    }
+    let bounds = GeoBounds {
+        west: coords[0],
+        south: coords[1],
+        east: coords[2],
+        north: coords[3],
+    };
+    let zoom = params.zoom.unwrap_or(3);
+
+    match places.clusters(auth_user.id, bounds, zoom).await {
+        Ok(clusters) => Json(clusters).into_response(),
+        Err(err) => {
+            error!("Error listing photo geo clusters: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{}", err) })),
             )
                 .into_response()
         }

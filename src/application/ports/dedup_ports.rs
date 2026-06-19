@@ -112,7 +112,10 @@ pub trait DedupPort: Send + Sync + 'static {
 
     /// Remove a reference from a blob.
     ///
-    /// Returns `true` if the blob was deleted (ref_count reached 0).
+    /// Returns `true` if the last reference was removed (the content is now
+    /// unreferenced). For CDC content the now-orphaned chunks are reclaimed
+    /// later by garbage collection rather than unlinked inline; legacy
+    /// whole-file blobs are still freed eagerly.
     async fn remove_reference(&self, hash: &str) -> Result<bool, DomainError>;
 
     /// Calculate BLAKE3 hash of a file (streaming).
