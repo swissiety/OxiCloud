@@ -1,0 +1,58 @@
+/* Honor the user's browser font-size / zoom preference (rem-relative). */
+html {
+    font-size: 100%;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: var(--font-sans);
+}
+
+body {
+    display: flex;
+    height: 100vh; /* fallback for browsers without dvh */
+    /* biome-ignore lint/suspicious/noDuplicateProperties: explicit fallback */
+    height: 100dvh;
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+    background-color: var(--color-bg-page);
+    overflow: hidden;
+}
+
+html[dir="rtl"] .fa-arrow-left::before {
+    content: "\f061";
+}
+
+html[dir="rtl"] .fa-sign-out-alt {
+    -webkit-transform: rotate(180deg);
+    transform: rotate(180deg);
+}
+/* Utility: hide elements without inline style="" (CSP-safe) */
+.hidden {
+    display: none !important;
+}
+
+/* Brand-tinted text selection + caret. */
+::selection {
+    background: var(--color-accent-ring-strong);
+    color: var(--color-text-heading);
+}
+
+:root {
+    caret-color: var(--color-accent);
+}
+
+/* Visually hidden but exposed to assistive tech (a11y-only labels/headings). */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}

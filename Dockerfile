@@ -6,6 +6,16 @@ FROM rust:1.96-alpine3.24 AS base
 RUN apk --no-cache upgrade && \
     apk add --no-cache musl-dev pkgconfig gcc perl make
 
+# ─── Stage 1b: Build the SvelteKit frontend (Vite) ───────────────────────────
+# Produces the SPA in /static-dist. `npm ci` is cached unless the lockfile
+# changes; the Rust build no longer bundles assets (see build.rs).
+FROM node:24-alpine AS frontend
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 # ─── Stage 2: Cache dependencies ─────────────────────────────────────────────
 FROM base AS cacher
 WORKDIR /app
@@ -42,6 +52,9 @@ ARG DATABASE_URL="postgres://postgres:postgres@localhost/oxicloud"
 # test-only bins (e.g. load-seed) even if `required-features` gating
 # changes upstream.
 RUN DATABASE_URL="${DATABASE_URL}" cargo build --release --bin oxicloud --bin generate-openapi --bin migrate-nfc-filenames
+# The SPA is built by the frontend stage; bring it in for the runtime copy below.
+# (build.rs no longer generates static-dist unless OXICLOUD_RUST_ASSETS=1.)
+COPY --from=frontend /static-dist ./static-dist
 
 # ─── Stage 4: Minimal runtime image ──────────────────────────────────────────
 FROM alpine:3.24.0
@@ -74,7 +87,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r//' /usr/local/bin/entrypoint.sh && \
     chmod 755 /usr/local/bin/entrypoint.sh
 
-# Copy processed static files (bundled/minified by build.rs in release)
+# Copy the built SPA (produced by the Vite frontend stage)
 COPY --from=builder --chown=oxicloud:oxicloud /app/static-dist /app/static
 # Create storage directory with proper permissions
 RUN mkdir -p /app/storage && chown -R oxicloud:oxicloud /app/storage

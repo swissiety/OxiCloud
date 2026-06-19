@@ -40,8 +40,17 @@ fn main() {
 
     println!("cargo:rerun-if-changed=static");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=OXICLOUD_RUST_ASSETS");
 
     git_status();
+
+    // The frontend is built by Vite into `static-dist/` and the Rust web layer
+    // serves it directly — no `include_str!` HTML, no Rust-side bundling. The
+    // pure-Rust asset pipeline below is retained, behind `OXICLOUD_RUST_ASSETS=1`,
+    // for one-release rollback only.
+    if env_or("OXICLOUD_RUST_ASSETS", "0") != "1" {
+        return;
+    }
 
     // ── Guard: Docker cacher stage has no static/ ────────────────────────────
     if !static_dir.exists() {

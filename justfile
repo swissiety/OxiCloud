@@ -7,9 +7,10 @@ build:
     cargo build
 
 release:
+    # Build the SvelteKit SPA into static-dist/ (build.rs no longer bundles),
+    # then compile the release binary which serves it.
+    cd frontend && npm ci && npm run build
     cargo build --release
-    # check that app is clean
-    node --check static-dist/js/app.*.js
 
 run:
     cargo run
@@ -153,6 +154,41 @@ front-design:
 api-test:
     bash tests/api/run.sh
     bash tests/webdav/run.sh
+
+# ---------------------------------------------------------------------------
+# New SvelteKit frontend (frontend/). The original vanilla frontend (static/)
+# and its `front-*` recipes remain until the Phase 5 cutover; these `fe-*`
+# recipes drive the rewrite in the meantime.
+# ---------------------------------------------------------------------------
+
+# install frontend dependencies
+fe-install:
+    cd frontend && npm ci
+
+# Vite dev server only (HMR) — backend must already be running on :8086
+fe-dev:
+    cd frontend && npm run dev
+
+# build the SPA (Phase 0: -> frontend/build; Phase 5: -> static-dist)
+fe-build:
+    cd frontend && npm run build
+
+# svelte-check + eslint + stylelint + prettier
+fe-check:
+    cd frontend && npm run check
+
+# Vitest unit/component tests
+fe-test:
+    cd frontend && npm run test:unit
+
+# Run backend (API) and the Vite dev server together; one Ctrl-C stops both.
+dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run &
+    backend=$!
+    trap 'kill $backend 2>/dev/null' EXIT INT TERM
+    cd frontend && npm run dev
 
 # k6 load suite — full scenarios + regression diff vs baseline/load.json.
 # Used by the nightly workflow and on demand. Release build for fair timings.

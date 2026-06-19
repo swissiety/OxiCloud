@@ -1,0 +1,10 @@
+/* Global stylesheet: design tokens + base layer, imported once in +layout.svelte.
+ * Ported from static/css/base/*. Component-specific styles live in each
+ * component's scoped \3c style> block. */
+@import url('./base/variables.css');
+@import url('./base/reset.css');
+@import url('./base/typography.css');
+@import url('./base/forms.css');
+@import url('./base/animations.css');
+@import url('./base/a11y.css');
+@import url('./ported.css');

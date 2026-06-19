@@ -1,0 +1,60 @@
+.form-group {
+    margin-bottom: 15px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: var(--space-2);
+    font-weight: var(--weight-medium);
+    color: var(--color-text-secondary);
+}
+
+.form-group input,
+.form-group textarea {
+    width: 100%;
+    padding: var(--space-2-5);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    font-size: var(--text-base);
+}
+
+.form-group textarea {
+    resize: vertical;
+    min-height: 80px;
+}
+
+.button {
+    padding: var(--space-2) var(--space-4);
+    border: none;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    font-size: var(--text-base);
+    transition: background-color 0.2s;
+}
+
+.primary {
+    background-color: var(--color-accent);
+    color: var(--color-danger-text);
+}
+
+.primary:hover {
+    background-color: var(--color-accent-hover);
+}
+
+.secondary {
+    background-color: var(--color-border);
+    color: var(--color-text-secondary);
+}
+
+.secondary:hover {
+    background-color: var(--color-border-medium);
+}
+
+.danger {
+    background-color: var(--color-danger-bg);
+    color: var(--color-danger-text);
+}
+
+.danger:hover {
+    background-color: var(--color-danger-bg-hover);
+}

@@ -1,0 +1,16 @@
+build/
+.svelte-kit/
+package/
+node_modules/
+package.json
+package-lock.json
+src/lib/i18n/locales/
+# vendored / generated — kept byte-faithful to their source
+src/lib/styles/base/
+src/lib/styles/ported/
+src/lib/styles/ported.css
+src/lib/icons/registry.ts
+static/locales/
+static/vendors/
+static/workers/
+static/basemaps/

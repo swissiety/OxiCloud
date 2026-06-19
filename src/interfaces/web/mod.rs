@@ -1,35 +1,37 @@
 use crate::common::config::AppConfig;
 use crate::common::di::AppState;
+use axum::Router;
 use axum::http::header::{CACHE_CONTROL, HeaderValue};
-use axum::{Router, response::Html, routing::get};
+use axum::routing::get_service;
+use std::path::Path;
 use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// Creates web routes for serving static files
+/// Serves the SvelteKit single-page app.
+///
+/// The frontend is built by Vite into `static-dist/` (repo root). Real files are
+/// served from disk; any unmatched client route (deep links such as
+/// `/files/<id>`, `/s/<token>`, `/login`) falls back to the SPA shell
+/// `index.html`, which boots the client router.
+///
+/// Caching: content-hashed assets under `/_app/immutable` are cached forever;
+/// everything else — crucially the `index.html` shell — is `no-cache` so a deploy
+/// can't leave a stale app pinned in browsers.
 pub fn create_web_routes() -> Router<Arc<AppState>> {
-    // Get config to access static path
     let config = AppConfig::from_env();
 
-    // XXX do we prefer PROFILE or ENV ?
+    // `PROFILE=dev` (the `just front-dev`/legacy path) serves the unbuilt source
+    // dir; normal release serves the Vite output in `static-dist/`.
     let is_dev = std::env::var("PROFILE").is_ok_and(|profile| profile == "dev");
+    let assets_dir = if is_dev { "static" } else { "static-dist" };
 
-    let assets_dir = if is_dev {
-        // take directly the source (permits faster development)
-        "static"
-    } else {
-        // take the compiled assets
-        "static-dist"
-    };
-
-    // In release builds, serve from static-dist/ (processed assets).
-    // In debug builds, serve from the original static/ directory.
     let static_path = if cfg!(not(debug_assertions)) {
         let dist = config
             .static_path
             .parent()
-            .unwrap_or(std::path::Path::new("."))
+            .unwrap_or(Path::new("."))
             .join(assets_dir);
         if dist.exists() {
             dist
@@ -40,59 +42,31 @@ pub fn create_web_routes() -> Router<Arc<AppState>> {
         config.static_path.clone()
     };
 
-    // Static assets (JS, CSS, JSON, SVG, ICO) served via ServeDir
-    // with brotli + gzip compression and aggressive caching (7 days).
-    // HTML pages are served via explicit routes (include_str!) and
-    // do NOT pass through these layers.
-    let static_service = ServeDir::new(&static_path);
+    // SPA fallback: serve the file if it exists, else the app shell.
+    let spa = ServeDir::new(&static_path).fallback(ServeFile::new(static_path.join("index.html")));
 
-    // By default assets are cached in release/production environement and no cache in dev
-    let cache_control_value = if is_dev {
+    // Hashed, immutable assets (SvelteKit emits these under /_app/immutable).
+    let app_immutable = ServeDir::new(static_path.join("_app").join("immutable"));
+
+    let shell_cache = if is_dev {
         "max-age=0, no-cache, no-store"
     } else {
-        "public, max-age=604800, stale-while-revalidate=86400"
+        "no-cache"
     };
 
     Router::new()
-        // Add specific routes for clean URLs (without .html)
-        .route("/login", get(serve_login_page))
-        .route("/profile", get(serve_profile_page))
-        .route("/admin", get(serve_admin_page))
-        .route("/device", get(serve_device_verify_page))
-        .route("/s/{token}", get(serve_share_page))
-        // Serve static files with compression + cache headers
-        .fallback_service(static_service)
+        .nest_service(
+            "/_app/immutable",
+            get_service(app_immutable).layer(SetResponseHeaderLayer::overriding(
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            )),
+        )
+        .fallback_service(spa)
         .layer(CompressionLayer::new().br(true).gzip(true))
+        // `if_not_present` so the immutable assets above keep their long cache.
         .layer(SetResponseHeaderLayer::if_not_present(
             CACHE_CONTROL,
-            HeaderValue::from_static(cache_control_value),
+            HeaderValue::from_static(shell_cache),
         ))
-}
-
-/// Serve the login page
-async fn serve_login_page() -> Html<&'static str> {
-    Html(include_str!(concat!(env!("OUT_DIR"), "/login.html")))
-}
-
-/// Serve the profile page
-async fn serve_profile_page() -> Html<&'static str> {
-    Html(include_str!(concat!(env!("OUT_DIR"), "/profile.html")))
-}
-
-/// Serve the admin page
-async fn serve_admin_page() -> Html<&'static str> {
-    Html(include_str!(concat!(env!("OUT_DIR"), "/admin.html")))
-}
-
-/// Serve the device verification page (RFC 8628 Device Authorization Grant)
-async fn serve_device_verify_page() -> Html<&'static str> {
-    Html(include_str!(concat!(
-        env!("OUT_DIR"),
-        "/device-verify.html"
-    )))
-}
-
-/// Serve the public share page (unauthenticated)
-async fn serve_share_page() -> Html<&'static str> {
-    Html(include_str!(concat!(env!("OUT_DIR"), "/share.html")))
 }

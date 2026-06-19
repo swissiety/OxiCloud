@@ -22,7 +22,7 @@
     cargo-audit
 
     # frontend tooling (no root package.json — these are expected as global bins)
-    nodejs_22
+    nodejs_24
     biome
     typescript   # provides `tsc`
     stylelint
