@@ -301,11 +301,16 @@
 				['large', 800, 800]
 			];
 			let previewData = '';
-			for (const [size, w, h] of SIZES) {
-				const blob = await bitmapToBlob(bitmap, w, h);
-				if (size === 'preview') previewData = await blobToDataUrl(blob);
-				await uploadThumbnail(file.id, size, blob).catch(() => {});
-			}
+			// Render the blobs and push all three sizes in parallel; `previewData`
+			// is captured before its upload so the local preview shows even if that
+			// upload fails (allSettled swallows per-size failures, as before).
+			await Promise.allSettled(
+				SIZES.map(async ([size, w, h]) => {
+					const blob = await bitmapToBlob(bitmap, w, h);
+					if (size === 'preview') previewData = await blobToDataUrl(blob);
+					await uploadThumbnail(file.id, size, blob);
+				})
+			);
 			if (previewData) videoThumbs = { ...videoThumbs, [file.id]: previewData };
 		} catch {
 			// Keep the generic play badge on failure.

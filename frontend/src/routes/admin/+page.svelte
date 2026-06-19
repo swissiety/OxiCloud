@@ -320,7 +320,7 @@
 		try {
 			migration = await getMigration();
 			if (migration.status === 'running') {
-				if (!migrationTimer) migrationTimer = setInterval(loadMigration, 2000);
+				if (!migrationTimer) migrationTimer = setInterval(loadMigration, 5000);
 			} else {
 				stopMigrationPoll();
 			}

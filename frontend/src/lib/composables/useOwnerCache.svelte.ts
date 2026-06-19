@@ -31,14 +31,16 @@ export class OwnerCache {
 
 	/** Resolve every not-yet-cached id in parallel; nullish ids are skipped. */
 	async resolve(ids: Iterable<string | null | undefined>): Promise<void> {
-		const unique = [...new Set([...ids].filter((id): id is string => !!id))];
-		await Promise.all(
-			unique.map(async (id) => {
-				if (this.#names[id]) return;
-				const name = await this.#resolver(id);
-				this.#names = { ...this.#names, [id]: name };
-			})
+		const pending = [...new Set([...ids].filter((id): id is string => !!id))].filter(
+			(id) => !this.#names[id]
 		);
+		if (pending.length === 0) return;
+		const resolved = await Promise.all(
+			pending.map(async (id) => [id, await this.#resolver(id)] as const)
+		);
+		// One reactive assignment for the whole batch instead of one per id, so a
+		// large resolve doesn't spread-copy the record N times (and re-run derives N times).
+		this.#names = { ...this.#names, ...Object.fromEntries(resolved) };
 	}
 }
 

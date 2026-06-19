@@ -96,10 +96,15 @@ class FilesStore {
 		this.selection = new Set();
 	}
 
+	// Soft ceiling so the per-item toggle can't grow the set without bound.
+	// (Bulk "select all" lives in the views and intentionally isn't capped —
+	// silently dropping ids there would break batch delete/move.)
+	static readonly MAX_SELECTION = 10_000;
+
 	toggleSelected(id: string): void {
 		const next = new Set(this.selection);
 		if (next.has(id)) next.delete(id);
-		else next.add(id);
+		else if (next.size < FilesStore.MAX_SELECTION) next.add(id);
 		this.selection = next;
 	}
 }
