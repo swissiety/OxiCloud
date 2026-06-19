@@ -23,9 +23,53 @@
 				}
 			})();
 		</script>
+		<!--
+			Instant boot splash. Paints on HTML parse (before the app bundle and its
+			CSS load), covering the otherwise-blank gap during JS download/parse for a
+			faster perceived first paint. The root layout removes `#app-splash` as soon
+			as it mounts. `light-dark()` + the early `color-scheme` rules match the
+			resolved theme so there's no colour flash when the app CSS arrives.
+		-->
+		<style>
+			html[data-color-scheme='dark'] {
+				color-scheme: dark;
+			}
+			html[data-color-scheme='light'] {
+				color-scheme: light;
+			}
+			#app-splash {
+				position: fixed;
+				inset: 0;
+				z-index: 9999;
+				display: grid;
+				place-items: center;
+				background: light-dark(#f5f7fa, #0f172a);
+			}
+			#app-splash__spinner {
+				width: 38px;
+				height: 38px;
+				border-radius: 50%;
+				border: 3px solid light-dark(#e2e8f0, #334155);
+				border-top-color: #ff5e3a;
+				animation: app-splash-spin 0.7s linear infinite;
+			}
+			@keyframes app-splash-spin {
+				to {
+					transform: rotate(360deg);
+				}
+			}
+			@media (prefers-reduced-motion: reduce) {
+				#app-splash__spinner {
+					animation: none;
+				}
+			}
+		</style>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">
+		<div id="app-splash" role="status" aria-label="Loading">
+			<div id="app-splash__spinner"></div>
+		</div>
 		<div style="display: contents">%sveltekit.body%</div>
 	</body>
 </html>

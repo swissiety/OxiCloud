@@ -21,6 +21,11 @@
 	let ready = $state(false);
 
 	onMount(async () => {
+		// The instant HTML boot splash has done its job — the app is mounted, so
+		// the route (login renders immediately; protected routes show their own
+		// loading state) is already in the DOM behind it.
+		document.getElementById('app-splash')?.remove();
+
 		// Redirect old `#/...` bookmarks to the new path before anything else.
 		if (typeof location !== 'undefined' && location.hash.startsWith('#/')) {
 			const mapped = hashUrlToPath(location.hash);
