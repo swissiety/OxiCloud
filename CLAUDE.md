@@ -6,7 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This project is split into two parts:
 - `/src` — OxiCloud Backend server in **Rust**
-- `/static` — Oxicloud Frontend in **vanilla CSS & vanilla JavaScript**
+- `/frontend` — OxiCloud Frontend: a **SvelteKit (Svelte 5) + TypeScript** single-page app built with Vite
+
+> The original vanilla-JS/CSS frontend still lives in `/static` and is retained
+> during the migration, but new frontend work goes in `/frontend`. Vite builds
+> the SvelteKit app to `static-dist/`, which the Rust web layer serves in
+> release.
 
 # Backend part
 
@@ -159,63 +164,81 @@ Canonical examples to mirror: `authz.denied` in `application/ports/authorization
 
 # Frontend part
 
+The frontend is a **SvelteKit** single-page app (Svelte 5 + TypeScript, Vite,
+`adapter-static`) under `frontend/`. Vite builds it to `static-dist/`, which the
+Rust web layer serves in release (unmatched client routes fall back to the SPA
+shell); `PROFILE=dev` serves the unbuilt source. The legacy vanilla frontend in
+`static/` is retained for now but is **not** where new work goes.
+
+## Frontend Build & Dev Commands
+
+Run from `frontend/` (or via the `fe-*` justfile recipes from the repo root):
+
+```bash
+npm ci                 # install deps                     (just fe-install)
+npm run dev            # Vite dev server + HMR             (just fe-dev) — backend must run on :8086
+npm run build          # build the SPA → static-dist/      (just fe-build)
+npm run check          # svelte-check + ESLint + Stylelint + Prettier (just fe-check)
+npm run test:unit      # Vitest                            (just fe-test)
+npm run format         # prettier --write .
+```
+
+`just dev` runs the backend and the Vite dev server together. CI uses **Node 24**; Node 22+ works locally.
+
+## Frontend Architecture (`frontend/src/`)
+
+- `routes/` — SvelteKit pages (`+page.svelte`, `+layout.svelte`), one folder per route (`files/[...path]`, `photos`, `shared`, `trash`, `admin`, `s/[token]`, …).
+- `lib/components/` — reusable Svelte components (`AppShell`, `PhotoLightbox`, `ShareDialog`, `Modal`, …).
+- `lib/api/` — HTTP layer: `client.ts` (`apiFetch`/`apiJson`), `csrf.ts` (`getCsrfHeaders`), `types.ts` (API DTO types — map the backend here), and `endpoints/*.ts` (one module per area: files, folders, photos, people, grants, …).
+- `lib/stores/` — global reactive state as `*.svelte.ts` rune stores (`session`, `ui`, `theme`, `dialogs`).
+- `lib/composables/` — reusable rune logic (`useSelection`, `useOwnerCache`).
+- `lib/i18n/` — bespoke reactive i18n; `t(key, [params], fallback)` reads `frontend/static/locales/*.json` (16 locales) with `{{param}}` interpolation and an English fallback.
+- `lib/icons/` — `Icon.svelte` + a generated Font Awesome `registry.ts`.
+- `lib/utils/`, `lib/vendor/` — shared helpers and minimal typings/loaders for vendored libs.
+- `lib/styles/` — global CSS (`app.css`, `base/`, `ported/`).
+- `static/` — served at the web root: `locales/`, `vendors/` (maplibre-gl, pmtiles, hash-wasm), `workers/` (deltaWorker), optional `basemaps/`.
+
 ## Code conventions
 
-### Javascript
+### Svelte / TypeScript
 
-- ES Modules (import/export), no CommonJS
-- No frameworks — vanilla JS only
-- Naming: `camelCase` for variables/functions, `PascalCase` for classes
-- No `var` — use `const`/`let` only
-- **JSDoc required** on all public functions — `jsconfig.json` enables `checkJs` globally (equivalent to `@ts-check` on every file)
-- Always us static/js/core/types.js to mapp OxCcloud API structure
-- Type parameters, return types, and complex types via `@typedef`:
-
-```js
-/**
- * @typedef {Object} User
- * @property {number} id
- * @property {string} name
- */
-
-/**
- * @param {User} user
- * @param {string} [role="viewer"]
- * @returns {Promise}
- */
-async function updateUser(user, role = 'viewer') { … }
-```
+- **Svelte 5 runes** — `$state`, `$derived`, `$props`, `$effect`, `$bindable`. No legacy `export let` for new components.
+- **TypeScript everywhere** (`lang="ts"` in components). **No `any`** — `typescript-eslint` recommended is enforced; prefer precise types, `unknown` + narrowing, or a minimal declared interface for an untyped global (see `lib/vendor/maplibre.ts`).
+- ES Modules; `camelCase` for variables/functions, `PascalCase` for components/classes; `const`/`let`, never `var`.
+- API DTO shapes live in `lib/api/types.ts`; call the backend through `lib/api/endpoints/*` — don't bare-`fetch` `/api` from components.
 
 ### Code duplication
 
-Never duplicate logic across JS modules. If the same behaviour is needed in more than one place, extract it into a shared utility function and import it. Preferred homes:
-- DOM/UI helpers → `static/js/utils/` or an existing utility module
-- API call wrappers → the relevant API module (e.g. `api/files.js`)
-- Event or state patterns shared across components → a dedicated shared module
+Never duplicate logic across modules/components. Extract shared behaviour:
+- DOM/UI helpers → `lib/utils/`
+- API wrappers → the relevant `lib/api/endpoints/*` module
+- Cross-component state/logic → a `lib/stores/*.svelte.ts` store or a `lib/composables/*`
+- Shared markup → a component (e.g. `PhotoLightbox` is shared by the photos grid, People and Places)
 
 ### CSS
-- BEM methodology for class names (`.block__element--modifier`)
-- CSS custom properties in `:root` for colors and spacing
-- **All colors must use `var(--*)` — no raw hex, rgb, or named colors anywhere except in `:root` declarations**
-- Mobile-first: media queries expand, they don't restrict
-- One CSS file per logical component in `/static/css/`
-- [data-theme="dark"] is permitted only in /static/css/themes/dark.css
+
+- BEM methodology for class names (`.block__element--modifier`).
+- Component styles live in the component's scoped `<style>`; cross-cutting tokens/styles in `lib/styles/`.
+- **All colors must use `var(--*)`** — no raw hex, rgb, or named colors (Stylelint enforces `function-disallowed-list`); define tokens in `lib/styles/base/variables.css`.
+- Mobile-first: media queries expand, they don't restrict.
+- Dark mode keys off `<html data-color-scheme="dark">`.
 
 ## Frontend Pre-commit checks
 
-Always run these before committing, in this order:
+Always run from `frontend/` before committing:
 
 ```bash
-biome check --fix                                           # Auto-format
-biome lint  --fix                                           # Lint (must pass)
-stylelint static/css/                                       # Css rules
-tsc -p jsconfig.json --noEmit                               # Ensure JS is always typed
+npm run check       # svelte-kit sync && svelte-check && eslint . && stylelint "src/**/*.{css,svelte}" && prettier --check .
+npm run test:unit   # Vitest
 ```
 
+CI runs the same `npm run check` (plus Vitest) — commits that fail will not merge.
+
 # What Claude must NOT do
-- Edit `Cargo.lock` directly
-- Use npm dependencies not listed in this file
-- Introduce a JS framework (React, Vue, etc.) without explicit approval
+- Edit `Cargo.lock` or `frontend/package-lock.json` by hand
+- Introduce a different JS framework (React, Vue, etc.) — the frontend is SvelteKit/Svelte 5
+- Add a heavy runtime npm dependency without discussion — prefer vendoring + lazy-loading under `frontend/static/vendors/` (see maplibre-gl / pmtiles)
+- Use `any` in TypeScript
 - Leave debug `console.log` statements in code
 - Use raw color values in CSS — always use CSS custom properties
-- Commit without passing all linters
+- Commit without passing all linters (`npm run check` for the frontend; `cargo fmt` + `cargo clippy` for the backend)
