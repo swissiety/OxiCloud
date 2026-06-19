@@ -218,10 +218,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Two parallel subtrees off root: one for the user-grant scenario, one for
     // the group-grant scenario. Each has its own depth/fanout shape so a single
     // grant cascades over a known fixed number of descendants.
+    // Post-D0: every folder needs a drive_id (NOT NULL) and root folders
+    // (parent_id IS NULL) are reserved for the atomic drive-creation
+    // transaction. The load-seed subtrees nest under admin's default
+    // personal drive's root folder ("Personal") — they're a workload
+    // shape, not their own drives. Look it up once and pass to both
+    // build_subtree calls so they share the same parent.
+    let admin_root: (Uuid,) = sqlx::query_as(
+        "SELECT f.id FROM storage.folders f
+           JOIN storage.drives d ON d.root_folder_id = f.id
+          WHERE d.default_for_user = $1
+          LIMIT 1",
+    )
+    .bind(admin.id)
+    .fetch_one(&pool)
+    .await?;
+    let admin_root_id = admin_root.0;
+
     let shared_subtree =
-        build_subtree(&pool, admin.id, "shared_root", args.depth, args.fanout).await?;
+        build_subtree(&pool, admin.id, admin_root_id, "shared_root", args.depth, args.fanout).await?;
     let group_subtree =
-        build_subtree(&pool, admin.id, "group_root", args.depth, args.fanout).await?;
+        build_subtree(&pool, admin.id, admin_root_id, "group_root", args.depth, args.fanout).await?;
 
     let total_folders = shared_subtree.all_ids.len() as u64 + group_subtree.all_ids.len() as u64;
     let total_leaves = shared_subtree.leaves.len() + group_subtree.leaves.len();
@@ -463,7 +480,14 @@ struct Subtree {
     leaves: Vec<Uuid>,
 }
 
-/// Build a folder tree under `parent=NULL` rooted at `root_name`.
+/// Build a folder tree under `parent_id = mount_under` rooted at `root_name`.
+///
+/// `mount_under` is an existing folder UUID (post-D0: the user's default
+/// drive's root folder, since root folders — `parent_id IS NULL` — are
+/// reserved for the atomic drive-creation transaction and would trip
+/// the no-orphan-root-folder constraint trigger). Every level's
+/// `drive_id` is derived from the parent folder so the NOT NULL column
+/// is satisfied automatically.
 ///
 /// Inserts level-by-level so `trg_folders_path` resolves `path`/`lpath` from
 /// the already-committed parent rows. Returns the root, a depth-4 sample, the
@@ -471,6 +495,7 @@ struct Subtree {
 async fn build_subtree(
     pool: &PgPool,
     user_id: Uuid,
+    mount_under: Uuid,
     root_name: &str,
     depth: u32,
     fanout: u32,
@@ -485,14 +510,19 @@ async fn build_subtree(
         root_name, predicted
     );
 
-    // Level 0 — the root folder.
+    // Level 0 — the subtree's "root" sits inside `mount_under`, not at
+    // parent_id=NULL. drive_id is inherited from the mount point.
     let root: (Uuid,) = sqlx::query_as(
-        "INSERT INTO storage.folders (name, parent_id, user_id)
-         VALUES ($1, NULL, $2)
+        "INSERT INTO storage.folders
+            (name, parent_id, user_id, drive_id, created_by, updated_by)
+         SELECT $1, parent.id, $2, parent.drive_id, $2, $2
+           FROM storage.folders parent
+          WHERE parent.id = $3::uuid
          RETURNING id",
     )
     .bind(root_name)
     .bind(user_id)
+    .bind(mount_under)
     .fetch_one(pool)
     .await?;
     let root_id = root.0;
@@ -523,10 +553,16 @@ async fn build_subtree(
             parents.len()
         );
 
+        // drive_id derives from the parent folder — same pattern as
+        // file_blob_write_repository's resolve_owner_and_drive helper.
+        // Every parent in `current_level` already has a drive_id set,
+        // so the JOIN is guaranteed to find one.
         let rows: Vec<(Uuid,)> = sqlx::query_as(
-            "INSERT INTO storage.folders (name, parent_id, user_id)
-             SELECT f.name, f.parent_id, $1
+            "INSERT INTO storage.folders
+                (name, parent_id, user_id, drive_id, created_by, updated_by)
+             SELECT f.name, f.parent_id, $1, parent.drive_id, $1, $1
                FROM UNNEST($2::uuid[], $3::text[]) AS f(parent_id, name)
+               JOIN storage.folders parent ON parent.id = f.parent_id
              RETURNING id",
         )
         .bind(user_id)
@@ -601,10 +637,17 @@ async fn insert_files(
         .flat_map(|li| (0..files_per_leaf).map(move |fi| format!("file_{}_{}.txt", li, fi)))
         .collect();
 
+    // Post-D0: storage.files.drive_id is NOT NULL — derive it from the
+    // parent folder (same pattern as file_blob_write_repository's
+    // INSERTs and the resolve_owner_and_drive helper). The folder's
+    // drive_id was set during the M2 backfill or by the lifecycle hook
+    // for users provisioned after D0.
     sqlx::query(
-        "INSERT INTO storage.files (name, folder_id, user_id, blob_hash, size, mime_type)
-         SELECT f.name, f.folder_id, $1, $2, 0, 'text/plain'
-           FROM UNNEST($3::uuid[], $4::text[]) AS f(folder_id, name)",
+        "INSERT INTO storage.files
+            (name, folder_id, user_id, drive_id, blob_hash, size, mime_type)
+         SELECT f.name, f.folder_id, $1, fo.drive_id, $2, 0, 'text/plain'
+           FROM UNNEST($3::uuid[], $4::text[]) AS f(folder_id, name)
+           JOIN storage.folders fo ON fo.id = f.folder_id",
     )
     .bind(user_id)
     .bind(blob_hash)
