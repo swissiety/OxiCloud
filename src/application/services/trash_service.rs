@@ -568,9 +568,11 @@ impl TrashUseCase for TrashService {
                                 }
                             }
                             Err(e) => {
-                                // Check if the file is not found - in that case, we can continue
-                                // because we still want to remove the item from the trash index
-                                if format!("{}", e).contains("not found") {
+                                // File already gone — still remove the trash index
+                                // entry. Match on the typed error kind, not the
+                                // message text, so a reworded message can't
+                                // silently turn this into a hard failure.
+                                if e.kind == ErrorKind::NotFound {
                                     info!(
                                         "File not found, may already have been deleted: {}",
                                         file_id
@@ -608,8 +610,9 @@ impl TrashUseCase for TrashService {
                                 info!("Successfully deleted folder permanently: {}", folder_id);
                             }
                             Err(e) => {
-                                // Check if the folder is not found - in that case, we can continue
-                                if format!("{}", e).contains("not found") {
+                                // Folder already gone — still remove the trash
+                                // index entry. Typed-kind match (see file branch).
+                                if e.kind == ErrorKind::NotFound {
                                     info!(
                                         "Folder not found, may already have been deleted: {}",
                                         folder_id
