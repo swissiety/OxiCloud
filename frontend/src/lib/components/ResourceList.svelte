@@ -331,10 +331,7 @@
 		{#if showOwner}
 			<div class="owner-cell">
 				{#if entry.ownerId}
-					<UserVignette
-						userId={entry.ownerId}
-						fallbackLabel={entry.ownerName ?? undefined}
-					/>
+					<UserVignette userId={entry.ownerId} fallbackLabel={entry.ownerName ?? undefined} />
 				{:else}
 					<span class="owner-cell__placeholder">{entry.ownerName ?? '—'}</span>
 				{/if}

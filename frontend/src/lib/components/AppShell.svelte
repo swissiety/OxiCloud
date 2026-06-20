@@ -7,7 +7,6 @@
 	import { fileInlineUrl } from '$lib/api/endpoints/files';
 	import type { FileItem, FolderItem } from '$lib/api/types';
 	import { lazyComponent } from '$lib/composables/lazyComponent.svelte';
-	import CommandPalette from '$lib/components/CommandPalette.svelte';
 	import DrivePicker from '$lib/components/DrivePicker.svelte';
 	import Icon from '$lib/icons/Icon.svelte';
 	import { iconNameFromClass } from '$lib/utils/display';

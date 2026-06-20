@@ -68,10 +68,7 @@
 		<div class="card">
 			<h2>{t('drive.not_found_title', 'Drive not found')}</h2>
 			<p class="muted">
-				{t(
-					'drive.not_found_body',
-					"This drive doesn't exist or you don't have access to it."
-				)}
+				{t('drive.not_found_body', "This drive doesn't exist or you don't have access to it.")}
 			</p>
 			<a class="link" href="/files">{t('drive.back_to_files', 'Back to Files')}</a>
 		</div>
@@ -124,7 +121,13 @@
 				</div>
 			</div>
 			{#if drive.quota_bytes && drive.quota_bytes > 0}
-				<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(storagePct)}>
+				<div
+					class="bar"
+					role="progressbar"
+					aria-valuemin="0"
+					aria-valuemax="100"
+					aria-valuenow={Math.round(storagePct)}
+				>
 					<div class="bar__fill" style:width="{storagePct}%"></div>
 				</div>
 			{/if}
