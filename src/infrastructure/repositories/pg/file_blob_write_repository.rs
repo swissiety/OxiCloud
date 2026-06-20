@@ -355,6 +355,36 @@ impl FileBlobWriteRepository {
                     if let sqlx::Error::Database(ref db_err) = e
                         && db_err.code().as_deref() == Some("23505")
                     {
+                        // Idempotent re-upload: if the conflicting file already
+                        // holds IDENTICAL content (same folder, same name, same
+                        // blob hash), treat this as success and return that file
+                        // instead of erroring. Re-uploading a partially-uploaded
+                        // folder then becomes a clean no-op for everything that
+                        // already landed — only the genuinely missing files
+                        // transfer — instead of surfacing hundreds of spurious
+                        // "already exists" failures. The duplicate blob reference
+                        // taken during ingest was just released above, so the
+                        // existing file's own reference is the only one (correct);
+                        // a different-content clash still returns the conflict.
+                        match self.fetch_identical_file(fid, &name, blob_hash).await {
+                            Ok(Some(existing)) => {
+                                tracing::info!(
+                                    "♻️ IDEMPOTENT UPLOAD: {} already present, identical content (hash: {})",
+                                    name,
+                                    &blob_hash[..12]
+                                );
+                                return Ok(existing);
+                            }
+                            Ok(None) => {} // genuine conflict (different content)
+                            Err(lookup_err) => {
+                                tracing::warn!(
+                                    "idempotency lookup failed for {} (hash {}): {} — returning conflict",
+                                    name,
+                                    &blob_hash[..12],
+                                    lookup_err
+                                );
+                            }
+                        }
                         return Err(DomainError::already_exists(
                             "File",
                             format!("'{name}' already exists in this folder"),
@@ -388,6 +418,85 @@ impl FileBlobWriteRepository {
             created_by,
             updated_by,
         )
+    }
+
+    /// Fetch a non-trashed file in `folder_id` named `name` whose content blob
+    /// is `blob_hash` — the "is this re-upload byte-identical?" probe that makes
+    /// uploads idempotent on a name conflict. `Ok(None)` means the conflicting
+    /// file has *different* content (a genuine clash the caller must report).
+    async fn fetch_identical_file(
+        &self,
+        folder_id: &str,
+        name: &str,
+        blob_hash: &str,
+    ) -> Result<Option<File>, DomainError> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                Uuid,
+                String,
+                i64,
+                i64,
+                Option<Uuid>,
+                Option<Uuid>,
+                i64,
+                String,
+            ),
+        >(
+            r#"
+            SELECT f.id::text, f.user_id, fo.path,
+                   EXTRACT(EPOCH FROM f.created_at)::bigint,
+                   EXTRACT(EPOCH FROM f.updated_at)::bigint,
+                   f.created_by, f.updated_by, f.size, f.mime_type
+              FROM storage.files f
+              JOIN storage.folders fo ON fo.id = f.folder_id
+             WHERE f.folder_id = $1::uuid
+               AND f.name = $2
+               AND f.blob_hash = $3
+               AND NOT f.is_trashed
+             LIMIT 1
+            "#,
+        )
+        .bind(folder_id)
+        .bind(name)
+        .bind(blob_hash)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            DomainError::internal_error("FileBlobWrite", format!("idempotency lookup: {e}"))
+        })?;
+
+        let Some((
+            id,
+            user_id,
+            folder_path,
+            created_at,
+            updated_at,
+            created_by,
+            updated_by,
+            size,
+            mime_type,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        Self::row_to_file(
+            id,
+            name.to_string(),
+            Some(folder_id.to_string()),
+            Some(folder_path),
+            size,
+            mime_type,
+            created_at,
+            updated_at,
+            Some(user_id),
+            blob_hash.to_string(),
+            created_by,
+            updated_by,
+        )
+        .map(Some)
     }
 }
 

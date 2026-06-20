@@ -349,11 +349,34 @@
 	}
 
 	/**
+	 * Upload one file, retrying once on a transient failure. A connection the
+	 * watchdog aborted, or an upload the server actually committed before the
+	 * client gave up, both recover here: the backend treats a re-upload of
+	 * byte-identical content as success (idempotent), so the retry is a clean
+	 * no-op for anything that already landed and a real second chance for the
+	 * rest. A quota error is never retried — the disk won't free up mid-batch.
+	 */
+	async function uploadWithRetry(
+		folderId: string | null,
+		file: File,
+		report: (frac: number) => void,
+		ownedHash: string | null
+	): Promise<number> {
+		try {
+			return await withTimeout(uploadOneFile(folderId, file, report, ownedHash), FILE_BACKSTOP_MS);
+		} catch (e) {
+			if ((e as { isQuota?: boolean } | null)?.isQuota) throw e;
+			report(0); // reset this file's progress for the second attempt
+			return await withTimeout(uploadOneFile(folderId, file, report, ownedHash), FILE_BACKSTOP_MS);
+		}
+	}
+
+	/**
 	 * Upload `items` ({file, folderId}) with bounded concurrency, a per-file
 	 * deadline and live aggregate progress. A stuck or failing file no longer
-	 * freezes the batch: it blocks only its own lane (the rest keep going) and
-	 * eventually times out / is skipped. Quota exhaustion stops the run early.
-	 * Returns the bytes deduplicated and the count of files that failed.
+	 * freezes the batch: it blocks only its own lane (the rest keep going), is
+	 * retried once, and only then counted as failed. Quota exhaustion stops the
+	 * run early. Returns the bytes deduplicated and the count of files that failed.
 	 */
 	async function uploadAll(
 		items: { file: File; folderId: string | null }[],
@@ -377,19 +400,12 @@
 			while (next < total) {
 				const i = next++;
 				const { file, folderId } = items[i];
+				const report = (f: number) => {
+					if (!Number.isNaN(f)) frac[i] = Math.min(1, f);
+					refresh();
+				};
 				try {
-					savedBytes += await withTimeout(
-						uploadOneFile(
-							folderId,
-							file,
-							(f) => {
-								if (!Number.isNaN(f)) frac[i] = Math.min(1, f);
-								refresh();
-							},
-							owned.get(file) ?? null
-						),
-						FILE_BACKSTOP_MS
-					);
+					savedBytes += await uploadWithRetry(folderId, file, report, owned.get(file) ?? null);
 				} catch (e) {
 					failures++;
 					// A full disk won't recover within this batch — stop pulling new
