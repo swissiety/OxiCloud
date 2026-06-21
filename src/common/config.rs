@@ -901,6 +901,11 @@ pub struct FeaturesConfig {
     /// Expose other OxiCloud users as a read-only "system" address book
     /// at GET /api/address-books. Set to false to hide the user directory.
     pub expose_system_users: bool,
+    /// Generate video thumbnails server-side via `ffmpeg` on upload. When true
+    /// (and ffmpeg is detected at startup) videos get a representative-frame
+    /// thumbnail through the same WebP pipeline as photos; otherwise videos have
+    /// no thumbnail. Env: `OXICLOUD_ENABLE_VIDEO_THUMBNAILS`.
+    pub enable_video_thumbnails: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -908,13 +913,14 @@ impl Default for FeaturesConfig {
         Self {
             enable_auth: true, // Enable authentication by default
             enable_user_storage_quotas: false,
-            enable_file_sharing: true, // Enable file sharing by default
-            enable_trash: true,        // Enable trash feature
-            enable_search: true,       // Enable search feature
-            enable_music: true,        // Enable music feature
-            enable_places: true,       // Photo map (GET /api/photos/geo + Places tab)
-            enable_faces: false,       // People/faces (biometric) — opt-in, off by default
-            expose_system_users: true, // Expose OxiCloud users as address book by default
+            enable_file_sharing: true,     // Enable file sharing by default
+            enable_trash: true,            // Enable trash feature
+            enable_search: true,           // Enable search feature
+            enable_music: true,            // Enable music feature
+            enable_places: true,           // Photo map (GET /api/photos/geo + Places tab)
+            enable_faces: false,           // People/faces (biometric) — opt-in, off by default
+            expose_system_users: true,     // Expose OxiCloud users as address book by default
+            enable_video_thumbnails: true, // Video thumbs via ffmpeg (if detected)
         }
     }
 }
@@ -1467,6 +1473,13 @@ impl AppConfig {
             && let Ok(val) = enable_places
         {
             config.features.enable_places = val;
+        }
+
+        if let Ok(enable_video_thumbnails) =
+            env::var("OXICLOUD_ENABLE_VIDEO_THUMBNAILS").map(|v| v.parse::<bool>())
+            && let Ok(val) = enable_video_thumbnails
+        {
+            config.features.enable_video_thumbnails = val;
         }
 
         if let Ok(enable_faces) = env::var("OXICLOUD_ENABLE_FACES").map(|v| v.parse::<bool>())

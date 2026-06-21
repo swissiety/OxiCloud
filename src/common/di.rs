@@ -46,6 +46,7 @@ use crate::infrastructure::services::search_index::content_index_worker::Content
 use crate::infrastructure::services::search_index::tantivy_content_index::TantivyContentIndex;
 use crate::infrastructure::services::trash_cleanup_service::TrashCleanupService;
 
+use crate::application::ports::video_frame_ports::VideoFramePort;
 use crate::application::services::app_password_service::AppPasswordService;
 use crate::application::services::blob_lifecycle_service::BlobLifecycleService;
 use crate::application::services::calendar_service::CalendarService;
@@ -66,6 +67,9 @@ use crate::infrastructure::repositories::pg::{
 use crate::infrastructure::services::audio_metadata_service::AudioMetadataService;
 use crate::infrastructure::services::chunked_upload_service::ChunkedUploadService;
 use crate::infrastructure::services::dedup_service::DedupService;
+use crate::infrastructure::services::ffmpeg_video_frame_service::{
+    FfmpegVideoFrameService, NoopVideoFrameService,
+};
 use crate::infrastructure::services::image_transcode_service::ImageTranscodeService;
 use crate::infrastructure::services::jwt_service::JwtTokenService;
 use crate::infrastructure::services::media_metadata_service::MediaMetadataService;
@@ -350,9 +354,64 @@ impl AppServiceFactory {
         // ThumbnailRefreshHook: handles FileLifecycleHook events (create/update/delete).
         // Implemented on ThumbnailRefreshHook (not ThumbnailService) to avoid circular Arc:
         //   DedupService → BlobLifecycleService → ThumbnailRefreshHook → DedupService.
+        // Video frame extractor for thumbnails. Detect ffmpeg once at startup so
+        // the choice (real extractor vs. no-op) is logged here instead of failing
+        // per upload.
+        let video_frame: Arc<dyn VideoFramePort> = {
+            let ffmpeg_path =
+                std::env::var("OXICLOUD_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
+            if self.config.features.enable_video_thumbnails
+                && FfmpegVideoFrameService::is_available(&ffmpeg_path)
+            {
+                let cpus = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let concurrency = std::env::var("OXICLOUD_VIDEO_THUMBNAIL_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or((cpus / 2).max(1));
+                let timeout = std::time::Duration::from_secs(
+                    std::env::var("OXICLOUD_VIDEO_THUMBNAIL_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30),
+                );
+                tracing::info!(
+                    "🎬 Video thumbnails enabled (ffmpeg '{}', concurrency {})",
+                    ffmpeg_path,
+                    concurrency
+                );
+                Arc::new(FfmpegVideoFrameService::new(
+                    ffmpeg_path,
+                    concurrency,
+                    timeout,
+                ))
+            } else {
+                if self.config.features.enable_video_thumbnails {
+                    tracing::warn!(
+                        "🎬 Video thumbnails enabled but ffmpeg not found at '{}' \
+                         (set OXICLOUD_FFMPEG_PATH) — videos will have no thumbnail",
+                        ffmpeg_path
+                    );
+                } else {
+                    tracing::info!("🎬 Video thumbnails disabled");
+                }
+                Arc::new(NoopVideoFrameService)
+            }
+        };
+        // Cap on bytes streamed to a temp file for frame extraction (default 2 GB).
+        // saturating_mul so an absurd MB value can't silently wrap to a tiny cap.
+        let video_max_bytes: u64 = std::env::var("OXICLOUD_VIDEO_THUMBNAIL_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2048)
+            .saturating_mul(1024 * 1024);
+
         let thumbnail_refresh_hook = Arc::new(ThumbnailRefreshHook::new(
             thumbnail_service.clone(),
             dedup_service.clone(),
+            video_frame,
+            video_max_bytes,
         ));
 
         // Build the unified FileLifecycleService dispatcher.

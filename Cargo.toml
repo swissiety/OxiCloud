@@ -155,6 +155,13 @@ name = "bench_thumbnails_mem"
 path = "examples/bench_thumbnails_mem.rs"
 required-features = ["bench"]
 
+# Video thumbnail benchmark — Option B (server-side ffmpeg frame → WebP). Needs
+# `ffmpeg` on PATH (libx264/libx265/libvpx-vp9 to synthesize the test corpus).
+[[example]]
+name = "bench_video_thumbnails"
+path = "examples/bench_video_thumbnails.rs"
+required-features = ["bench"]
+
 # DB connection-pool tail-latency benchmark (needs the dev Postgres up).
 [[example]]
 name = "bench_db_pool"

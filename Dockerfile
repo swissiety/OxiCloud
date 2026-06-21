@@ -67,9 +67,11 @@ LABEL org.opencontainers.image.title="OxiCloud" \
 
 # Install only necessary runtime dependencies and update packages
 # su-exec is needed by the entrypoint to drop privileges after fixing volume permissions.
+# ffmpeg powers server-side video thumbnail extraction (one frame → WebP pipeline);
+# without it videos simply have no thumbnail (OXICLOUD_ENABLE_VIDEO_THUMBNAILS).
 # No libpq: the pure-Rust sqlx postgres driver never links it.
 RUN apk --no-cache upgrade && \
-    apk add --no-cache libgcc ca-certificates tzdata su-exec && \
+    apk add --no-cache libgcc ca-certificates tzdata su-exec ffmpeg && \
     addgroup -g 1001 -S oxicloud && \
     adduser -u 1001 -S oxicloud -G oxicloud
 

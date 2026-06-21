@@ -25,6 +25,7 @@ use tokio::time::timeout;
 use crate::application::ports::thumbnail_ports::{
     ThumbnailFormat, ThumbnailPort, ThumbnailSize as PortThumbnailSize, ThumbnailStatsDto,
 };
+use crate::application::ports::video_frame_ports::VideoFramePort;
 use crate::domain::errors::{DomainError, ErrorKind};
 use crate::infrastructure::services::dedup_service::DedupService;
 
@@ -93,6 +94,11 @@ const WEBP_QUALITY: f32 = 82.0;
 
 /// Environment override for the decode-concurrency cap (ops tuning).
 const DECODE_CONCURRENCY_ENV: &str = "OXICLOUD_THUMBNAIL_DECODE_CONCURRENCY";
+
+/// Wall-clock cap for streaming a video blob to a temp file before frame
+/// extraction. Bounds a stalled remote object-store read so the background task
+/// (and its temp file) can't hang forever.
+const STREAM_TO_TEMP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Compute max concurrent thumbnail decode operations at runtime.
 ///
@@ -1094,43 +1100,193 @@ impl ThumbnailService {
                 }
             };
 
-            let results = tokio::task::spawn_blocking(move || {
-                Self::render_all_thumbnails_from_data(original_data.as_ref(), ThumbnailFormat::Webp)
-            })
-            .await;
+            self.render_and_persist_all_webp(&file_id, &blob_hash, original_data)
+                .await;
 
-            let thumbnails = match results {
+            tracing::info!("✅ Background thumbnail generation complete: {}", file_id);
+        });
+    }
+
+    /// Render every size as WebP from a decoded source image and persist them by
+    /// blob_hash (disk `{hash}.webp` + moka). Shared by the image upload path and
+    /// the video path (which passes the extracted frame as the source), so both
+    /// produce identical, dedup-able, content-negotiable thumbnails.
+    async fn render_and_persist_all_webp(&self, file_id: &str, blob_hash: &str, source: Bytes) {
+        let results = tokio::task::spawn_blocking(move || {
+            Self::render_all_thumbnails_from_data(source.as_ref(), ThumbnailFormat::Webp)
+        })
+        .await;
+
+        let thumbnails = match results {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                tracing::warn!("Thumbnail generation failed for {}: {}", file_id, e);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("Thumbnail task panicked for {}: {}", file_id, e);
+                return;
+            }
+        };
+
+        for (size, bytes) in thumbnails {
+            let thumb_path = self.get_thumbnail_path(blob_hash, size, ThumbnailFormat::Webp);
+            if let Some(parent) = thumb_path.parent() {
+                let _ = fs::create_dir_all(parent).await;
+            }
+            if let Err(e) = fs::write(&thumb_path, &bytes).await {
+                tracing::warn!("Failed to save thumbnail {} {:?}: {}", file_id, size, e);
+            } else {
+                let cache_key = ThumbnailCacheKey {
+                    file_id: file_id.to_string(),
+                    size,
+                    format: ThumbnailFormat::Webp,
+                };
+                self.cache.insert(cache_key, bytes).await;
+                tracing::debug!("✅ Generated thumbnail: {} {:?}", file_id, size);
+            }
+        }
+    }
+
+    /// Eagerly generate WebP thumbnails for a freshly-uploaded video.
+    ///
+    /// Streams the (decrypted, reassembled) blob to a temp file — bounded by
+    /// `max_bytes` so a giant upload never materialises in full — extracts one
+    /// representative frame via `video_frame`, then runs it through the same
+    /// WebP/blob-hash pipeline as photos. Any miss or failure leaves the video
+    /// without a thumbnail (the prior behaviour), never an error to the user.
+    pub fn generate_video_thumbnails_background(
+        self: Arc<Self>,
+        file_id: String,
+        blob_hash: String,
+        dedup: Arc<DedupService>,
+        video_frame: Arc<dyn VideoFramePort>,
+        max_bytes: u64,
+    ) {
+        tokio::spawn(async move {
+            // Blob deleted before this task ran → nothing to do.
+            if !dedup.blob_exists(&blob_hash).await {
+                return;
+            }
+
+            // Dedup hit: thumbnails for this content already exist on disk — just
+            // warm the moka cache (zero CPU), mirroring the image path.
+            let all_exist = {
+                let mut ok = true;
+                for size in ThumbnailSize::all() {
+                    let p = self.get_thumbnail_path(&blob_hash, *size, ThumbnailFormat::Webp);
+                    if fs::metadata(&p).await.is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            };
+            if all_exist {
+                for size in ThumbnailSize::all() {
+                    let p = self.get_thumbnail_path(&blob_hash, *size, ThumbnailFormat::Webp);
+                    if let Ok(data) = fs::read(&p).await {
+                        let key = ThumbnailCacheKey {
+                            file_id: file_id.clone(),
+                            size: *size,
+                            format: ThumbnailFormat::Webp,
+                        };
+                        self.cache.insert(key, Bytes::from(data)).await;
+                    }
+                }
+                return;
+            }
+
+            // ffmpeg needs a seekable file, and the blob may be encrypted/chunked
+            // on disk — stream through the normal decrypting read path into a
+            // bounded temp file (on the data volume) rather than reading the raw
+            // blob path. Bounded by size (max_bytes) AND time, so a stalled remote
+            // backend can't hang the task or leak its temp file forever.
+            let tmp = match tokio::time::timeout(
+                STREAM_TO_TEMP_TIMEOUT,
+                Self::stream_blob_to_temp(&dedup, &blob_hash, max_bytes, &self.thumbnails_root),
+            )
+            .await
+            {
                 Ok(Ok(t)) => t,
                 Ok(Err(e)) => {
-                    tracing::warn!("Thumbnail generation failed for {}: {}", file_id, e);
+                    tracing::warn!("🎬 video thumb: stream {} failed: {}", file_id, e);
                     return;
                 }
-                Err(e) => {
-                    tracing::warn!("Thumbnail task panicked for {}: {}", file_id, e);
+                Err(_) => {
+                    tracing::warn!("🎬 video thumb: stream {} timed out", file_id);
                     return;
                 }
             };
 
-            for (size, bytes) in thumbnails {
-                let thumb_path = self.get_thumbnail_path(&blob_hash, size, ThumbnailFormat::Webp);
-                if let Some(parent) = thumb_path.parent() {
-                    let _ = fs::create_dir_all(parent).await;
+            let frame = match video_frame.extract_frame(tmp.path()).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::info!("🎬 video thumb: extract {} skipped: {}", file_id, e);
+                    return;
                 }
-                if let Err(e) = fs::write(&thumb_path, &bytes).await {
-                    tracing::warn!("Failed to save thumbnail {} {:?}: {}", file_id, size, e);
-                } else {
-                    let cache_key = ThumbnailCacheKey {
-                        file_id: file_id.clone(),
-                        size,
-                        format: ThumbnailFormat::Webp,
-                    };
-                    self.cache.insert(cache_key, bytes).await;
-                    tracing::debug!("✅ Generated thumbnail: {} {:?}", file_id, size);
-                }
-            }
+            };
+            drop(tmp); // remove the temp video promptly; we have the frame bytes
 
-            tracing::info!("✅ Background thumbnail generation complete: {}", file_id);
+            // Bound the CPU-bound decode+resize with the same decode_semaphore the
+            // image path uses (the ffmpeg extractor's own permit covered only
+            // extraction and is already released), so concurrent video uploads
+            // can't spawn unbounded render jobs.
+            let _permit = match self.decode_semaphore.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            self.render_and_persist_all_webp(&file_id, &blob_hash, frame)
+                .await;
+            tracing::info!("✅ Video thumbnail generation complete: {}", file_id);
         });
+    }
+
+    /// Stream a blob through the decrypting/CDC-aware read path into a temp file,
+    /// aborting if it exceeds `max_bytes`. The returned handle deletes the file
+    /// on drop. Bounded memory: chunks are written straight to disk, never
+    /// buffered whole.
+    async fn stream_blob_to_temp(
+        dedup: &DedupService,
+        blob_hash: &str,
+        max_bytes: u64,
+        temp_dir: &Path,
+    ) -> Result<tempfile::NamedTempFile, DomainError> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = dedup.read_blob_stream(blob_hash).await?;
+        // Colocate the temp video with the data volume (sized for blobs) instead
+        // of the OS temp dir, which can be small or a tmpfs in containers.
+        let tmp = tempfile::Builder::new()
+            .prefix("oxithumb-")
+            .tempfile_in(temp_dir)
+            .map_err(|e| DomainError::internal_error("VideoFrame", format!("temp file: {e}")))?;
+        let mut out = tokio::fs::File::create(tmp.path())
+            .await
+            .map_err(|e| DomainError::internal_error("VideoFrame", format!("temp open: {e}")))?;
+
+        let mut written: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                DomainError::internal_error("VideoFrame", format!("blob read: {e}"))
+            })?;
+            written += chunk.len() as u64;
+            if written > max_bytes {
+                return Err(DomainError::internal_error(
+                    "VideoFrame",
+                    format!("video exceeds {max_bytes}-byte thumbnail cap"),
+                ));
+            }
+            out.write_all(&chunk).await.map_err(|e| {
+                DomainError::internal_error("VideoFrame", format!("temp write: {e}"))
+            })?;
+        }
+        out.flush()
+            .await
+            .map_err(|e| DomainError::internal_error("VideoFrame", format!("temp flush: {e}")))?;
+        drop(out); // close our write handle before ffmpeg opens the path
+        Ok(tmp)
     }
 
     /// Delete thumbnails for a file.
@@ -1205,11 +1361,26 @@ impl ThumbnailService {
 pub struct ThumbnailRefreshHook {
     thumbnail: Arc<ThumbnailService>,
     dedup: Arc<DedupService>,
+    /// Video frame extractor (ffmpeg, or a no-op when unavailable/disabled).
+    video_frame: Arc<dyn VideoFramePort>,
+    /// Max bytes streamed to a temp file for video frame extraction; larger
+    /// videos are skipped (no thumbnail) rather than materialised in full.
+    video_max_bytes: u64,
 }
 
 impl ThumbnailRefreshHook {
-    pub fn new(thumbnail: Arc<ThumbnailService>, dedup: Arc<DedupService>) -> Self {
-        Self { thumbnail, dedup }
+    pub fn new(
+        thumbnail: Arc<ThumbnailService>,
+        dedup: Arc<DedupService>,
+        video_frame: Arc<dyn VideoFramePort>,
+        video_max_bytes: u64,
+    ) -> Self {
+        Self {
+            thumbnail,
+            dedup,
+            video_frame,
+            video_max_bytes,
+        }
     }
 }
 
@@ -1222,16 +1393,28 @@ impl crate::application::ports::file_lifecycle::FileLifecycleHook for ThumbnailR
         is_new_blob: bool,
     ) {
         // Blob-hash thumbnail already exists on disk when is_new_blob=false — skip.
-        if !is_new_blob || !ThumbnailService::is_supported_image(content_type) {
+        if !is_new_blob {
             return;
         }
-        self.thumbnail
-            .clone()
-            .generate_all_sizes_background_from_blob(
+        if ThumbnailService::is_supported_image(content_type) {
+            self.thumbnail
+                .clone()
+                .generate_all_sizes_background_from_blob(
+                    file_id.to_string(),
+                    blob_hash.to_string(),
+                    self.dedup.clone(),
+                );
+        } else if self.video_frame.is_supported_video(content_type) {
+            // Videos: extract a frame server-side (ffmpeg) and run it through the
+            // same WebP/blob-hash pipeline — eager, off the request path.
+            self.thumbnail.clone().generate_video_thumbnails_background(
                 file_id.to_string(),
                 blob_hash.to_string(),
                 self.dedup.clone(),
+                self.video_frame.clone(),
+                self.video_max_bytes,
             );
+        }
     }
 
     fn on_file_copied(

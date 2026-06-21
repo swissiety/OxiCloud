@@ -9,6 +9,7 @@ pub mod encrypted_blob_backend;
 pub mod exif_service;
 pub mod face_geometry;
 pub mod face_indexing_service;
+pub mod ffmpeg_video_frame_service;
 pub mod file_content_cache;
 pub mod file_system_i18n_service;
 pub mod image_transcode_service;

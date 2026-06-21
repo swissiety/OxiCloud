@@ -6,12 +6,7 @@
 	import { useSelection } from '$lib/composables/useSelection.svelte';
 	import { errorToast } from '$lib/utils/errors';
 	import { onMount } from 'svelte';
-	import {
-		batchTrash,
-		fetchPhotos,
-		uploadThumbnail,
-		type PhotoItem
-	} from '$lib/api/endpoints/photos';
+	import { batchTrash, fetchPhotos, type PhotoItem } from '$lib/api/endpoints/photos';
 	import { peopleEnabled } from '$lib/api/endpoints/people';
 	import { fileDownloadUrl, fileThumbnailUrl } from '$lib/api/endpoints/files';
 	import Icon from '$lib/icons/Icon.svelte';
@@ -54,9 +49,6 @@
 		if (tab === 'places') void placesMap.load();
 		else if (tab === 'people') void peopleView.load();
 	});
-
-	/** Client-generated video frame thumbnails (file id → data/URL). */
-	let videoThumbs = $state<Record<string, string>>({});
 
 	/** EXIF-aware timestamp (seconds → ms), matching the OLD grouping logic. */
 	function bucketKey(d: Date): string {
@@ -290,95 +282,17 @@
 	}
 
 	/**
-	 * A tile thumbnail failed to load (no server thumbnail — e.g. SVGs, which the
-	 * backend can't rasterise — or a transient error). Hide the broken <img> so
-	 * the always-present placeholder shows through, and for videos kick off
-	 * client-side frame extraction (which, on success, re-renders the tile from
-	 * `videoThumbs`).
+	 * A tile thumbnail failed to load — no server thumbnail yet (SVGs the backend
+	 * can't rasterise; a video whose server-side frame extraction is still running
+	 * or unavailable) or a transient error. Hide the broken <img> so the
+	 * always-present placeholder (and, for videos, the play badge) shows through.
+	 *
+	 * Video thumbnails are now produced server-side (ffmpeg) on upload through the
+	 * same WebP pipeline as photos — the browser no longer re-downloads the video
+	 * to extract a frame.
 	 */
-	function onThumbError(e: Event, photo: PhotoItem) {
+	function onThumbError(e: Event) {
 		(e.currentTarget as HTMLImageElement).style.display = 'none';
-		if (isVideo(photo)) void generateVideoThumb(photo);
-	}
-
-	// ── Client-side video thumbnail generation ──────────────────────────────
-	// When the server has no thumbnail for a video tile the <img> errors; we
-	// then extract a frame with the browser's native decoder and upload it.
-
-	async function generateVideoThumb(file: PhotoItem) {
-		if (videoThumbs[file.id]) return;
-		try {
-			const bitmap = await frameFromVideo(`/api/files/${file.id}?inline=true`);
-			const SIZES: Array<['icon' | 'preview' | 'large', number, number]> = [
-				['icon', 150, 150],
-				['preview', 400, 400],
-				['large', 800, 800]
-			];
-			let previewData = '';
-			// Render the blobs and push all three sizes in parallel; `previewData`
-			// is captured before its upload so the local preview shows even if that
-			// upload fails (allSettled swallows per-size failures, as before).
-			await Promise.allSettled(
-				SIZES.map(async ([size, w, h]) => {
-					const blob = await bitmapToBlob(bitmap, w, h);
-					if (size === 'preview') previewData = await blobToDataUrl(blob);
-					await uploadThumbnail(file.id, size, blob);
-				})
-			);
-			if (previewData) videoThumbs = { ...videoThumbs, [file.id]: previewData };
-		} catch {
-			// Keep the generic play badge on failure.
-		}
-	}
-
-	function frameFromVideo(src: string): Promise<ImageBitmap> {
-		return new Promise((resolve, reject) => {
-			const video = document.createElement('video');
-			video.src = src;
-			video.muted = true;
-			video.preload = 'metadata';
-			video.onloadedmetadata = () => {
-				video.currentTime = (video.duration || 3) / 3;
-			};
-			video.onseeked = async () => {
-				try {
-					const bitmap = await createImageBitmap(video);
-					video.removeAttribute('src');
-					video.load();
-					resolve(bitmap);
-				} catch (e) {
-					reject(e instanceof Error ? e : new Error(String(e)));
-				}
-			};
-			video.onerror = () => reject(new Error('video frame extraction failed'));
-		});
-	}
-
-	async function bitmapToBlob(bitmap: ImageBitmap, tw: number, th: number): Promise<Blob> {
-		const ratio = bitmap.width / bitmap.height;
-		const target = tw / th;
-		const w = ratio > target ? tw : Math.round(th * ratio);
-		const h = ratio > target ? Math.round(tw / ratio) : th;
-		const canvas = document.createElement('canvas');
-		canvas.width = w;
-		canvas.height = h;
-		canvas.getContext('2d')?.drawImage(bitmap, 0, 0, w, h);
-		return new Promise<Blob>((resolve, reject) => {
-			canvas.toBlob(
-				(b) => (b ? resolve(b) : reject(new Error('canvas toBlob failed'))),
-				'image/jpeg',
-				0.8
-			);
-		});
-	}
-
-	function blobToDataUrl(blob: Blob): Promise<string> {
-		return new Promise((resolve, reject) => {
-			const reader = new FileReader();
-			reader.onload = () => resolve(String(reader.result));
-			reader.onerror = () => reject(new Error('blob read failed'));
-			reader.readAsDataURL(blob);
-		});
 	}
 
 	onMount(() => {
@@ -540,19 +454,15 @@
 			     it can't load (no server thumbnail, e.g. SVG), hides itself to reveal
 			     this default rather than the browser's broken-image glyph. -->
 			<span class="photo-tile__placeholder" aria-hidden="true"><Icon name="file-image" /></span>
-			{#if videoThumbs[photo.id]}
-				<img src={videoThumbs[photo.id]} alt={photo.name} loading="lazy" decoding="async" />
-			{:else}
-				<img
-					src={fileThumbnailUrl(photo.id, 'preview')}
-					srcset={`${fileThumbnailUrl(photo.id, 'icon')} 150w, ${fileThumbnailUrl(photo.id, 'preview')} 400w, ${fileThumbnailUrl(photo.id, 'large')} 800w`}
-					sizes="(max-width: 768px) 33vw, 200px"
-					alt={photo.name}
-					loading="lazy"
-					decoding="async"
-					onerror={(e) => onThumbError(e, photo)}
-				/>
-			{/if}
+			<img
+				src={fileThumbnailUrl(photo.id, 'preview')}
+				srcset={`${fileThumbnailUrl(photo.id, 'icon')} 150w, ${fileThumbnailUrl(photo.id, 'preview')} 400w, ${fileThumbnailUrl(photo.id, 'large')} 800w`}
+				sizes="(max-width: 768px) 33vw, 200px"
+				alt={photo.name}
+				loading="lazy"
+				decoding="async"
+				onerror={onThumbError}
+			/>
 			{#if isVideo(photo)}
 				<span class="photo-tile__video-badge" aria-hidden="true"><Icon name="play" /></span>
 			{/if}

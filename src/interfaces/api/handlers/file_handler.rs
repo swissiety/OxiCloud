@@ -429,8 +429,11 @@ impl FileHandler {
             }
         };
 
-        // Non-image (video, etc.) with no cached thumbnail → 204
-        if !thumbnail_service.is_supported_image(&file.mime_type) {
+        // Images and videos both store blob-hash thumbnails (videos via an
+        // eagerly-extracted frame); anything else has nothing to thumbnail → 204.
+        let is_image = thumbnail_service.is_supported_image(&file.mime_type);
+        let is_video = file.mime_type.starts_with("video/");
+        if !is_image && !is_video {
             return Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header(header::CACHE_CONTROL, "no-store")
@@ -466,6 +469,44 @@ impl FileHandler {
                 .header(header::ETAG, &etag)
                 .header(header::VARY, header::ACCEPT.as_str())
                 .body(Body::from(data))
+                .unwrap()
+                .into_response();
+        }
+
+        // Videos: thumbnails are produced eagerly server-side (ffmpeg) on upload,
+        // and persisted WebP-only. Serve that WebP regardless of the negotiated
+        // format — a JPEG/`*/*`/no-Accept client still gets it, correctly labelled
+        // via byte-sniffing — otherwise non-WebP clients would 204 forever despite
+        // a valid thumbnail on disk. We never image-decode a video, so a genuine
+        // miss (generation in flight or unavailable) returns 204.
+        if is_video {
+            if let Some(data) = thumbnail_service
+                .get_cached_thumbnail(
+                    &id,
+                    Some(&blob_hash),
+                    thumb_size.into(),
+                    ThumbnailFormat::Webp,
+                )
+                .await
+            {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        header::CONTENT_TYPE,
+                        crate::common::mime_detect::thumbnail_content_type(&data),
+                    )
+                    .header(header::CONTENT_LENGTH, data.len())
+                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                    .header(header::ETAG, &etag)
+                    .header(header::VARY, header::ACCEPT.as_str())
+                    .body(Body::from(data))
+                    .unwrap()
+                    .into_response();
+            }
+            return Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::empty())
                 .unwrap()
                 .into_response();
         }

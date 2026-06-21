@@ -114,21 +114,3 @@ export async function batchTrash(fileIds: string[]): Promise<Set<string>> {
 	}
 	return trashed;
 }
-
-/**
- * Upload a generated thumbnail blob for a file at a given size. Used by the
- * photos grid to persist client-generated video frames server-side.
- */
-export async function uploadThumbnail(
-	fileId: string,
-	size: 'icon' | 'preview' | 'large',
-	blob: Blob,
-	contentType = 'image/jpeg'
-): Promise<void> {
-	await apiFetch(`/api/files/${fileId}/thumbnail/${size}`, {
-		method: 'PUT',
-		credentials: 'same-origin',
-		headers: { ...getCsrfHeaders(), 'Content-Type': contentType },
-		body: blob
-	});
-}
