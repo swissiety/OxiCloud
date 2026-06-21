@@ -22,7 +22,7 @@
 	import type { FileItem, FolderItem, ItemType } from '$lib/api/types';
 	import Icon from '$lib/icons/Icon.svelte';
 	import ListToolbar from '$lib/components/ListToolbar.svelte';
-	import ShareDialog from '$lib/components/ShareDialog.svelte';
+	import { lazyComponent } from '$lib/composables/lazyComponent.svelte';
 	import UserVignette from '$lib/components/UserVignette.svelte';
 	import { t } from '$lib/i18n/index.svelte';
 	import { ui } from '$lib/stores/ui.svelte';
@@ -54,6 +54,13 @@
 	// Edit-sharing dialog
 	let dialogOpen = $state(false);
 	let dialogItem = $state<{ id: string; name: string; kind: ItemType } | null>(null);
+
+	// ShareDialog is heavy and only opens on demand — keep it out of this route's
+	// initial chunk and load it the first time the dialog is opened.
+	const shareDialog = lazyComponent(() => import('$lib/components/ShareDialog.svelte'));
+	$effect(() => {
+		if (dialogOpen) void shareDialog.load();
+	});
 
 	// Open kebab menu, keyed by grant id.
 	let menuFor = $state<string | null>(null);
@@ -580,7 +587,10 @@
 	</div>
 {/if}
 
-<ShareDialog bind:open={dialogOpen} item={dialogItem} />
+{#if shareDialog.component}
+	{@const ShareDialog = shareDialog.component}
+	<ShareDialog bind:open={dialogOpen} item={dialogItem} />
+{/if}
 
 <style>
 	.ms-lanes {

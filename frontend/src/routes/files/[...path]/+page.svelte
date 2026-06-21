@@ -44,8 +44,6 @@
 	import type { FileItem, FolderItem, ItemType } from '$lib/api/types';
 	import ListToolbar from '$lib/components/ListToolbar.svelte';
 	import VirtualList from '$lib/components/VirtualList.svelte';
-	import MoveDialog from '$lib/components/MoveDialog.svelte';
-	import ShareDialog from '$lib/components/ShareDialog.svelte';
 	import { lazyComponent } from '$lib/composables/lazyComponent.svelte';
 	import { t } from '$lib/i18n/index.svelte';
 	import { confirmDialog, promptDialog } from '$lib/stores/dialogs.svelte';
@@ -69,6 +67,8 @@
 	// call `.load()` when `viewerOpen` / `wopiOpen` flip true).
 	const fileViewer = lazyComponent(() => import('$lib/components/FileViewer.svelte'));
 	const wopiEditor = lazyComponent(() => import('$lib/components/WopiEditor.svelte'));
+	const moveDialog = lazyComponent(() => import('$lib/components/MoveDialog.svelte'));
+	const shareDialog = lazyComponent(() => import('$lib/components/ShareDialog.svelte'));
 
 	// The URL rest param is the trail of folder ids from home's children down.
 	// /files → home root; /files/a/b → folder b inside a inside home.
@@ -1083,6 +1083,8 @@
 	$effect(() => {
 		if (viewerOpen) void fileViewer.load();
 		if (wopiOpen) void wopiEditor.load();
+		if (moveOpen) void moveDialog.load();
+		if (shareOpen) void shareDialog.load();
 	});
 	// Editability of the current context-menu target file, resolved async.
 	let ctxCanEditWopi = $state(false);
@@ -1936,21 +1938,27 @@
 	</div>
 {/snippet}
 
-<MoveDialog
-	bind:open={moveOpen}
-	item={actionTarget}
-	items={moveItems}
-	mode={moveMode}
-	onmoved={() => {
-		clearSelection();
-		void reload();
-	}}
-/>
-<ShareDialog
-	bind:open={shareOpen}
-	item={actionTarget}
-	onshared={(id) => (sharedIds = new SvelteSet(sharedIds).add(id))}
-/>
+{#if moveDialog.component}
+	{@const MoveDialog = moveDialog.component}
+	<MoveDialog
+		bind:open={moveOpen}
+		item={actionTarget}
+		items={moveItems}
+		mode={moveMode}
+		onmoved={() => {
+			clearSelection();
+			void reload();
+		}}
+	/>
+{/if}
+{#if shareDialog.component}
+	{@const ShareDialog = shareDialog.component}
+	<ShareDialog
+		bind:open={shareOpen}
+		item={actionTarget}
+		onshared={(id) => (sharedIds = new SvelteSet(sharedIds).add(id))}
+	/>
+{/if}
 {#if fileViewer.component}
 	{@const FileViewer = fileViewer.component}
 	<FileViewer bind:open={viewerOpen} file={viewerFile} />

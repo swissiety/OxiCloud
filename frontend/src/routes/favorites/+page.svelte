@@ -19,8 +19,6 @@
 	import { renameFolder, deleteFolder } from '$lib/api/endpoints/folders';
 	import type { FileItem } from '$lib/api/types';
 	import { lazyComponent } from '$lib/composables/lazyComponent.svelte';
-	import MoveDialog from '$lib/components/MoveDialog.svelte';
-	import ShareDialog from '$lib/components/ShareDialog.svelte';
 	import ResourceList, {
 		type ContextAction,
 		type GroupByDef,
@@ -127,8 +125,12 @@
 	// The file preview is loaded the first time a file is opened, keeping its
 	// module out of this route's initial chunk.
 	const fileViewer = lazyComponent(() => import('$lib/components/FileViewer.svelte'));
+	const moveDialog = lazyComponent(() => import('$lib/components/MoveDialog.svelte'));
+	const shareDialog = lazyComponent(() => import('$lib/components/ShareDialog.svelte'));
 	$effect(() => {
 		if (viewerOpen) void fileViewer.load();
+		if (moveOpen) void moveDialog.load();
+		if (shareOpen) void shareDialog.load();
 	});
 
 	function open(entry: ResourceEntry) {
@@ -317,13 +319,19 @@
 	{@const FileViewer = fileViewer.component}
 	<FileViewer bind:open={viewerOpen} file={viewerFile} />
 {/if}
-<MoveDialog
-	bind:open={moveOpen}
-	item={moveTarget}
-	items={moveItems}
-	onmoved={() => {
-		selectedIds = new Set();
-		load(true, orderByForGroup());
-	}}
-/>
-<ShareDialog bind:open={shareOpen} item={shareTarget} />
+{#if moveDialog.component}
+	{@const MoveDialog = moveDialog.component}
+	<MoveDialog
+		bind:open={moveOpen}
+		item={moveTarget}
+		items={moveItems}
+		onmoved={() => {
+			selectedIds = new Set();
+			load(true, orderByForGroup());
+		}}
+	/>
+{/if}
+{#if shareDialog.component}
+	{@const ShareDialog = shareDialog.component}
+	<ShareDialog bind:open={shareOpen} item={shareTarget} />
+{/if}
