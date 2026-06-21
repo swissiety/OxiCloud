@@ -59,7 +59,7 @@ use common::di::AppServiceFactory;
 use infrastructure::db::create_database_pools;
 use interfaces::{
     create_api_routes, create_health_routes, create_public_api_routes,
-    web::{content_security_policy, create_web_routes},
+    web::{content_security_policy, create_web_routes, resolve_static_path},
 };
 
 fn parse_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
@@ -277,17 +277,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Locales directory for i18n. Derived from the configured static path
-    // (OXICLOUD_STATIC_PATH, defaults to ./static) so deployments that ship
-    // assets from a non-default location — or the build.rs-bundled
-    // `./static-dist` in release — find their locale files correctly.
+    // Locales directory for i18n. Resolved from wherever the SPA is actually
+    // served (the Vite `static-dist/` build, or the configured static path in
+    // the container) so deployments find their locale files correctly. A source
+    // checkout without a built SPA still has the canonical locales under the
+    // frontend static assets, so fall back to those for `just dev`.
     //
-    // Read-only at runtime: locales ship as static assets (build.rs bundles
-    // them into static-dist, the Dockerfile copies them into /app/static).
-    // Fail-fast if the path is missing rather than silently creating an
-    // empty directory and limping along with a "translation missing" error
-    // on every request later.
-    let locales_path = config.static_path.join("locales");
+    // Read-only at runtime: locales ship as static assets (Vite copies
+    // `frontend/static/locales` into the build, the Dockerfile copies that into
+    // /app/static). Fail-fast if the path is missing rather than silently
+    // creating an empty directory and limping along with a "translation missing"
+    // error on every request later.
+    let locales_path = {
+        let served = resolve_static_path(&config).join("locales");
+        if served.is_dir() {
+            served
+        } else {
+            std::path::PathBuf::from("frontend/static/locales")
+        }
+    };
     if !locales_path.is_dir() {
         panic!(
             "FATAL: locales directory not found at {}. \

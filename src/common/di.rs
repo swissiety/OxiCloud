@@ -405,7 +405,6 @@ impl AppServiceFactory {
             Arc::new(FileBlobWriteRepository::new(
                 db_pool.clone(),
                 core.dedup_service.clone(),
-                folder_repo_concrete.clone(),
                 // Shared blob-hash cache: the write side invalidates entries
                 // on content swaps/deletes so reads never serve stale blobs.
                 file_read_repository.blob_hash_cache(),

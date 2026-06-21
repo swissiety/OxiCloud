@@ -123,15 +123,6 @@ path = "src/bin/load-seed.rs"
 # and load-nightly.yml build it explicitly with --features load_seed_bin.
 required-features = ["load_seed_bin"]
 
-[build-dependencies]
-oxc_allocator = "0.125.0"
-oxc_parser = "0.125.0"
-oxc_semantic = "0.125.0"
-oxc_span = "0.125.0"
-oxc_codegen = "0.125.0"
-oxc_minifier = "0.125.0"
-lightningcss = "1.0.0-alpha.71"
-
 [profile.release]
 lto = "thin"
 codegen-units = 1

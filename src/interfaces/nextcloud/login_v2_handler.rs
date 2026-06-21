@@ -31,8 +31,7 @@ struct DrivePickerTemplate {
 
 /// The Nextcloud Login Flow v2 "Grant Access" page. Rendered server-side via
 /// askama (no template variables — the username/password are collected by the
-/// embedded form) instead of `include_str!` so the build no longer depends on
-/// the legacy `build.rs` static-asset pipeline / `OUT_DIR`.
+/// embedded form); the template is embedded at compile time by the derive macro.
 #[derive(Template)]
 #[template(path = "nextcloud/login.html")]
 struct NextcloudLoginTemplate;
@@ -264,7 +263,7 @@ pub async fn handle_login_submit(
             // Flow token vanished (TTL?) between password submit and
             // here — extremely unlikely but treat the same as any
             // session-expired case.
-            return axum::response::Redirect::to("/nextcloud-error.html?type=session-expired")
+            return axum::response::Redirect::to("/nextcloud/error?type=session-expired")
                 .into_response();
         }
         return render_drive_picker(&token, &drives);
@@ -365,7 +364,7 @@ async fn complete_flow(
             user = %user.username,
             "Login Flow v2: complete() returned false — flow token not found"
         );
-        axum::response::Redirect::to("/nextcloud-error.html?type=session-expired").into_response()
+        axum::response::Redirect::to("/nextcloud/error?type=session-expired").into_response()
     }
 }
 
@@ -402,7 +401,7 @@ pub async fn handle_drive_pick(
                 reason = "no_pending_user",
                 "👮🏻‍♂️ NC drive pick rejected: flow has no pending user (replay or unknown token)"
             );
-            return axum::response::Redirect::to("/nextcloud-error.html?type=session-expired")
+            return axum::response::Redirect::to("/nextcloud/error?type=session-expired")
                 .into_response();
         }
     };
@@ -516,7 +515,7 @@ pub async fn handle_login_oidc(
 
     // Verify the NC login flow token exists
     if !nextcloud.login_flow.flow_exists(&token) {
-        return axum::response::Redirect::to("/nextcloud-error.html?type=session-expired")
+        return axum::response::Redirect::to("/nextcloud/error?type=session-expired")
             .into_response();
     }
 
@@ -549,7 +548,7 @@ pub async fn handle_login_oidc(
 }
 
 fn login_failed_response(_err: DomainError) -> Response {
-    axum::response::Redirect::to("/nextcloud-error.html?type=invalid-credentials").into_response()
+    axum::response::Redirect::to("/nextcloud/error?type=invalid-credentials").into_response()
 }
 
 fn parse_form(body: &str) -> HashMap<String, String> {
