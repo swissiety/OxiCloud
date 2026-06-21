@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // Generates docs/TOKENS.md — a grouped reference of every design token defined
-// in static/css/base/variables.css. Run after changing tokens:
+// in frontend/src/lib/styles/base/variables.css. Run after changing tokens:
 //   node scripts/gen-token-docs.mjs
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..');
-const src = readFileSync(join(repo, 'static', 'css', 'base', 'variables.css'), 'utf8');
+const src = readFileSync(
+    join(repo, 'frontend', 'src', 'lib', 'styles', 'base', 'variables.css'),
+    'utf8'
+);
 
 const tokens = [];
 for (const m of src.matchAll(/^\s*(--[a-z0-9-]+)\s*:\s*([^;]+);/gim)) {
@@ -46,7 +49,7 @@ for (const [name, value] of tokens) {
 
 let md = `# Design tokens
 
-> Auto-generated from \`static/css/base/variables.css\` by \`scripts/gen-token-docs.mjs\`.
+> Auto-generated from \`frontend/src/lib/styles/base/variables.css\` by \`scripts/gen-token-docs.mjs\`.
 > Do not edit by hand — re-run the generator after changing tokens.
 
 **${tokens.length} tokens** across ${[...buckets].filter(([, v]) => v.length).length} groups.

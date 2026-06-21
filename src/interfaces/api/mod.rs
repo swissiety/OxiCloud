@@ -100,7 +100,6 @@ use crate::interfaces::api::handlers::file_handler::MoveFilePayload;
         handlers::folder_handler::list_root_folders,
         handlers::folder_handler::list_root_folders_paginated,
         handlers::folder_handler::list_folder_resources,
-        handlers::folder_handler::list_folder_listing,
         handlers::folder_handler::rename_folder,
         handlers::folder_handler::move_folder,
         handlers::folder_handler::delete_folder_with_trash,

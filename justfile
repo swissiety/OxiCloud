@@ -100,35 +100,9 @@ db:
 db-down:
     docker compose down
 
-# start OxiCloud with static assets in no-cache mode
-front-dev:
-    PROFILE=dev cargo run
-
-# front: check all (linter, format, type, icons, translations...)
-front-check: front-fmt front-lint front-type front-rules front-check-icons front-check-i18n frontend-check
-
-# kept for compatibility
+# Frontend design-system / a11y guardrails (pure Node, no deps). The entry
+# point the UI/UX workflow uses; delegates to `front-design`.
 frontend-check: front-design
-
-front-fmt:
-    biome format static/
-
-front-lint:
-    biome lint static/
-
-# test types (JSDOC), using typescript
-front-type:
-    tsc -p jsconfig.json --noEmit
-
-# check CSS rules
-front-rules:
-    stylelint static/css/
-
-front-check-icons:
-    tools/check-icons.py --check-only
-
-front-check-i18n:
-    tools/check-missing-translations.py --check-only
 
 # end-to-end Playwright tests
 front-test:
@@ -138,14 +112,11 @@ front-test:
 front-test-update-snapshot:
     cd tests/e2e && npm test -- --update-snapshots=all
 
-# Frontend design-system / a11y guardrails — pure Node, no extra deps.
-# Single gate: WCAG contrast, heading order, locale completeness, dead tokens,
-# brand-mark drift.
-# (Also run `stylelint static/css/**/*.css`, `biome check`, `tsc -p jsconfig.json
-#  --noEmit` once node_modules is installed — those need devDependencies.)
+# Frontend design-system guardrails — pure Node, no extra deps, run against the
+# SvelteKit frontend (frontend/). Locale completeness, dead-token report, and
+# brand-mark drift. For the full svelte-check/eslint/stylelint/prettier gate use
+# `just fe-check` (needs the frontend devDependencies installed).
 front-design:
-    node scripts/check-contrast.mjs
-    node scripts/check-headings.mjs
     node scripts/check-locales.mjs
     node scripts/check-dead-tokens.mjs
     node scripts/check-brand-drift.mjs
@@ -157,9 +128,8 @@ api-test:
     bash tests/webdav/run.sh
 
 # ---------------------------------------------------------------------------
-# New SvelteKit frontend (frontend/). The original vanilla frontend (static/)
-# and its `front-*` recipes remain until the Phase 5 cutover; these `fe-*`
-# recipes drive the rewrite in the meantime.
+# SvelteKit frontend (frontend/) — the only frontend. These `fe-*` recipes
+# drive its dev server, build, lint and tests.
 # ---------------------------------------------------------------------------
 
 # install frontend dependencies

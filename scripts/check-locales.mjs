@@ -10,7 +10,13 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const localesDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'static', 'locales');
+const localesDir = join(
+    dirname(fileURLToPath(import.meta.url)),
+    '..',
+    'frontend',
+    'static',
+    'locales'
+);
 
 /** Flatten a nested translation object to dotted keys. */
 function flat(obj, prefix = '', out = {}) {

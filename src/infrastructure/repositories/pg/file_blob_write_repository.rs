@@ -19,7 +19,6 @@ use crate::common::errors::DomainError;
 use crate::domain::entities::file::File;
 use crate::domain::services::path_service::StoragePath;
 
-use super::folder_db_repository::FolderDbRepository;
 use super::transaction_utils::retry_on_deadlock;
 use crate::infrastructure::services::dedup_service::DedupService;
 
@@ -27,11 +26,6 @@ use crate::infrastructure::services::dedup_service::DedupService;
 pub struct FileBlobWriteRepository {
     pool: Arc<PgPool>,
     dedup: Arc<DedupService>,
-    /// Retained on the struct after D0-8 inlined parent-folder lookups
-    /// directly via SQL; kept for now so D0's diff stays scoped to drive_id
-    /// + provenance plumbing. Slated for removal in a follow-up cleanup.
-    #[allow(dead_code)]
-    folder_repo: Arc<FolderDbRepository>,
     /// Shared handle to `FileBlobReadRepository`'s file_id → blob_hash
     /// cache. Content swaps and hard deletes invalidate the mapping here
     /// so the read side can never serve a stale blob after a PUT update.
@@ -42,13 +36,11 @@ impl FileBlobWriteRepository {
     pub fn new(
         pool: Arc<PgPool>,
         dedup: Arc<DedupService>,
-        folder_repo: Arc<FolderDbRepository>,
         hash_cache: Cache<String, String>,
     ) -> Self {
         Self {
             pool,
             dedup,
-            folder_repo,
             hash_cache,
         }
     }
@@ -65,7 +57,6 @@ impl FileBlobWriteRepository {
                     .unwrap(),
             ),
             dedup: Arc::new(DedupService::new_stub()),
-            folder_repo: Arc::new(super::folder_db_repository::FolderDbRepository::new_stub()),
             hash_cache: Cache::builder().max_capacity(10_000).build(),
         }
     }

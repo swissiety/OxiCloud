@@ -20,9 +20,8 @@ RUN npm run build
 FROM base AS cacher
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-# build.rs + static/ are needed so the build script can run and set OUT_DIR
+# build.rs runs during the dependency build; it only injects git metadata.
 COPY build.rs ./
-COPY static static
 # Create a minimal project to download and cache dependencies
 RUN mkdir -p src/bin && \
     echo 'fn main() { println!("Dummy build for caching dependencies"); }' > src/main.rs && \
@@ -37,10 +36,9 @@ WORKDIR /app
 # Copy cached dependencies (only target dir and cargo registry)
 COPY --from=cacher /app/target target
 COPY --from=cacher /usr/local/cargo/registry /usr/local/cargo/registry
-# Copy source, build script, and static assets
+# Copy source, build script, and migrations
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src src
-COPY static static
 COPY migrations migrations
 # askama templates — read at *compile time* by the derive macro, so
 # they must be present in the build stage even though they're embedded
@@ -52,8 +50,8 @@ ARG DATABASE_URL="postgres://postgres:postgres@localhost/oxicloud"
 # test-only bins (e.g. load-seed) even if `required-features` gating
 # changes upstream.
 RUN DATABASE_URL="${DATABASE_URL}" cargo build --release --bin oxicloud --bin generate-openapi --bin migrate-nfc-filenames
-# The SPA is built by the frontend stage; bring it in for the runtime copy below.
-# (build.rs no longer generates static-dist unless OXICLOUD_RUST_ASSETS=1.)
+# The SPA is built by the Vite frontend stage; bring it in for the runtime copy
+# below (build.rs has no asset pipeline — it only injects git metadata).
 COPY --from=frontend /static-dist ./static-dist
 
 # ─── Stage 4: Minimal runtime image ──────────────────────────────────────────

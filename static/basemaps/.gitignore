@@ -1,5 +1,0 @@
-# The vector basemap is large (tens of MB) and operator-provided — never
-# commit it to the repo. Drop a Protomaps `.pmtiles` here as `basemap.pmtiles`
-# and the existing static file server (tower-http ServeDir, Range-capable)
-# will serve it to the Places map. See README.md.
-*.pmtiles

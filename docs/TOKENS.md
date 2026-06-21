@@ -1,9 +1,9 @@
 # Design tokens
 
-> Auto-generated from `static/css/base/variables.css` by `scripts/gen-token-docs.mjs`.
+> Auto-generated from `frontend/src/lib/styles/base/variables.css` by `scripts/gen-token-docs.mjs`.
 > Do not edit by hand — re-run the generator after changing tokens.
 
-**430 tokens** across 20 groups.
+**447 tokens** across 21 groups.
 
 
 ## Spacing (4px grid)
@@ -175,16 +175,16 @@
 | `--color-text` | `light-dark(#2d3748, #e2e8f0)` |
 | `--color-text-heading` | `light-dark(#1e293b, #f1f5f9)` |
 | `--color-text-secondary` | `light-dark(#475569, #cbd5e1)` |
-| `--color-text-muted` | `light-dark(#5e6a78, #9fadbe)` |
-| `--color-text-subtle` | `light-dark(#5e6a78, #9fadbe)` |
-| `--color-text-faint` | `light-dark(#5e6a78, #9fadbe)` |
+| `--color-text-muted` | `light-dark(#586472, #b2c0d0)` |
+| `--color-text-subtle` | `light-dark(#5e6a78, #a6b4c6)` |
+| `--color-text-faint` | `light-dark(#647082, #9fadbe)` |
 | `--color-text-dark` | `var(--color-text-secondary)` |
 | `--color-text-dim` | `var(--color-text-secondary)` |
 | `--color-text-black` | `var(--color-text)` |
 | `--color-text-gray` | `var(--color-text-muted)` |
 | `--color-text-medium` | `var(--color-text-muted)` |
 | `--color-text-faint2` | `var(--color-text-faint)` |
-| `--color-text-light` | `var(--color-text-faint)` |
+| `--color-text-light` | `var(--color-on-accent)` |
 | `--color-text-placeholder` | `var(--color-text-faint)` |
 | `--color-text-navy` | `#1a1a2e` |
 
@@ -238,6 +238,8 @@
 | `--color-accent-ring-strong` | `rgba(255, 94, 58, 0.2)` |
 | `--color-accent-ring-xl` | `rgba(255, 94, 58, 0.4)` |
 | `--color-accent-ring-xs` | `rgba(255, 94, 58, 0.05)` |
+| `--color-accent-glow` | `rgba(255, 94, 58, 0.2)` |
+| `--color-accent-glow-soft` | `rgba(255, 94, 58, 0.1)` |
 | `--color-primary` | `var(--color-accent)` |
 | `--color-primary-hover` | `var(--color-accent-hover)` |
 | `--color-accent-second` | `#ff2d55` |
@@ -452,13 +454,14 @@
 
 | Token | Value |
 | --- | --- |
+| `--color-scrim-control` | `light-dark(rgba(255, 255, 255, 0.92), rgba(15, 23, 42, 0.82))` |
 | `--color-item` | `var(--color-bg-surface)` |
 | `--color-item-hover` | `var(--color-bg-hover)` |
 | `--color-item-active` | `light-dark(#f8d2ae, #5a5047)` |
 | `--color-item-selected` | `light-dark(#fff8f6, #39281a)` |
 | `--color-item-hover-accent` | `light-dark(#fff0ec, #3d342c)` |
-| `--color-item-hover-blue` | `#f0f8ff` |
-| `--color-item-hover-sky` | `#e0f2fe` |
+| `--color-item-hover-blue` | `light-dark(#f0f8ff, #18293f)` |
+| `--color-item-hover-sky` | `light-dark(#e0f2fe, #103048)` |
 | `--color-multiselect-bg` | `#1e293b` |
 | `--color-multiselect-border` | `#334155` |
 | `--color-multiselect-text` | `#ffffff` |
@@ -535,3 +538,22 @@
 | `--color-music-public-bg` | `rgba(74, 144, 217, 0.12)` |
 | `--color-video-play` | `#ffffff` |
 | `--color-video-play-shadow` | `#000000` |
+
+## Other
+
+| Token | Value |
+| --- | --- |
+| `--brand-ambient` | `radial-gradient(55% 50% at 8% 4%, var(--color-accent-glow), transparent 60%), radial-gradient(55% 55% at 95% 98%, var(--color-accent-glow), transparent 58%), radial-gradient(48% 48% at 88% 12%, var(--color-accent-glow-soft), transparent 55%), radial-gradient(50% 45% at 6% 92%, var(--color-accent-glow-soft), transparent 55%), radial-gradient(78% 64% at 50% 33%, var(--color-bg-surface), transparent 70%), var(--color-bg-page)` |
+| `--brand-grain` | `url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='g'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='180' height='180' filter='url(%23g)'/></svg>")` |
+| `--file-kind-folder` | `light-dark(#3b82f6, #60a5fa)` |
+| `--file-kind-pdf` | `light-dark(#ef4444, #f87171)` |
+| `--file-kind-doc` | `light-dark(#2563eb, #60a5fa)` |
+| `--file-kind-sheet` | `light-dark(#16a34a, #4ade80)` |
+| `--file-kind-slides` | `light-dark(#ea580c, #fb923c)` |
+| `--file-kind-archive` | `light-dark(#d97706, #fbbf24)` |
+| `--file-kind-code` | `light-dark(#7c3aed, #a78bfa)` |
+| `--file-kind-image` | `light-dark(#0891b2, #22d3ee)` |
+| `--file-kind-video` | `light-dark(#c026d3, #e879f9)` |
+| `--file-kind-audio` | `light-dark(#db2777, #f472b6)` |
+| `--file-kind-text` | `light-dark(#475569, #94a3b8)` |
+| `--file-kind-generic` | `light-dark(#64748b, #94a3b8)` |

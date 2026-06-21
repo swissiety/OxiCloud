@@ -64,7 +64,7 @@ use crate::interfaces::api::handlers::file_handler::{
 };
 #[allow(deprecated)]
 use crate::interfaces::api::handlers::folder_handler::{
-    create_folder, delete_folder_with_trash, download_folder_zip, get_folder, list_folder_listing,
+    create_folder, delete_folder_with_trash, download_folder_zip, get_folder,
     list_folder_resources, list_root_folders, list_root_folders_paginated, move_folder,
     rename_folder,
 };
@@ -208,21 +208,13 @@ pub fn create_api_routes(app_state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/{id}/download", get(download_folder_zip))
         .with_state(app_state.clone());
 
-    // Combined listing endpoint: returns both sub-folders AND files in one
-    // response.  Needs full AppState because it calls both FolderService
-    // and FileRetrievalService concurrently.
-    let folder_listing_router = Router::new()
-        .route("/{id}/listing", get(list_folder_listing))
-        .with_state(app_state.clone());
-
     // Create folder operations that use trash (requires full AppState)
     let folders_ops_router = Router::new().route("/{id}", delete(delete_folder_with_trash));
 
     // Merge the routers
     let folders_router = folders_basic_router
         .merge(folders_ops_router)
-        .merge(folder_zip_router)
-        .merge(folder_listing_router);
+        .merge(folder_zip_router);
 
     // Create file routes for basic operations and trash-enabled delete
     let basic_file_router = Router::new()

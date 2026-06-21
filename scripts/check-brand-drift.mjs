@@ -19,12 +19,12 @@ const sha16 = (s) => createHash('sha256').update(s).digest('hex').slice(0, 16);
 // ── Locked baseline ─────────────────────────────────────────────────────────
 // Update INTENTIONALLY when the brand changes (and only then).
 const LOCK = {
-    logoHash: '7fbd2016e9caeac1', // sha256(static/logo/logo-plain.svg)[:16]
+    logoHash: '7fbd2016e9caeac1', // sha256(frontend/static/logo/logo-plain.svg)[:16]
     gradient: 'linear-gradient(135deg, #ff5e3a 0%, #ff8a5c 100%)' // --color-logo-gradient
 };
 
-const logo = readFileSync(join(repo, 'static/logo/logo-plain.svg'), 'utf8');
-const vars = readFileSync(join(repo, 'static/css/base/variables.css'), 'utf8');
+const logo = readFileSync(join(repo, 'frontend/static/logo/logo-plain.svg'), 'utf8');
+const vars = readFileSync(join(repo, 'frontend/src/lib/styles/base/variables.css'), 'utf8');
 const gradMatch = vars.match(/--color-logo-gradient:\s*([^;]+);/);
 const gradient = gradMatch ? gradMatch[1].trim().replace(/\s+/g, ' ') : '(token missing!)';
 

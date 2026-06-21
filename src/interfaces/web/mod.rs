@@ -14,26 +14,19 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 /// Resolve the directory the SPA is actually served from.
 ///
-/// Release builds prefer the Vite output next to the configured static path —
-/// `static-dist/`, or `static/` under `PROFILE=dev` — falling back to the
-/// configured path when that build dir is absent. Debug builds always use the
-/// configured path. Shared with the CSP layer in `main.rs` so the inline-script
-/// hashes are computed from exactly the bytes that get served.
+/// Prefers the Vite build output (`static-dist/`) sitting next to the configured
+/// static path, falling back to the configured path itself — the container ships
+/// the built SPA straight to `OXICLOUD_STATIC_PATH` (default `./static`), so there
+/// the fallback is what serves. Shared with the CSP layer in `main.rs` so the
+/// inline-script hashes are computed from exactly the bytes that get served.
 pub fn resolve_static_path(config: &AppConfig) -> PathBuf {
-    // `PROFILE=dev` (the `just front-dev`/legacy path) serves the unbuilt source
-    // dir; normal release serves the Vite output in `static-dist/`.
-    let is_dev = std::env::var("PROFILE").is_ok_and(|profile| profile == "dev");
-    let assets_dir = if is_dev { "static" } else { "static-dist" };
-
-    if cfg!(not(debug_assertions)) {
-        let dist = config
-            .static_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(assets_dir);
-        if dist.exists() {
-            return dist;
-        }
+    let dist = config
+        .static_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("static-dist");
+    if dist.exists() {
+        return dist;
     }
     config.static_path.clone()
 }
@@ -50,7 +43,6 @@ pub fn resolve_static_path(config: &AppConfig) -> PathBuf {
 /// can't leave a stale app pinned in browsers.
 pub fn create_web_routes() -> Router<Arc<AppState>> {
     let config = AppConfig::from_env();
-    let is_dev = std::env::var("PROFILE").is_ok_and(|profile| profile == "dev");
     let static_path = resolve_static_path(&config);
 
     // SPA fallback: serve the file if it exists, else the app shell.
@@ -58,12 +50,6 @@ pub fn create_web_routes() -> Router<Arc<AppState>> {
 
     // Hashed, immutable assets (SvelteKit emits these under /_app/immutable).
     let app_immutable = ServeDir::new(static_path.join("_app").join("immutable"));
-
-    let shell_cache = if is_dev {
-        "max-age=0, no-cache, no-store"
-    } else {
-        "no-cache"
-    };
 
     Router::new()
         .nest_service(
@@ -75,10 +61,12 @@ pub fn create_web_routes() -> Router<Arc<AppState>> {
         )
         .fallback_service(spa)
         .layer(CompressionLayer::new().br(true).gzip(true))
-        // `if_not_present` so the immutable assets above keep their long cache.
+        // `if_not_present` so the immutable assets above keep their long cache;
+        // the shell itself must always revalidate so a deploy can't pin a stale
+        // app in browsers.
         .layer(SetResponseHeaderLayer::if_not_present(
             CACHE_CONTROL,
-            HeaderValue::from_static(shell_cache),
+            HeaderValue::from_static("no-cache"),
         ))
 }
 
@@ -148,8 +136,8 @@ pub fn content_security_policy(config: &AppConfig) -> String {
 /// each shell is read verbatim and that slice hashed. Scripts carrying a `src`
 /// attribute are external (already allowed by `'self'`) and skipped. Only the
 /// directory root is scanned — the SPA is client-rendered (SSR/prerender off),
-/// so the only inline-script shell is `index.html`; any legacy pages sit beside
-/// it. Returns a deduplicated, sorted list; empty when the dir is unreadable
+/// so the only inline-script shell is `index.html`. Returns a deduplicated,
+/// sorted list; empty when the dir is unreadable
 /// (e.g. a Vite dev server serving HTML on its own port instead).
 fn inline_script_csp_hashes(static_path: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(static_path) else {

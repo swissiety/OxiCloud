@@ -9,7 +9,7 @@ and [UIUX-ROADMAP.md](UIUX-ROADMAP.md) (the work plan).
 ## 1. Design tokens
 
 Everything visual routes through a token in
-[`static/css/base/variables.css`](../static/css/base/variables.css). Six scales,
+[`static/css/base/variables.css`](../frontend/src/lib/styles/base/variables.css). Six scales,
 plus a curated color system. **Never hand-write a raw px/hex for these** — consume
 a token so the next change happens in one place.
 
@@ -40,7 +40,7 @@ These are enforced/aided by CI scripts and must hold for every new surface.
 - **Keyboard.** Everything interactive is reachable and operable by keyboard.
   Use `<button>`/`<a>` (not clickable `<div>`s). Nav exposes `aria-current="page"`.
 - **Focus.** A global `:focus-visible` ring lives in
-  [`base/a11y.css`](../static/css/base/a11y.css). Never `outline: none` without a
+  [`base/a11y.css`](../frontend/src/lib/styles/base/a11y.css). Never `outline: none` without a
   paired `:focus-visible` style. Mouse focus stays ring-free; keyboard focus never.
 - **Contrast.** Every text/background pair clears 4.5:1 in **light AND dark** —
   `node scripts/check-contrast.mjs` fails the build otherwise.
@@ -52,7 +52,7 @@ These are enforced/aided by CI scripts and must hold for every new surface.
   globally. Also honor `prefers-contrast` and `forced-colors`.
 - **Dialogs.** `role="dialog"` + `aria-modal` + `aria-labelledby`, focus trapped
   while open, focus restored to the trigger on close (see
-  [`modal.js`](../static/js/components/modal.js)).
+  [`modal.js`](../frontend/src/lib/components/Modal.svelte)).
 - **Icon-only buttons.** Always an `aria-label`; decorative icons get
   `aria-hidden="true"`.
 - **Touch targets.** ≥44×44px on phones.
@@ -61,7 +61,7 @@ These are enforced/aided by CI scripts and must hold for every new surface.
 
 ## 3. Brand
 
-- **Mark.** The cloud glyph ([`logo-plain.svg`](../static/logo/logo-plain.svg)).
+- **Mark.** The cloud glyph ([`logo-plain.svg`](../frontend/static/logo/logo-plain.svg)).
   Always rendered from the real SVG (never a stock `fa-cloud`). On surfaces it
   sits in an accent-gradient tile via the `.brand-mark` component.
 - **Wordmark.** "OxiCloud", weight 700, tight tracking. The accent-coloured
@@ -74,8 +74,8 @@ These are enforced/aided by CI scripts and must hold for every new surface.
   the mark; don't render the wordmark below ~16px.
 - **Don't:** recolor the mark, stretch it, place it on a low-contrast background,
   or introduce a second "primary" hue.
-- **Maskable / OG.** [`logo-maskable.svg`](../static/logo/logo-maskable.svg) (PWA,
-  safe-zone) and [`og-image.svg`](../static/logo/og-image.svg) (social). Export
+- **Maskable / OG.** [`logo-maskable.svg`](../frontend/static/logo/logo-maskable.svg) (PWA,
+  safe-zone) and [`og-image.svg`](../frontend/static/logo/og-image.svg) (social). Export
   both to PNG for full platform support (see roadmap).
 
 ---
