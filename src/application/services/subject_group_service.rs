@@ -563,7 +563,15 @@ mod integration_tests {
         let pool = Arc::new(pool);
         let repo = Arc::new(SubjectGroupPgRepository::new(pool.clone()));
         let user_storage = Arc::new(UserPgRepository::new(pool.clone()));
-        SubjectGroupService::new(repo, pool, user_storage)
+        // The engine is wired so `add_member` / `remove_member` can invalidate
+        // their stale `user_groups_cache` entries (the production path).
+        // A stub engine is enough — these tests never trigger an authz SQL
+        // round-trip, only the in-memory cache invalidation calls. The stub's
+        // lazy invalid pool would panic if reached, surfacing any drift if a
+        // future test starts exercising real authz lookups.
+        let engine =
+            Arc::new(crate::infrastructure::services::pg_acl_engine::PgAclEngine::new_stub());
+        SubjectGroupService::new(repo, pool, user_storage, engine)
     }
 
     async fn first_admin(pool: &sqlx::PgPool) -> Uuid {

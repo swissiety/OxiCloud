@@ -201,7 +201,13 @@ impl PgAclEngine {
     /// without a real PostgreSQL pool. Connecting to the lazy pool will
     /// fail at runtime — only safe in tests that exercise types, not actual
     /// authz queries.
-    #[cfg(test)]
+    ///
+    /// Visible under both `cfg(test)` (the standard unit-test build) and
+    /// `cfg(integration_tests)` (the gated-by-RUSTFLAGS integration
+    /// build). The `SubjectGroupService` integration tests construct the
+    /// service with a stub engine, since they only exercise the engine's
+    /// in-memory cache invalidation calls — never its SQL paths.
+    #[cfg(any(test, integration_tests))]
     pub fn new_stub() -> Self {
         let pool = sqlx::pool::PoolOptions::<sqlx::Postgres>::new()
             .max_connections(1)
