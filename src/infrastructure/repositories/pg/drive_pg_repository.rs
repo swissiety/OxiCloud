@@ -355,14 +355,13 @@ impl DriveRepository for DrivePgRepository {
         .await
         .map_err(|e| Self::map_sqlx_err("delete_atomic.grants", e))?;
 
-        let root: (Uuid,) = sqlx::query_as(
-            "SELECT root_folder_id FROM storage.drives WHERE id = $1",
-        )
-        .bind(drive_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| Self::map_sqlx_err("delete_atomic.lookup_root", e))?
-        .ok_or_else(|| DriveRepositoryError::NotFound(drive_id.to_string()))?;
+        let root: (Uuid,) =
+            sqlx::query_as("SELECT root_folder_id FROM storage.drives WHERE id = $1")
+                .bind(drive_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Self::map_sqlx_err("delete_atomic.lookup_root", e))?
+                .ok_or_else(|| DriveRepositoryError::NotFound(drive_id.to_string()))?;
 
         sqlx::query("DELETE FROM storage.drives WHERE id = $1")
             .bind(drive_id)

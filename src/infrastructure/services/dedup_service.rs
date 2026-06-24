@@ -1912,10 +1912,7 @@ impl DedupService {
         self.garbage_collect_with_grace(0).await
     }
 
-    async fn garbage_collect_with_grace(
-        &self,
-        grace_secs: i64,
-    ) -> Result<(u64, u64), DomainError> {
+    async fn garbage_collect_with_grace(&self, grace_secs: i64) -> Result<(u64, u64), DomainError> {
         const BATCH_SIZE: i64 = 500;
 
         let mut total_deleted = 0u64;

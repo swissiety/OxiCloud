@@ -207,13 +207,14 @@ impl StorageUsageService {
         drive_id: Uuid,
         additional_bytes: u64,
     ) -> Result<(), DomainError> {
-        let row: Option<(i64, Option<i64>)> = sqlx::query_as(
-            "SELECT used_bytes, quota_bytes FROM storage.drives WHERE id = $1",
-        )
-        .bind(drive_id)
-        .fetch_optional(self.pool.as_ref())
-        .await
-        .map_err(|e| DomainError::internal_error("StorageUsage", format!("drive quota lookup: {e}")))?;
+        let row: Option<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT used_bytes, quota_bytes FROM storage.drives WHERE id = $1")
+                .bind(drive_id)
+                .fetch_optional(self.pool.as_ref())
+                .await
+                .map_err(|e| {
+                    DomainError::internal_error("StorageUsage", format!("drive quota lookup: {e}"))
+                })?;
 
         let Some((used, quota)) = row else {
             // Anti-enum at the upload edge would normally map to 404,
@@ -468,10 +469,7 @@ impl StorageUsagePort for StorageUsageService {
         .await
         .map_err(|e| {
             error!("Drive storage-usage reconciliation sweep failed: {}", e);
-            DomainError::internal_error(
-                "StorageUsage",
-                format!("drive reconciliation sweep: {e}"),
-            )
+            DomainError::internal_error("StorageUsage", format!("drive reconciliation sweep: {e}"))
         })?;
 
         info!(

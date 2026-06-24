@@ -846,7 +846,11 @@ impl TrashService {
             }
         }
 
-        info!("Trash cleared across {} drive(s) for user {}", drive_ids.len(), user_id);
+        info!(
+            "Trash cleared across {} drive(s) for user {}",
+            drive_ids.len(),
+            user_id
+        );
         Ok(())
     }
 }
