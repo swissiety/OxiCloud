@@ -168,11 +168,46 @@ pub struct ExternalMountRecord {
     pub mount_path: String,
 }
 
+/// The persistable columns of an `external_mounts` row (admin create).
+#[derive(Debug, Clone)]
+pub struct NewExternalMount {
+    /// The mount-root folder UUID this mount attaches to.
+    pub mount_folder_id: Uuid,
+    /// Provider kind.
+    pub kind: String,
+    /// Provider-specific connection config.
+    pub config: serde_json::Value,
+    /// Display name.
+    pub name: String,
+    /// Owner of the mount configuration.
+    pub owner_id: Uuid,
+    /// Whether the mount is read-only.
+    pub read_only: bool,
+}
+
 /// Persistence port for external mount configuration.
 #[async_trait]
 pub trait ExternalMountRepositoryPort: Send + Sync {
     /// Load every (non-trashed) mount joined with its folder, for registry build.
     async fn list_all(&self) -> Result<Vec<ExternalMountRecord>, DomainError>;
+
+    /// Insert a new mount row. Default errors — only the PG repo implements it
+    /// (test doubles need `list_all` only).
+    async fn create(&self, _mount: &NewExternalMount) -> Result<(), DomainError> {
+        Err(DomainError::operation_not_supported(
+            "ExternalMount",
+            "create is not supported by this repository",
+        ))
+    }
+
+    /// Delete a mount row by its mount-root folder id. Returns `true` when a
+    /// row was removed. Default errors (see `create`).
+    async fn delete(&self, _mount_folder_id: Uuid) -> Result<bool, DomainError> {
+        Err(DomainError::operation_not_supported(
+            "ExternalMount",
+            "delete is not supported by this repository",
+        ))
+    }
 }
 
 /// Builds [`ExternalMountProvider`]s from a `kind` + `config` pair.

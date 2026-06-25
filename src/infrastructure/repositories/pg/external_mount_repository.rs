@@ -1,7 +1,7 @@
 //! PostgreSQL persistence for external mount configuration.
 //!
-//! P1 only needs [`ExternalMountRepositoryPort::list_all`] to (re)build the
-//! in-memory registry; admin CRUD lands with P4.
+//! `list_all` (re)builds the in-memory registry; `create`/`delete` back the
+//! admin CRUD endpoints.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::application::ports::external_mount_ports::{
-    ExternalMountRecord, ExternalMountRepositoryPort,
+    ExternalMountRecord, ExternalMountRepositoryPort, NewExternalMount,
 };
 use crate::domain::errors::DomainError;
 
@@ -91,6 +91,37 @@ impl ExternalMountRepositoryPort for ExternalMountPgRepository {
         }
         Ok(out)
     }
+
+    async fn create(&self, mount: &NewExternalMount) -> Result<(), DomainError> {
+        sqlx::query(
+            "INSERT INTO storage.external_mounts
+                (mount_folder_id, kind, config, name, owner_id, read_only)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(mount.mount_folder_id)
+        .bind(&mount.kind)
+        .bind(&mount.config)
+        .bind(&mount.name)
+        .bind(mount.owner_id)
+        .bind(mount.read_only)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            DomainError::database_error(format!("failed to create external mount: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn delete(&self, mount_folder_id: Uuid) -> Result<bool, DomainError> {
+        let res = sqlx::query("DELETE FROM storage.external_mounts WHERE mount_folder_id = $1")
+            .bind(mount_folder_id)
+            .execute(self.pool.as_ref())
+            .await
+            .map_err(|e| {
+                DomainError::database_error(format!("failed to delete external mount: {e}"))
+            })?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 // Gated on `test` too: the module uses the `testcontainers` dev-dependency,
@@ -150,5 +181,34 @@ mod integration_tests {
         let (_c, pool) = fresh_db().await;
         let repo = ExternalMountPgRepository::new(pool.clone());
         assert!(repo.list_all().await.expect("list_all").is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_and_delete_round_trip() {
+        use crate::application::ports::external_mount_ports::NewExternalMount;
+        let (_c, pool) = fresh_db().await;
+        let p = provision_folder(&pool, "owner", "Media").await;
+        let repo = ExternalMountPgRepository::new(pool.clone());
+
+        repo.create(&NewExternalMount {
+            mount_folder_id: p.mount_folder_id,
+            kind: "local_fs".to_string(),
+            config: serde_json::json!({ "path": "/srv/x" }),
+            name: "Media".to_string(),
+            owner_id: p.owner_id,
+            read_only: true,
+        })
+        .await
+        .expect("create");
+
+        let mounts = repo.list_all().await.expect("list");
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].read_only);
+        assert_eq!(mounts[0].mount_folder_id, p.mount_folder_id);
+
+        assert!(repo.delete(p.mount_folder_id).await.expect("delete"));
+        assert!(repo.list_all().await.expect("list").is_empty());
+        // Deleting a non-existent mount returns false.
+        assert!(!repo.delete(p.mount_folder_id).await.expect("delete again"));
     }
 }
