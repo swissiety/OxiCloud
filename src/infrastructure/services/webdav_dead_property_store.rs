@@ -3,10 +3,18 @@
 //! RFC 4918 §4.2 defines "dead properties" as those stored verbatim by the
 //! server without interpreting their value. Properties are persisted to
 //! `storage.webdav_dead_properties` and survive server restarts.
+//!
+//! Queries here use `sqlx::query()` (runtime-bound) rather than the
+//! compile-time-checked `sqlx::query!()` macro. The macro would require either
+//! a live DB at compile time OR committed `.sqlx/` offline metadata; the rest
+//! of this codebase consistently uses the runtime variant (see
+//! `user_pg_repository.rs` for the canonical style), so a fresh checkout
+//! compiles without any DB connection. Trading the macro's compile-time column
+//! check for that bootstrap-friendliness is the project's standing convention.
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::application::adapters::webdav_adapter::QualifiedName;
@@ -29,7 +37,7 @@ impl DeadPropertyStore {
         name: QualifiedName,
         value: Option<String>,
     ) -> Result<(), DomainError> {
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO storage.webdav_dead_properties
                 (resource_path, user_id, namespace, local_name, value)
@@ -37,12 +45,12 @@ impl DeadPropertyStore {
             ON CONFLICT (resource_path, user_id, namespace, local_name)
             DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
             "#,
-            path,
-            user_id,
-            name.namespace,
-            name.name,
-            value,
         )
+        .bind(path)
+        .bind(user_id)
+        .bind(&name.namespace)
+        .bind(&name.name)
+        .bind(&value)
         .execute(&*self.pool)
         .await
         .map_err(|e| DomainError::internal_error("DeadPropertyStore", format!("set: {e}")))?;
@@ -56,15 +64,15 @@ impl DeadPropertyStore {
         user_id: Uuid,
         name: &QualifiedName,
     ) -> Result<(), DomainError> {
-        sqlx::query!(
+        sqlx::query(
             "DELETE FROM storage.webdav_dead_properties
              WHERE resource_path = $1 AND user_id = $2
                AND namespace = $3 AND local_name = $4",
-            path,
-            user_id,
-            name.namespace,
-            name.name,
         )
+        .bind(path)
+        .bind(user_id)
+        .bind(&name.namespace)
+        .bind(&name.name)
         .execute(&*self.pool)
         .await
         .map_err(|e| DomainError::internal_error("DeadPropertyStore", format!("remove: {e}")))?;
@@ -77,20 +85,25 @@ impl DeadPropertyStore {
         path: &str,
         user_id: Uuid,
     ) -> Result<Vec<(QualifiedName, Option<String>)>, DomainError> {
-        let rows = sqlx::query!(
+        let rows = sqlx::query(
             "SELECT namespace, local_name, value
              FROM storage.webdav_dead_properties
              WHERE resource_path = $1 AND user_id = $2",
-            path,
-            user_id,
         )
+        .bind(path)
+        .bind(user_id)
         .fetch_all(&*self.pool)
         .await
         .map_err(|e| DomainError::internal_error("DeadPropertyStore", format!("get_all: {e}")))?;
 
         Ok(rows
             .into_iter()
-            .map(|r| (QualifiedName::new(r.namespace, r.local_name), r.value))
+            .map(|r| {
+                let namespace: String = r.get("namespace");
+                let local_name: String = r.get("local_name");
+                let value: Option<String> = r.get("value");
+                (QualifiedName::new(namespace, local_name), value)
+            })
             .collect())
     }
 
@@ -102,30 +115,30 @@ impl DeadPropertyStore {
         user_id: Uuid,
         name: &QualifiedName,
     ) -> Result<Option<Option<String>>, DomainError> {
-        let row = sqlx::query!(
+        let row = sqlx::query(
             "SELECT value FROM storage.webdav_dead_properties
              WHERE resource_path = $1 AND user_id = $2
                AND namespace = $3 AND local_name = $4",
-            path,
-            user_id,
-            name.namespace,
-            name.name,
         )
+        .bind(path)
+        .bind(user_id)
+        .bind(&name.namespace)
+        .bind(&name.name)
         .fetch_optional(&*self.pool)
         .await
         .map_err(|e| DomainError::internal_error("DeadPropertyStore", format!("get: {e}")))?;
 
-        Ok(row.map(|r| r.value))
+        Ok(row.map(|r| r.get::<Option<String>, _>("value")))
     }
 
     /// Delete all dead properties for `path` (called on DELETE).
     pub async fn remove_resource(&self, path: &str, user_id: Uuid) -> Result<(), DomainError> {
-        sqlx::query!(
+        sqlx::query(
             "DELETE FROM storage.webdav_dead_properties
              WHERE resource_path = $1 AND user_id = $2",
-            path,
-            user_id,
         )
+        .bind(path)
+        .bind(user_id)
         .execute(&*self.pool)
         .await
         .map_err(|e| {
@@ -146,26 +159,26 @@ impl DeadPropertyStore {
             DomainError::internal_error("DeadPropertyStore", format!("rename_resource tx: {e}"))
         })?;
 
-        sqlx::query!(
+        sqlx::query(
             "DELETE FROM storage.webdav_dead_properties
              WHERE resource_path = $1 AND user_id = $2",
-            new_path,
-            user_id,
         )
+        .bind(new_path)
+        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
             DomainError::internal_error("DeadPropertyStore", format!("rename_resource delete: {e}"))
         })?;
 
-        sqlx::query!(
+        sqlx::query(
             "UPDATE storage.webdav_dead_properties
              SET resource_path = $2
              WHERE resource_path = $1 AND user_id = $3",
-            old_path,
-            new_path,
-            user_id,
         )
+        .bind(old_path)
+        .bind(new_path)
+        .bind(user_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| {

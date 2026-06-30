@@ -487,7 +487,10 @@ async fn handle_propfind(
                 .await;
             }
             Ok(ResolvedResource::File(file)) => {
-                let dead_props = state.webdav_dead_props.get_all(&path, user.id).await
+                let dead_props = state
+                    .webdav_dead_props
+                    .get_all(&path, user.id)
+                    .await
                     .unwrap_or_default();
                 let file_href = webdav_href(&client_path);
                 let mut buf = Vec::with_capacity(1024);
@@ -541,7 +544,10 @@ async fn handle_propfind(
             .await
         {
             assert_owner(file.owner_id.as_deref(), &user.id.to_string(), &path)?;
-            let dead_props = state.webdav_dead_props.get_all(&path, user.id).await
+            let dead_props = state
+                .webdav_dead_props
+                .get_all(&path, user.id)
+                .await
                 .unwrap_or_default();
             let file_href = webdav_href(&client_path);
             let mut buf = Vec::with_capacity(1024);
@@ -785,13 +791,18 @@ async fn handle_proppatch(
     for op in &ops {
         match op {
             PropPatchOp::Set(pv) => {
-                dead_props.set(&path, user.id, pv.name.clone(), pv.value.clone()).await
-                    .map_err(|e| AppError::internal_error(format!("Failed to store dead property: {e}")))?;
+                dead_props
+                    .set(&path, user.id, pv.name.clone(), pv.value.clone())
+                    .await
+                    .map_err(|e| {
+                        AppError::internal_error(format!("Failed to store dead property: {e}"))
+                    })?;
                 results.push((&pv.name, true));
             }
             PropPatchOp::Remove(name) => {
-                dead_props.remove(&path, user.id, name).await
-                    .map_err(|e| AppError::internal_error(format!("Failed to remove dead property: {e}")))?;
+                dead_props.remove(&path, user.id, name).await.map_err(|e| {
+                    AppError::internal_error(format!("Failed to remove dead property: {e}"))
+                })?;
                 results.push((name, true));
             }
         }
@@ -1112,7 +1123,9 @@ fn enforce_native_lock(
             if p.is_empty() {
                 return None;
             }
-            if let Some(e) = lock_store.get_by_path(p) && e.info.depth.eq_ignore_ascii_case("infinity") {
+            if let Some(e) = lock_store.get_by_path(p)
+                && e.info.depth.eq_ignore_ascii_case("infinity")
+            {
                 return Some(e);
             }
         }
