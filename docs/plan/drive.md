@@ -1368,6 +1368,88 @@ flip Photos to cross-drive with `forbid_photo_index` as the
 opt-out (mirroring Music). That can land later without a schema
 change — just a behaviour change.
 
+#### Face indexing — per-drive clustering, scope follows Photos
+
+Face indexing is bound to the same scope as `/api/photos` — the
+two surfaces show the same content set, so the face data behind
+that content lives in the same scope.
+
+Two layers to keep distinct:
+
+**Storage layer — per blob.** Face fingerprints are keyed on
+`blob_hash` (BLAKE3), FK to `storage.blobs.hash`. Fingerprints
+are deterministic from content bytes, and OxiCloud dedups
+content via blob hash — so a photo uploaded into N drives (or N
+times by N users) produces *one* fingerprint set, computed once,
+reused forever. Cascade-deletes when the blob is GC'd (ref_count
+→ 0). No `user_id`, `created_by`, `file_id`, `drive_id`, or
+group key on the fingerprint row: identity is the content.
+
+**Clustering layer — per drive.** Cluster computation runs
+*within* a drive: take every fingerprint reachable via a file in
+that drive (`storage.files.drive_id = X` JOIN
+`face_fingerprints` ON `blob_hash`), cluster them, emit clusters
+scoped to drive X. The query repeats per drive the caller can
+see (default personal + drives where
+`policies.include_in_photo_index = true` AND the caller has
+Read). Same-person fingerprints from different drives land in
+**separate** clusters by default — even when both drives reach
+the exact same blob, because clustering is keyed on drive, not
+on fingerprint identity.
+
+**Why per-drive clustering:**
+
+The drive is already the data boundary post-D6 — quota, sharing,
+trash, AuthZ all pivot on `drive_id`. The face library is part
+of the drive's content, not a cross-drive aggregate. Two
+properties fall out cleanly:
+
+- **Family-drive UX works.** Alice and Bob both members of
+  "Family" with `include_in_photo_index=true`. Alice uploads
+  Christmas photos; Bob uploads birthday photos. Grandma is in
+  both. Both see the *same* Grandma cluster in Family — one
+  merged cluster derived from fingerprints across both uploads.
+  Labels on the Family cluster are drive-scoped (anyone with
+  Photos access to Family sees them).
+- **Personal-drive isolation is preserved.** Each user's
+  personal drive is access-isolated by definition (nobody else
+  has Read on it). So a personal-drive cluster is visible only
+  to the drive's owner. The privacy guarantee falls out of
+  drive-access scoping — no separate user-id key needed.
+
+**Cross-drive clusters don't auto-merge.** Bob labelling
+"Grandma" in his Personal-drive cluster does NOT propagate to
+Family's Grandma cluster. Two separate visual clusters by
+default — even if the embedding similarity would otherwise
+match them. Rationale: auto-propagating private labels into a
+shared drive would silently expose personal classifications.
+Future UX can offer explicit per-cluster merging ("these two
+clusters are the same person") — user-driven, never silent.
+
+**Shared-drive opt-in is the consent surface.** Enabling
+`include_in_photo_index` on a drive is the owner saying "the
+photos in this drive are part of the drive's photo library,
+including the face data they contain." Doesn't add a new
+sharing surface — surfaces what was already visible (anyone
+with Read on a photo can see who's in it).
+
+**Implementation:**
+
+- `face_fingerprints(blob_hash, embedding, …)` — FK to
+  `storage.blobs.hash`, no `user_id` / `file_id` / `drive_id`
+  column. Cascade-delete via the blob ref-count → 0 GC path.
+- Cluster query: `SELECT … FROM storage.files f JOIN
+  face_fingerprints fp ON fp.blob_hash = f.blob_hash WHERE
+  f.drive_id = $1 AND NOT f.is_trashed` for each drive in the
+  caller's Photos-scope set.
+- Pre-D7 the legacy `(user_id, blob_hash)` query in
+  `face_indexing_service.rs::lookup_user` stays in place; D7
+  drops `user_id` from the column set in lockstep with the
+  global user_id retirement, leaving the fingerprint row keyed
+  on `blob_hash` alone. Both the `include_in_photo_index` policy
+  AND D7's user_id drop must land before face indexing can move
+  to the per-drive clustering model.
+
 #### Verification sketch
 
 The D0 Hurl suite (`tests/api/drives_foundation.hurl`) covers
