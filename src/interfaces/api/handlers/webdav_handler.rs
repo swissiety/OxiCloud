@@ -456,10 +456,32 @@ async fn handle_propfind(
         .await;
     }
 
-    // Single-query path resolution: folder OR file in one DB round-trip
+    // `drive_id` is mandatory post-D0 for path-based lookups. Native
+    // WebDAV resolves it once from the caller's default drive and
+    // reuses it for the resolver / fallback probes below.
+    let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
+
+    // Single-query path resolution: folder OR file in one DB round-trip.
+    //
+    // Post-D7 the resolver is drive-scoped (not owner-scoped), so we
+    // explicitly `authz.require(Read, …)` on the returned resource
+    // before rendering the multistatus. The streaming children of a
+    // Folder branch are separately per-item authorised inside
+    // `build_streaming_propfind_response` via `_with_perms` service
+    // methods.
     if let Some(resolver) = &state.path_resolver {
-        match resolver.resolve_path_for_user(&path, user.id).await {
+        match resolver.resolve_path_in_drive(&path, drive_id).await {
             Ok(ResolvedResource::Folder(folder)) => {
+                let folder_uuid = Uuid::parse_str(&folder.id)
+                    .map_err(|_| AppError::not_found(format!("Resource not found: {}", path)))?;
+                state
+                    .authorization
+                    .require(
+                        Subject::User(user.id),
+                        Permission::Read,
+                        Resource::Folder(folder_uuid),
+                    )
+                    .await?;
                 let folder_id = folder.id.clone();
                 return build_streaming_propfind_response(
                     folder,
@@ -475,6 +497,16 @@ async fn handle_propfind(
                 .await;
             }
             Ok(ResolvedResource::File(file)) => {
+                let file_uuid = Uuid::parse_str(&file.id)
+                    .map_err(|_| AppError::not_found(format!("Resource not found: {}", path)))?;
+                state
+                    .authorization
+                    .require(
+                        Subject::User(user.id),
+                        Permission::Read,
+                        Resource::File(file_uuid),
+                    )
+                    .await?;
                 let dead_props = file_dead_props(&state, &file).await;
                 let file_href = webdav_href(&client_path);
                 let mut buf = Vec::with_capacity(1024);
@@ -503,9 +535,6 @@ async fn handle_propfind(
         }
     } else {
         // Fallback: legacy double-query path when PathResolver is unavailable.
-        // `drive_id` is mandatory post-D0 for path-based lookups — derive
-        // the caller's default drive once and reuse it for both probes.
-        let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
         if let Ok(folder) = folder_service.get_folder_by_path(&path, drive_id).await {
             let folder_uuid = Uuid::parse_str(&folder.id)
                 .map_err(|_| AppError::not_found(format!("Resource not found: {}", path)))?;
@@ -875,10 +904,38 @@ async fn handle_get(
         return Err(AppError::bad_request("Cannot GET a directory"));
     }
 
-    // Resolve file — user-scoped when PathResolver is available
+    // `drive_id` is the path-lookup scope post-D0 (paths repeat across
+    // drives), derived once from the caller's default drive and reused
+    // by both the resolver + legacy fallback.
+    let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
+
+    // Resolve file — drive-scoped when PathResolver is available.
+    // Post-D7 both branches enforce `Read` on the resolved file
+    // explicitly. The download stream call below also passes
+    // `caller_id`, so `get_file_stream_with_perms` re-verifies as
+    // defence-in-depth.
+    //
+    // (Fix, 2026-07-02: the legacy fallback branch previously used
+    // `Permission::Update`, a stale mapping from the retired
+    // `assert_owner` helper. That would have locked Viewers out of
+    // downloads once shared drives were exposed via WebDAV. Both
+    // branches now share the correct `Read` permission — see the
+    // post-D7 second AuthZ audit memo.)
     let file = if let Some(resolver) = &state.path_resolver {
-        match resolver.resolve_path_for_user(&path, user.id).await {
-            Ok(ResolvedResource::File(f)) => f,
+        match resolver.resolve_path_in_drive(&path, drive_id).await {
+            Ok(ResolvedResource::File(f)) => {
+                let file_uuid = Uuid::parse_str(&f.id)
+                    .map_err(|_| AppError::not_found(format!("File not found: {}", path)))?;
+                state
+                    .authorization
+                    .require(
+                        Subject::User(user.id),
+                        Permission::Read,
+                        Resource::File(file_uuid),
+                    )
+                    .await?;
+                f
+            }
             Ok(ResolvedResource::Folder(_)) => {
                 return Err(AppError::bad_request("Cannot GET a directory"));
             }
@@ -887,11 +944,7 @@ async fn handle_get(
             }
         }
     } else {
-        // Legacy fallback — fetch + AuthZ check. `drive_id` is the
-        // path-lookup scope post-D0 (`storage.files.path` repeats across
-        // drives), derived once from the caller's default drive. PUT
-        // overwrite = Update on the existing file.
-        let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
+        // Legacy fallback — fetch + AuthZ check.
         let f = file_retrieval_service
             .get_file_by_path(&path, drive_id)
             .await
@@ -902,7 +955,7 @@ async fn handle_get(
             .authorization
             .require(
                 Subject::User(user.id),
-                Permission::Update,
+                Permission::Read,
                 Resource::File(file_uuid),
             )
             .await?;
@@ -977,10 +1030,26 @@ async fn handle_head(
             .unwrap());
     }
 
-    // Single-query path resolution (user-scoped)
+    // `drive_id` is the path-lookup scope post-D0 — derive once and
+    // reuse across the resolver + fallback branches below.
+    let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
+
+    // Single-query path resolution (drive-scoped). Both branches
+    // enforce `Read` on the resolved resource before emitting the
+    // metadata response — same permission as the legacy fallback below.
     if let Some(resolver) = &state.path_resolver {
-        match resolver.resolve_path_for_user(&path, user.id).await {
+        match resolver.resolve_path_in_drive(&path, drive_id).await {
             Ok(ResolvedResource::Folder(folder)) => {
+                let folder_uuid = Uuid::parse_str(&folder.id)
+                    .map_err(|_| AppError::not_found(format!("Resource not found: {}", path)))?;
+                state
+                    .authorization
+                    .require(
+                        Subject::User(user.id),
+                        Permission::Read,
+                        Resource::Folder(folder_uuid),
+                    )
+                    .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "httpd/unix-directory")
@@ -990,6 +1059,16 @@ async fn handle_head(
                     .unwrap());
             }
             Ok(ResolvedResource::File(file)) => {
+                let file_uuid = Uuid::parse_str(&file.id)
+                    .map_err(|_| AppError::not_found(format!("Resource not found: {}", path)))?;
+                state
+                    .authorization
+                    .require(
+                        Subject::User(user.id),
+                        Permission::Read,
+                        Resource::File(file_uuid),
+                    )
+                    .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, &*file.mime_type)
@@ -1009,9 +1088,6 @@ async fn handle_head(
     }
 
     // Fallback: legacy double-query path (with ownership check).
-    // `drive_id` is the path-lookup scope post-D0 — derive once and
-    // reuse for both the folder and file probes.
-    let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
     if let Ok(folder) = folder_service.get_folder_by_path(&path, drive_id).await {
         let folder_uuid = Uuid::parse_str(&folder.id)
             .map_err(|_| AppError::not_found(format!("Resource not found: {}", path)))?;
@@ -1089,16 +1165,10 @@ async fn resolve_or_legacy(
     path: &str,
     user_id: Uuid,
 ) -> Option<ResolvedResource> {
-    if let Some(resolver) = &state.path_resolver
-        && let Ok(r) = resolver.resolve_path_for_user(path, user_id).await
-    {
-        return Some(r);
-    }
-
     // Path-lookup scope post-D0 — derive the caller's default drive
-    // for both legacy probes. `find_default_for_user` returning Err
-    // (e.g. external user, or boot before the lifecycle hook fired)
-    // means no fallback resolution is possible: return None.
+    // once and reuse across both probes. `find_default_for_user`
+    // returning Err (e.g. external user, or boot before the lifecycle
+    // hook fired) means no resolution is possible: return None.
     let drive_id = state
         .drive_repo
         .find_default_for_user(user_id)
@@ -1107,17 +1177,18 @@ async fn resolve_or_legacy(
         .drive
         .id;
 
-    let user_id_str = user_id.to_string();
-    let folder_service = &state.applications.folder_service;
-    if let Ok(folder) = folder_service.get_folder_by_path(path, drive_id).await
-        && folder.owner_id.as_deref() == Some(&user_id_str)
+    if let Some(resolver) = &state.path_resolver
+        && let Ok(r) = resolver.resolve_path_in_drive(path, drive_id).await
     {
+        return Some(r);
+    }
+
+    let folder_service = &state.applications.folder_service;
+    if let Ok(folder) = folder_service.get_folder_by_path(path, drive_id).await {
         return Some(ResolvedResource::Folder(folder));
     }
     let file_retrieval = &state.applications.file_retrieval_service;
-    if let Ok(file) = file_retrieval.get_file_by_path(path, drive_id).await
-        && file.owner_id.as_deref() == Some(&user_id_str)
-    {
+    if let Ok(file) = file_retrieval.get_file_by_path(path, drive_id).await {
         return Some(ResolvedResource::File(file));
     }
     None
@@ -1350,14 +1421,35 @@ async fn handle_put(
         return Ok(resp);
     }
 
-    // ── Ownership / existence check ───────────────────────────────────
+    // `drive_id` is the path-lookup scope post-D0 — resolve once from
+    // the caller's default drive, reused by the resolver checks below
+    // and by the atomic-store call further down.
+    let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
+
+    // ── Existence check ───────────────────────────────────────────────
     // Resolves to: File(existing), Folder(wrong), or Err(new file).
     // Sets `file_existed` for 201 vs 204 and `current_etag` for If-Match.
+    //
+    // Post-D7 the resolver is drive-scoped, not owner-scoped, so we
+    // explicitly `authz.require(Read, …)` on every returned resource
+    // before consuming it. The actual overwrite is authorised as
+    // `Update` inside `update_file_streaming`; this Read check is the
+    // defence-in-depth existence-proof (see project_webdav_authz_second_audit).
     let mut file_existed = false;
     let mut current_etag: Option<String> = None;
     if let Some(resolver) = &state.path_resolver {
-        match resolver.resolve_path_for_user(&path, user.id).await {
+        match resolver.resolve_path_in_drive(&path, drive_id).await {
             Ok(ResolvedResource::File(f)) => {
+                let file_uuid = Uuid::parse_str(&f.id)
+                    .map_err(|_| AppError::not_found(format!("File not found: {}", path)))?;
+                state
+                    .authorization
+                    .require(
+                        Subject::User(user.id),
+                        Permission::Read,
+                        Resource::File(file_uuid),
+                    )
+                    .await?;
                 file_existed = true;
                 current_etag = Some(f.etag.clone());
             }
@@ -1369,12 +1461,36 @@ async fn handle_put(
                 // parent MUST produce 409 Conflict, not 404.
                 let parent_path = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
                 if !parent_path.is_empty() {
-                    resolver
-                        .resolve_path_for_user(parent_path, user.id)
+                    let parent = resolver
+                        .resolve_path_in_drive(parent_path, drive_id)
                         .await
                         .map_err(|_| {
                             AppError::conflict(format!("Parent folder not found: {}", parent_path))
                         })?;
+                    if let ResolvedResource::Folder(folder) = parent {
+                        let folder_uuid = Uuid::parse_str(&folder.id).map_err(|_| {
+                            AppError::conflict(format!("Parent folder not found: {}", parent_path))
+                        })?;
+                        state
+                            .authorization
+                            .require(
+                                Subject::User(user.id),
+                                Permission::Read,
+                                Resource::Folder(folder_uuid),
+                            )
+                            .await
+                            .map_err(|_| {
+                                AppError::conflict(format!(
+                                    "Parent folder not found: {}",
+                                    parent_path
+                                ))
+                            })?;
+                    } else {
+                        return Err(AppError::conflict(format!(
+                            "Parent path is a file, not a collection: {}",
+                            parent_path
+                        )));
+                    }
                 }
             }
         }
@@ -1449,8 +1565,11 @@ async fn handle_put(
     }
 
     // ── Atomic store ──────────────────────────────────────────────────
+    // `drive_id` was resolved above (existence-check block) and is
+    // reused here — the same drive that scoped the resolver scopes the
+    // write. `update_file_streaming` enforces `Permission::Update`
+    // internally via its `_with_perms` shape.
     let content_type = ingested.content_type.clone();
-    let drive_id = resolve_drive_id_for_native_webdav(&state, user.id).await?;
     let result = file_upload_service
         .update_file_streaming(
             &path,
@@ -1552,9 +1671,12 @@ async fn handle_mkcol(
     }
 
     // Check whether the target itself already exists (file or folder → 405).
+    // `exists_in_drive` is an existence-only probe (returns a bool), so no
+    // per-resource authz is applicable here — the create call below is
+    // authorised via `Permission::Create` on the parent.
     if let Some(resolver) = &state.path_resolver {
         if resolver
-            .exists_for_user(&path, user.id)
+            .exists_in_drive(&path, drive_id)
             .await
             .unwrap_or(false)
         {
@@ -1587,10 +1709,29 @@ async fn handle_mkcol(
         None
     } else {
         let parent_path = parent_segments.join("/");
-        // Parent must be a folder, not a file.
+        // Parent must be a folder, not a file. Post-D7 the resolver is
+        // drive-scoped so we explicitly `authz.require(Read, Folder)` on the
+        // returned parent — the actual create then runs under
+        // `Permission::Create` on the same folder inside `create_folder_with_perms`.
         if let Some(resolver) = &state.path_resolver {
-            match resolver.resolve_path_for_user(&parent_path, user.id).await {
-                Ok(ResolvedResource::Folder(f)) => Some(f.id),
+            match resolver.resolve_path_in_drive(&parent_path, drive_id).await {
+                Ok(ResolvedResource::Folder(f)) => {
+                    let folder_uuid = Uuid::parse_str(&f.id).map_err(|_| {
+                        AppError::conflict(format!("Parent folder not found: {}", parent_path))
+                    })?;
+                    state
+                        .authorization
+                        .require(
+                            Subject::User(user.id),
+                            Permission::Read,
+                            Resource::Folder(folder_uuid),
+                        )
+                        .await
+                        .map_err(|_| {
+                            AppError::conflict(format!("Parent folder not found: {}", parent_path))
+                        })?;
+                    Some(f.id)
+                }
                 Ok(ResolvedResource::File(_)) => {
                     return Err(AppError::conflict(
                         "Parent path is a file, not a collection",
@@ -1807,7 +1948,7 @@ async fn handle_move(
     // Probe destination existence for Overwrite semantics and 201 vs 204.
     let dest_existed = if let Some(resolver) = &state.path_resolver {
         resolver
-            .exists_for_user(&destination_path, user.id)
+            .exists_in_drive(&destination_path, drive_id)
             .await
             .unwrap_or(false)
     } else {
@@ -2089,7 +2230,7 @@ async fn handle_copy(
     // Probe destination existence for Overwrite semantics and 201 vs 204.
     let dest_existed = if let Some(resolver) = &state.path_resolver {
         resolver
-            .exists_for_user(&destination_path, user.id)
+            .exists_in_drive(&destination_path, drive_id)
             .await
             .unwrap_or(false)
     } else {
