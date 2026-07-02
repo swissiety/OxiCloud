@@ -422,7 +422,6 @@ impl FileBlobWriteRepository {
             _,
             (
                 String,
-                Option<Uuid>,
                 String,
                 i64,
                 i64,
@@ -433,7 +432,7 @@ impl FileBlobWriteRepository {
             ),
         >(
             r#"
-            SELECT f.id::text, f.user_id, fo.path,
+            SELECT f.id::text, fo.path,
                    EXTRACT(EPOCH FROM f.created_at)::bigint,
                    EXTRACT(EPOCH FROM f.updated_at)::bigint,
                    f.created_by, f.updated_by, f.size, f.mime_type
@@ -457,7 +456,6 @@ impl FileBlobWriteRepository {
 
         let Some((
             id,
-            user_id,
             folder_path,
             created_at,
             updated_at,
@@ -479,7 +477,7 @@ impl FileBlobWriteRepository {
             mime_type,
             created_at,
             updated_at,
-            user_id,
+            None,
             blob_hash.to_string(),
             created_by,
             updated_by,
@@ -532,11 +530,10 @@ impl FileWritePort for FileBlobWriteRepository {
         >(
             r#"
             WITH dest AS (
-                SELECT user_id, drive_id FROM storage.folders WHERE id = $1::uuid
+                SELECT drive_id FROM storage.folders WHERE id = $1::uuid
             )
             UPDATE storage.files f
                SET folder_id = $1::uuid,
-                   user_id   = COALESCE((SELECT user_id  FROM dest), f.user_id),
                    drive_id  = COALESCE((SELECT drive_id FROM dest), f.drive_id),
                    updated_at = NOW(),
                    updated_by = $3

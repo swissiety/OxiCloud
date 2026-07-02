@@ -8,6 +8,8 @@
 //! materialized path column), so no recursive CTEs or N+1 queries are needed.
 
 /// Row shape returned by media-file queries (avoids `clippy::type_complexity`).
+/// Post-D7-step-6: `storage.files.user_id` dropped, so it's no
+/// longer projected.
 type MediaFileRow = (
     String,         // id
     String,         // name
@@ -18,7 +20,6 @@ type MediaFileRow = (
     i64,            // created_at
     i64,            // updated_at
     String,         // blob_hash
-    Option<Uuid>,   // user_id
     Option<Uuid>,   // created_by (§14 provenance)
     Option<Uuid>,   // updated_by (§14 provenance)
     i64,            // sort_date
@@ -76,8 +77,11 @@ const CALLER_CAN_READ_DRIVE: &str = "EXISTS (\
 
 /// Type alias for file metadata rows from SQL queries.
 /// Fields: id, name, folder_id, folder_path, size, mime_type,
-/// created_at, updated_at, blob_hash, user_id, created_by, updated_by.
+/// created_at, updated_at, blob_hash, created_by, updated_by.
 /// `created_by` / `updated_by` are the §14 provenance columns.
+/// Post-D7-step-6: `storage.files.user_id` dropped, so it's no
+/// longer part of the tuple; `row_to_file` populates the entity's
+/// legacy `user_id` field with `None`.
 type FileRow = (
     String,
     String,
@@ -88,7 +92,6 @@ type FileRow = (
     i64,
     i64,
     String,
-    Option<Uuid>,
     Option<Uuid>,
     Option<Uuid>,
 );
@@ -271,7 +274,7 @@ impl FileBlobReadRepository {
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
                     fi.blob_hash, \
-                    fi.user_id, \
+                    \
                     fi.created_by, fi.updated_by \
                FROM storage.files fi \
                LEFT JOIN storage.folders fo ON fo.id = fi.folder_id \
@@ -292,10 +295,8 @@ impl FileBlobReadRepository {
 
         rows.into_iter()
             .map(
-                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub)| {
-                    Self::row_to_file(
-                        id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
-                    )
+                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)| {
+                    Self::row_to_file(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)
                 },
             )
             .collect::<Result<Vec<_>, _>>()
@@ -323,7 +324,7 @@ impl FileBlobReadRepository {
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
                     fi.blob_hash, \
-                    fi.user_id, \
+                    \
                     fi.created_by, fi.updated_by \
                FROM storage.files fi \
                LEFT JOIN storage.folders fo ON fo.id = fi.folder_id \
@@ -338,10 +339,8 @@ impl FileBlobReadRepository {
 
         rows.into_iter()
             .map(
-                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub)| {
-                    Self::row_to_file(
-                        id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
-                    )
+                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)| {
+                    Self::row_to_file(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)
                 },
             )
             .collect::<Result<Vec<_>, _>>()
@@ -398,6 +397,8 @@ impl FileBlobReadRepository {
         }
     }
 
+    /// Post-D7-step-6: `storage.files.user_id` dropped; the entity's
+    /// legacy `user_id` field is populated with `None` here.
     #[allow(clippy::too_many_arguments)]
     fn row_to_file(
         id: String,
@@ -409,7 +410,6 @@ impl FileBlobReadRepository {
         created_at: i64,
         modified_at: i64,
         blob_hash: String,
-        owner_id: Option<Uuid>,
         created_by: Option<Uuid>,
         updated_by: Option<Uuid>,
     ) -> Result<File, DomainError> {
@@ -423,7 +423,7 @@ impl FileBlobReadRepository {
             folder_id,
             created_at as u64,
             modified_at as u64,
-            owner_id,
+            None, // Post-D7: `files.user_id` column dropped.
             blob_hash,
             created_by,
             updated_by,
@@ -504,7 +504,7 @@ impl FileBlobReadRepository {
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
                    EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                    fi.blob_hash,
-                   fi.user_id,
+
                    fi.created_by, fi.updated_by,
                    EXTRACT(EPOCH FROM fi.media_sort_date)::bigint AS sort_date,
                    fm.width, fm.height
@@ -544,9 +544,9 @@ impl FileBlobReadRepository {
         let mut sort_dates = Vec::with_capacity(rows.len());
         let mut dims = Vec::with_capacity(rows.len());
 
-        for (id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub, sd, w, h) in rows {
+        for (id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub, sd, w, h) in rows {
             files.push(Self::row_to_file(
-                id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
+                id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub,
             )?);
             sort_dates.push(sd);
             dims.push((w, h));
@@ -641,7 +641,6 @@ impl FileReadPort for FileBlobReadRepository {
                 i64,            // created_at
                 i64,            // updated_at
                 String,         // blob_hash
-                Option<Uuid>,   // user_id (owner)
                 Option<Uuid>,   // created_by (§14)
                 Option<Uuid>,   // updated_by (§14)
             ),
@@ -652,7 +651,6 @@ impl FileReadPort for FileBlobReadRepository {
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
                    EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                    fi.blob_hash,
-                   fi.user_id,
                    fi.created_by, fi.updated_by
               FROM storage.files fi
               LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -670,7 +668,7 @@ impl FileReadPort for FileBlobReadRepository {
         self.hash_cache.insert(id.to_string(), row.8.clone());
 
         Self::row_to_file(
-            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
         )
     }
 
@@ -690,7 +688,6 @@ impl FileReadPort for FileBlobReadRepository {
                 i64,
                 i64,
                 String,
-                Option<Uuid>,
                 Option<Uuid>, // created_by (§14)
                 Option<Uuid>, // updated_by (§14)
             ),
@@ -701,7 +698,6 @@ impl FileReadPort for FileBlobReadRepository {
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
                    EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                    fi.blob_hash,
-                   fi.user_id,
                    fi.created_by, fi.updated_by
               FROM storage.files fi
               LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -716,7 +712,7 @@ impl FileReadPort for FileBlobReadRepository {
 
         self.hash_cache.insert(id.to_string(), row.8.clone());
         Self::row_to_file(
-            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
         )
     }
 
@@ -730,7 +726,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
+
                    fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -749,7 +745,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
+
                    fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -764,10 +760,8 @@ impl FileReadPort for FileBlobReadRepository {
 
         rows.into_iter()
             .map(
-                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub)| {
-                    Self::row_to_file(
-                        id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
-                    )
+                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)| {
+                    Self::row_to_file(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)
                 },
             )
             .collect()
@@ -796,7 +790,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
+
                    fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -818,7 +812,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
+
                    fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -836,10 +830,8 @@ impl FileReadPort for FileBlobReadRepository {
 
         rows.into_iter()
             .map(
-                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub)| {
-                    Self::row_to_file(
-                        id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
-                    )
+                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)| {
+                    Self::row_to_file(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)
                 },
             )
             .collect()
@@ -989,7 +981,6 @@ impl FileReadPort for FileBlobReadRepository {
                     i64,
                     i64,
                     String,
-                    Option<Uuid>,
                     Option<Uuid>, // created_by (§14)
                     Option<Uuid>, // updated_by (§14)
                 ),
@@ -1000,8 +991,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
-                   fi.created_by, fi.updated_by
+                       fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
                  WHERE fi.name = $1 AND fi.folder_id IS NULL
@@ -1029,7 +1019,6 @@ impl FileReadPort for FileBlobReadRepository {
                     i64,
                     i64,
                     String,
-                    Option<Uuid>,
                     Option<Uuid>, // created_by (§14)
                     Option<Uuid>, // updated_by (§14)
                 ),
@@ -1040,8 +1029,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
-                   fi.created_by, fi.updated_by
+                       fi.created_by, fi.updated_by
                   FROM storage.files fi
                   JOIN storage.folders fo ON fo.id = fi.folder_id
                  WHERE fo.path = $1 AND fi.name = $2
@@ -1058,7 +1046,7 @@ impl FileReadPort for FileBlobReadRepository {
 
         match row {
             Some(r) => Ok(Some(Self::row_to_file(
-                r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11,
+                r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10,
             )?)),
             None => Ok(None),
         }
@@ -1078,8 +1066,8 @@ impl FileReadPort for FileBlobReadRepository {
         let stream = async_stream::try_stream! {
             let mut row_stream = sqlx::query_as::<_, (
                 String, String, Option<String>, Option<String>,
-                i64, String, i64, i64, String, Option<Uuid>,
-                Option<Uuid>, Option<Uuid>,
+                i64, String, i64, i64, String,
+                Option<Uuid>, Option<Uuid>, // created_by, updated_by (§14)
             )>(
                 r#"
                 SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
@@ -1087,8 +1075,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
-                   fi.created_by, fi.updated_by
+                       fi.created_by, fi.updated_by
                   FROM storage.files fi
                   JOIN storage.folders fo ON fo.id = fi.folder_id
                  WHERE fo.lpath <@ (SELECT lpath FROM storage.folders WHERE id = $1::uuid)
@@ -1102,9 +1089,9 @@ impl FileReadPort for FileBlobReadRepository {
             while let Some(row) = row_stream.try_next().await.map_err(|e| {
                 DomainError::internal_error("FileBlobRead", format!("subtree stream: {e}"))
             })? {
-                let (id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub) = row;
+                let (id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub) = row;
                 let file = FileBlobReadRepository::row_to_file(
-                    id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
+                    id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub,
                 )?;
                 yield file;
             }
@@ -1171,7 +1158,7 @@ impl FileReadPort for FileBlobReadRepository {
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
                     fi.blob_hash, \
-                    fi.user_id, \
+                    \
                     fi.created_by, fi.updated_by, \
                     COUNT(*) OVER() AS total_count \
                FROM storage.files fi \
@@ -1194,10 +1181,9 @@ impl FileReadPort for FileBlobReadRepository {
                 i64,
                 i64,
                 String,
-                Option<Uuid>,
                 Option<Uuid>, // created_by (§14)
                 Option<Uuid>, // updated_by (§14)
-                i64,
+                i64,          // total_count
             ),
         >(&sql)
         .bind(caller_id);
@@ -1219,15 +1205,13 @@ impl FileReadPort for FileBlobReadRepository {
             .map_err(|e| DomainError::internal_error("FileBlobRead", format!("search: {e}")))?;
 
         // total_count is the same in every row; 0 when result set is empty.
-        let total_count = rows.first().map_or(0, |r| r.12) as usize;
+        let total_count = rows.first().map_or(0, |r| r.11) as usize;
 
         let files = rows
             .into_iter()
             .map(
-                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub, _total)| {
-                    Self::row_to_file(
-                        id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
-                    )
+                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub, _total)| {
+                    Self::row_to_file(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)
                 },
             )
             .collect::<Result<Vec<_>, _>>()
@@ -1306,7 +1290,7 @@ impl FileReadPort for FileBlobReadRepository {
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
                     fi.blob_hash, \
-                    fi.user_id, \
+                    \
                     fi.created_by, fi.updated_by, \
                     COUNT(*) OVER() AS total_count \
                FROM storage.files fi \
@@ -1329,10 +1313,9 @@ impl FileReadPort for FileBlobReadRepository {
                 i64,
                 i64,
                 String,
-                Option<Uuid>,
                 Option<Uuid>, // created_by (§14)
                 Option<Uuid>, // updated_by (§14)
-                i64,
+                i64,          // total_count
             ),
         >(&sql)
         .bind(caller_id)
@@ -1352,15 +1335,13 @@ impl FileReadPort for FileBlobReadRepository {
             DomainError::internal_error("FileBlobRead", format!("subtree search: {e}"))
         })?;
 
-        let total_count = rows.first().map_or(0, |r| r.12) as usize;
+        let total_count = rows.first().map_or(0, |r| r.11) as usize;
 
         let files = rows
             .into_iter()
             .map(
-                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub, _total)| {
-                    Self::row_to_file(
-                        id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
-                    )
+                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub, _total)| {
+                    Self::row_to_file(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)
                 },
             )
             .collect::<Result<Vec<_>, _>>()
@@ -1402,7 +1383,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
+
                    fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -1432,7 +1413,7 @@ impl FileReadPort for FileBlobReadRepository {
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                        fi.blob_hash,
-                       fi.user_id,
+
                    fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
@@ -1458,10 +1439,8 @@ impl FileReadPort for FileBlobReadRepository {
 
         rows.into_iter()
             .map(
-                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub)| {
-                    Self::row_to_file(
-                        id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, cb, ub,
-                    )
+                |(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)| {
+                    Self::row_to_file(id, name, fid, fpath, size, mime, ca, ma, blob_hash, cb, ub)
                 },
             )
             .collect()
