@@ -1,10 +1,12 @@
 use crate::application::dtos::cursor::PageCursor;
 use crate::application::dtos::recent_dto::{RecentCursor, RecentItemDto, RecentResourceRow};
+use crate::application::ports::authorization_ports::AuthorizationEngine;
 use crate::application::ports::recent_ports::{RecentItemsRepositoryPort, RecentItemsUseCase};
 use crate::application::ports::resource_access_hook::ResourceAccessHook;
-use crate::common::errors::{DomainError, ErrorKind, Result};
-use crate::domain::services::authorization::ResourceKind;
+use crate::common::errors::Result;
+use crate::domain::services::authorization::{Permission, Resource, ResourceKind, Subject};
 use crate::infrastructure::repositories::pg::RecentItemsPgRepository;
+use crate::infrastructure::services::pg_acl_engine::PgAclEngine;
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 use uuid::Uuid;
@@ -16,6 +18,13 @@ use uuid::Uuid;
 pub struct RecentService {
     repo: Arc<RecentItemsPgRepository>,
     max_recent_items: i32,
+    /// ReBAC engine — enforces `Permission::Read` on the referenced
+    /// file/folder before enrolling it into a user's Recent list.
+    /// The listing side JOINs back to `storage.files/folders` and
+    /// returns name/mime/size/drive_id for any enrolled UUID, so
+    /// the write path is an information oracle without this gate.
+    /// See `docs/plan/authz_audit/rest_storage.md`.
+    authorization: Arc<PgAclEngine>,
     /// Set after construction via [`Self::set_resource_access_hook`].
     /// The hook is built FROM this service (it wraps an `Arc<Self>`), so
     /// we can't take it as a constructor arg without circular ownership;
@@ -28,10 +37,15 @@ pub struct RecentService {
 
 impl RecentService {
     /// Create a new recent items service
-    pub fn new(repo: Arc<RecentItemsPgRepository>, max_recent_items: i32) -> Self {
+    pub fn new(
+        repo: Arc<RecentItemsPgRepository>,
+        authorization: Arc<PgAclEngine>,
+        max_recent_items: i32,
+    ) -> Self {
         Self {
             repo,
             max_recent_items: max_recent_items.clamp(1, 100),
+            authorization,
             resource_access_hook: OnceLock::new(),
         }
     }
@@ -87,13 +101,16 @@ impl RecentItemsUseCase for RecentService {
             item_type, item_id, user_id
         );
 
-        if item_type != "file" && item_type != "folder" {
-            return Err(DomainError::new(
-                ErrorKind::InvalidInput,
-                "RecentItems",
-                "Item type must be 'file' or 'folder'",
-            ));
-        }
+        // AuthZ pre-write: caller must have Read on the referenced
+        // resource. Denial routes through `require` → NotFound
+        // (anti-enum) + `authz.denied` audit line. Without this
+        // gate the write path was an information oracle over the
+        // whole tenant via the listing endpoint's JOIN back to
+        // storage.files/folders.
+        let resource = Resource::parse(item_type, item_id)?;
+        self.authorization
+            .require(Subject::User(user_id), Permission::Read, resource)
+            .await?;
 
         self.repo.upsert_access(user_id, item_id, item_type).await?;
         self.repo.prune(user_id, self.max_recent_items).await?;
