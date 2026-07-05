@@ -3,7 +3,7 @@ use crate::application::dtos::recent_dto::{RecentCursor, RecentItemDto, RecentRe
 use crate::application::ports::authorization_ports::AuthorizationEngine;
 use crate::application::ports::recent_ports::{RecentItemsRepositoryPort, RecentItemsUseCase};
 use crate::application::ports::resource_access_hook::ResourceAccessHook;
-use crate::common::errors::Result;
+use crate::common::errors::{DomainError, Result};
 use crate::domain::services::authorization::{Permission, Resource, ResourceKind, Subject};
 use crate::infrastructure::repositories::pg::RecentItemsPgRepository;
 use crate::infrastructure::services::pg_acl_engine::PgAclEngine;
@@ -67,6 +67,41 @@ impl RecentService {
             hook.on_recents_cleared(user_id);
         }
     }
+
+    /// Record access to an item WITHOUT the pre-write `authz.require`
+    /// gate. Callers must have gated the caller's Read upstream — this
+    /// method exists for the `RecentRecordingHook` fast path: writes
+    /// that reach the hook have already passed a `_with_perms` service
+    /// method (uploads, streams, GETs, etc.), so re-checking here
+    /// would be pure duplicate work AND widen the race window between
+    /// the POST response and the `tokio::spawn`ed upsert (
+    /// `tests/api/recent.hurl` step 7 hits this — the extra SQL
+    /// round-trip pushes the upsert past the client's immediate
+    /// `GET /api/recent/resources`).
+    ///
+    /// **Do NOT call this from an externally-reachable handler.** The
+    /// REST endpoint goes through the trait method `record_item_access`
+    /// below, which enforces the Read gate per AGENTS.md convention.
+    pub async fn record_item_access_internal(
+        &self,
+        user_id: Uuid,
+        item_id: &str,
+        item_type: &str,
+    ) -> Result<()> {
+        // Type validation only — no authz, no resource parse for the
+        // engine (the hook path is already resource-typed by construction).
+        if item_type != "file" && item_type != "folder" {
+            return Err(DomainError::new(
+                crate::common::errors::ErrorKind::InvalidInput,
+                "RecentItems",
+                "Item type must be 'file' or 'folder'",
+            ));
+        }
+
+        self.repo.upsert_access(user_id, item_id, item_type).await?;
+        self.repo.prune(user_id, self.max_recent_items).await?;
+        Ok(())
+    }
 }
 
 impl RecentItemsUseCase for RecentService {
@@ -107,13 +142,18 @@ impl RecentItemsUseCase for RecentService {
         // gate the write path was an information oracle over the
         // whole tenant via the listing endpoint's JOIN back to
         // storage.files/folders.
+        //
+        // Internal hook callers (RecentRecordingHook) bypass the
+        // trait entry point and call `record_item_access_internal`
+        // directly — Read has already been enforced upstream on
+        // whatever `_with_perms` service produced the access event.
         let resource = Resource::parse(item_type, item_id)?;
         self.authorization
             .require(Subject::User(user_id), Permission::Read, resource)
             .await?;
 
-        self.repo.upsert_access(user_id, item_id, item_type).await?;
-        self.repo.prune(user_id, self.max_recent_items).await?;
+        self.record_item_access_internal(user_id, item_id, item_type)
+            .await?;
 
         info!(
             "Successfully recorded access to {} '{}' for user {}",
