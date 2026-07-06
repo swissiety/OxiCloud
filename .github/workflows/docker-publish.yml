@@ -1,4 +1,4 @@
-name: Docker Hub Release
+name: "Docker Hub & GHCR Release"
 
 on:
   push:
@@ -15,6 +15,7 @@ on:
 
 env:
   REGISTRY_IMAGE: diocrafts/oxicloud
+  GHCR_REGISTRY_IMAGE: ghcr.io/atalayalabs/oxicloud
 
 jobs:
   # Run tests before publishing
@@ -112,8 +113,8 @@ jobs:
           tags: |
             ${{ env.REGISTRY_IMAGE }}:${{ env.VERSION }}
             ${{ env.REGISTRY_IMAGE }}:latest
-            ghcr.io/${{ github.repository }}:${{ env.VERSION }}
-            ghcr.io/${{ github.repository }}:latest
+            ${{ env.GHCR_REGISTRY_IMAGE }}:${{ env.VERSION }}
+            ${{ env.GHCR_REGISTRY_IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # GitHub Actions env piped through so build.rs stamps
