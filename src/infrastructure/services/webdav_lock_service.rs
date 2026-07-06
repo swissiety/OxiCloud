@@ -321,7 +321,7 @@ mod tests {
         let store = WebDavLockStore::new(16);
         let info = lock_info("urn:token-1", Some("Second-600"), LockScope::Exclusive);
 
-        let acquired = store.acquire("/a.txt", info).expect("acquire");
+        let acquired = store.acquire("/a.txt", info, None).expect("acquire");
         assert_eq!(acquired.info.token, "urn:token-1");
 
         // Resolvable by both indexes.
@@ -348,12 +348,14 @@ mod tests {
             .acquire(
                 "/a.txt",
                 lock_info("urn:token-1", Some("Second-600"), LockScope::Exclusive),
+                None,
             )
             .expect("first acquire");
 
         let conflict = store.acquire(
             "/a.txt",
             lock_info("urn:token-2", Some("Second-600"), LockScope::Exclusive),
+            None,
         );
         assert!(conflict.is_err());
         // The original holder is returned so the caller can report it.
@@ -367,6 +369,7 @@ mod tests {
             .acquire(
                 "/a.txt",
                 lock_info("urn:token-1", Some("Infinite"), LockScope::Exclusive),
+                None,
             )
             .expect("acquire");
 
