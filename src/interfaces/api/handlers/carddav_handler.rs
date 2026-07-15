@@ -254,9 +254,7 @@ async fn handle_propfind(
             addressbook_service
                 .list_user_address_books(user.id)
                 .await
-                .map_err(|e| {
-                    AppError::internal_error(format!("Failed to list address books: {}", e))
-                })?
+                .map_err(AppError::from)?
         };
 
         let mut response_body = Vec::new();
@@ -307,9 +305,7 @@ async fn handle_propfind(
         let address_books = addressbook_service
             .list_user_address_books(user.id)
             .await
-            .map_err(|e| {
-                AppError::internal_error(format!("Failed to list address books: {}", e))
-            })?;
+            .map_err(AppError::from)?;
 
         let user_part = path.split('/').next().unwrap_or(path);
         let base_href = format!("/carddav/{}/", user_part);
@@ -373,7 +369,7 @@ async fn handle_propfind(
             let contact = contact_svc
                 .get_contact_by_uid(address_book_id, contact_uid, user.id)
                 .await
-                .map_err(|e| AppError::internal_error(format!("Failed to look up contact: {}", e)))?
+                .map_err(AppError::from)?
                 .ok_or_else(|| {
                     AppError::not_found(format!("Contact not found: {}", contact_uid))
                 })?;
@@ -432,7 +428,7 @@ async fn handle_report(
         CardDavReportType::AddressbookQuery { .. } => contact_svc
             .list_contacts(address_book_id, None, None, user.id)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to list contacts: {}", e)))?,
+            .map_err(AppError::from)?,
         CardDavReportType::AddressbookMultiget { hrefs, .. } => {
             // Indexed batch lookup (`uid = ANY(...)`) — a multiget for a
             // handful of contacts must not pay for listing the whole
@@ -445,12 +441,12 @@ async fn handle_report(
             contact_svc
                 .get_contacts_by_uids(address_book_id, &uids, user.id)
                 .await
-                .map_err(|e| AppError::internal_error(format!("Failed to fetch contacts: {}", e)))?
+                .map_err(AppError::from)?
         }
         CardDavReportType::SyncCollection { .. } => contact_svc
             .list_contacts(address_book_id, None, None, user.id)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to list contacts: {}", e)))?,
+            .map_err(AppError::from)?,
     };
 
     // Generate vCards
@@ -511,10 +507,13 @@ async fn handle_mkcol(
         is_public: Some(false),
     };
 
+    // See the comment on the vCard PUT path — kind-aware error mapping
+    // so a client MKCOL body with a bad name / duplicate returns
+    // 400 / 409 instead of an opaque 500.
     addressbook_service
         .create_address_book(create_dto)
         .await
-        .map_err(|e| AppError::internal_error(format!("Failed to create address book: {}", e)))?;
+        .map_err(AppError::from)?;
 
     Ok(Response::builder()
         .status(StatusCode::CREATED)
@@ -564,11 +563,17 @@ async fn handle_put(
     };
 
     if let Some(existing_contact) = existing {
-        // Update: delete + recreate from vCard
+        // Update: delete + recreate from vCard. `AppError::from` maps
+        // the domain-error ErrorKind onto the right status code:
+        // NotFound → 404 (contact/address-book gone), AccessDenied →
+        // 403, InvalidInput → 400 (malformed vCard PUT from the
+        // client). Naive `internal_error(...)` wrapping used to hide
+        // all client-input bugs as 500 — same class of bug as the
+        // CalDAV `create_event_from_ical` path (see #545).
         contact_svc
             .delete_contact(&existing_contact.id, user.id)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to update contact: {}", e)))?;
+            .map_err(AppError::from)?;
 
         let create_dto = CreateContactVCardDto {
             address_book_id: address_book_id.to_string(),
@@ -578,7 +583,7 @@ async fn handle_put(
         let contact = contact_svc
             .create_contact_from_vcard(create_dto)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to recreate contact: {}", e)))?;
+            .map_err(AppError::from)?;
 
         Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -592,10 +597,12 @@ async fn handle_put(
             user_id: user.id.to_string(),
         };
 
+        // See the comment above the update branch — same rationale for
+        // preferring `AppError::from` over blanket 500.
         let contact = contact_svc
             .create_contact_from_vcard(create_dto)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to create contact: {}", e)))?;
+            .map_err(AppError::from)?;
 
         Ok(Response::builder()
             .status(StatusCode::CREATED)
@@ -635,7 +642,7 @@ async fn handle_get(
         let contacts = contact_svc
             .list_contacts(address_book_id, None, None, user.id)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to list contacts: {}", e)))?;
+            .map_err(AppError::from)?;
 
         let mut vcf_data = String::new();
         for contact in &contacts {
@@ -655,7 +662,7 @@ async fn handle_get(
         let contact = contact_svc
             .get_contact_by_uid(address_book_id, contact_uid, user.id)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to look up contact: {}", e)))?
+            .map_err(AppError::from)?
             .ok_or_else(|| AppError::not_found(format!("Contact not found: {}", contact_uid)))?;
 
         let vcard = contact_to_vcard(&contact);
@@ -693,9 +700,7 @@ async fn handle_delete(
         addressbook_service
             .delete_address_book(address_book_id, user.id)
             .await
-            .map_err(|e| {
-                AppError::internal_error(format!("Failed to delete address book: {}", e))
-            })?;
+            .map_err(AppError::from)?;
     } else {
         // Delete contact — indexed lookup by vCard UID.
         let contact_file = parts[1];
@@ -704,13 +709,13 @@ async fn handle_delete(
         let contact = contact_svc
             .get_contact_by_uid(address_book_id, contact_uid, user.id)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to look up contact: {}", e)))?
+            .map_err(AppError::from)?
             .ok_or_else(|| AppError::not_found(format!("Contact not found: {}", contact_uid)))?;
 
         contact_svc
             .delete_contact(&contact.id, user.id)
             .await
-            .map_err(|e| AppError::internal_error(format!("Failed to delete contact: {}", e)))?;
+            .map_err(AppError::from)?;
     }
 
     Ok(Response::builder()
@@ -768,9 +773,7 @@ async fn handle_proppatch(
         addressbook_service
             .update_address_book(address_book_id, update)
             .await
-            .map_err(|e| {
-                AppError::internal_error(format!("Failed to update address book: {}", e))
-            })?;
+            .map_err(AppError::from)?;
     }
 
     let mut results = Vec::new();

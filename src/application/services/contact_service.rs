@@ -103,7 +103,11 @@ impl ContactService {
         Ok(book)
     }
 
-    fn parse_vcard(&self, vcard_data: &str) -> Result<Contact, DomainError> {
+    // Associated function (no `&self`) so tests in this module
+    // can call `ContactService::parse_vcard(&body)` directly
+    // without instantiating a full service (which needs an
+    // Arc<ContactStorageAdapter> and an Arc<PgAclEngine>).
+    fn parse_vcard(vcard_data: &str) -> Result<Contact, DomainError> {
         // This is a simplified vCard parser - a real implementation would use a proper vCard library
         // For now, we'll create a basic contact with minimal data
 
@@ -123,11 +127,15 @@ impl ContactService {
                     contact.set_first_name(Some(parts[1].to_string()));
                 }
             } else if line.starts_with("EMAIL") {
-                let value = line.split(':').nth(1).unwrap_or("");
+                // Split on the FIRST colon — same rationale as the
+                // TEL branch below; keeps parameter parsing separate
+                // from value parsing.
+                let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
                 if !value.is_empty() {
-                    let email_type = if line.contains("TYPE=HOME") {
+                    let params_upper = line.to_ascii_uppercase();
+                    let email_type = if params_upper.contains("TYPE=HOME") {
                         "home"
-                    } else if line.contains("TYPE=WORK") {
+                    } else if params_upper.contains("TYPE=WORK") {
                         "work"
                     } else {
                         "other"
@@ -140,15 +148,35 @@ impl ContactService {
                     });
                 }
             } else if line.starts_with("TEL") {
-                let value = line.split(':').nth(1).unwrap_or("");
+                // Split on the FIRST colon so URI-form values survive.
+                // Apple Contacts / DAVx⁵ send:
+                //   TEL;TYPE=cell;VALUE=uri:tel:+15551234567
+                // The pre-fix `split(':').nth(1)` picked up "tel"
+                // (the middle segment), silently losing the actual
+                // phone number. `split_once(':')` splits ONCE at the
+                // property-name/value boundary; we then strip the
+                // `tel:` URI scheme if present.
+                let value = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+                let value = value.strip_prefix("tel:").unwrap_or(value);
                 if !value.is_empty() {
-                    let phone_type = if line.contains("TYPE=CELL") || line.contains("TYPE=MOBILE") {
+                    // RFC 6350 §5.3: parameter values are
+                    // case-insensitive. Match on the uppercase
+                    // form of the whole property line so
+                    // `TYPE=cell` and `TYPE=CELL` both route
+                    // correctly. Pre-fix this was case-sensitive
+                    // and dropped lowercase to "other" — matches
+                    // the shape python-caldav / Apple Contacts
+                    // emit.
+                    let params_upper = line.to_ascii_uppercase();
+                    let phone_type = if params_upper.contains("TYPE=CELL")
+                        || params_upper.contains("TYPE=MOBILE")
+                    {
                         "mobile"
-                    } else if line.contains("TYPE=HOME") {
+                    } else if params_upper.contains("TYPE=HOME") {
                         "home"
-                    } else if line.contains("TYPE=WORK") {
+                    } else if params_upper.contains("TYPE=WORK") {
                         "work"
-                    } else if line.contains("TYPE=FAX") {
+                    } else if params_upper.contains("TYPE=FAX") {
                         "fax"
                     } else {
                         "other"
@@ -158,6 +186,62 @@ impl ContactService {
                         number: value.to_string(),
                         r#type: phone_type.to_string(),
                         is_primary: contact.phone_is_empty(), // First one is primary
+                    });
+                }
+            } else if line.starts_with("ADR") {
+                // ADR (RFC 6350 §6.3.1). Structured value: 7 components
+                // separated by `;` — (pobox, extended, street, city,
+                // region, postal, country). Positions 0/1 are legacy
+                // and typically empty; we preserve positions 2–6 as
+                // (street, city, state, postal_code, country) which
+                // matches the emitter format at
+                // `carddav_adapter.rs::contact_to_vcard`.
+                //
+                // Pre-fix parse_vcard had NO ADR handler at all —
+                // every ADR line sent by a client was silently dropped
+                // at PUT time, so no address ever survived a
+                // round-trip. See bug_carddav_parser_gaps.md.
+                let value = line.split_once(':').map(|(_, v)| v).unwrap_or("");
+                let parts: Vec<&str> = value.split(';').collect();
+                let field = |i: usize| {
+                    parts
+                        .get(i)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                };
+                let params_upper = line.to_ascii_uppercase();
+                let addr_type = if params_upper.contains("TYPE=HOME") {
+                    "home"
+                } else if params_upper.contains("TYPE=WORK") {
+                    "work"
+                } else {
+                    "other"
+                };
+                // Only push if AT LEAST one of the useful fields
+                // is populated — an all-empty ADR line is a
+                // no-op sent by some clients that "clear" the
+                // address; storing an empty row would confuse
+                // downstream UIs.
+                let street = field(2);
+                let city = field(3);
+                let state = field(4);
+                let postal_code = field(5);
+                let country = field(6);
+                if street.is_some()
+                    || city.is_some()
+                    || state.is_some()
+                    || postal_code.is_some()
+                    || country.is_some()
+                {
+                    let is_primary = contact.address_is_empty();
+                    contact.push_address(Address {
+                        street,
+                        city,
+                        state,
+                        postal_code,
+                        country,
+                        r#type: addr_type.to_string(),
+                        is_primary,
                     });
                 }
             } else if let Some(stripped) = line.strip_prefix("ORG:") {
@@ -535,7 +619,7 @@ impl ContactUseCase for ContactService {
             .await?;
 
         // Parse vCard data
-        let mut contact = self.parse_vcard(&dto.vcard)?;
+        let mut contact = Self::parse_vcard(&dto.vcard)?;
 
         // Set address book ID
         contact.set_address_book_id(address_book_id);
@@ -1068,5 +1152,292 @@ impl ContactUseCase for ContactService {
             .collect();
 
         Ok(vcards)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DefaultAddressBookLifecycleHook
+//
+// Ensures every internal user has at least one owned address book so
+// CardDAV clients (Thunderbird, Apple Contacts, DAVx⁵) succeed at their
+// PROPFIND-based address-book discovery on first connect. Without this,
+// a fresh user's carddav home collection is empty and every mainstream
+// client returns "no address books found" rather than offering to create
+// one (see AtalayaLabs/OxiCloud#545 — same class of bug as CalDAV).
+//
+// Symmetric with `DefaultCalendarLifecycleHook`. See the calendar hook
+// docstring for the design rationale (ownership-based idempotency, safety-
+// net on login, external → internal upgrade, deletion behaviour).
+// ─────────────────────────────────────────────────────────────────────────────
+
+use crate::application::ports::user_lifecycle::{DeletionMode, LogoutReason, UserLifecycleHook};
+use crate::domain::entities::user::User;
+use crate::domain::repositories::address_book_repository::AddressBookRepository;
+use crate::infrastructure::repositories::pg::AddressBookPgRepository;
+use async_trait::async_trait;
+
+pub struct DefaultAddressBookLifecycleHook {
+    /// Owner-listing goes through the concrete repository (bypasses the
+    /// storage port which doesn't expose owner-only enumeration —
+    /// matching the pattern `PersonalDriveLifecycleHook` uses for
+    /// `find_default_for_user`).
+    address_book_repo: Arc<AddressBookPgRepository>,
+    contact_storage: Arc<ContactStorageAdapter>,
+    /// Concrete engine — `AuthorizationEngine` isn't dyn-compatible
+    /// (native async-fn-in-trait), so we hold the concrete
+    /// `PgAclEngine` matching the other lifecycle hooks.
+    authorization: Arc<PgAclEngine>,
+    /// Display name for the default address book. "Contacts" mirrors
+    /// the Nextcloud convention CardDAV clients already recognise.
+    default_name: String,
+}
+
+impl DefaultAddressBookLifecycleHook {
+    pub fn new(
+        address_book_repo: Arc<AddressBookPgRepository>,
+        contact_storage: Arc<ContactStorageAdapter>,
+        authorization: Arc<PgAclEngine>,
+    ) -> Self {
+        Self {
+            address_book_repo,
+            contact_storage,
+            authorization,
+            default_name: "Contacts".to_string(),
+        }
+    }
+
+    /// Idempotent provisioning. Shared by `on_user_created`,
+    /// `on_user_login` (safety-net for pre-existing users), and
+    /// `on_upgraded_to_internal` (external → internal promotion).
+    async fn provision_if_needed(&self, user: &User) -> Result<(), DomainError> {
+        if user.is_external() {
+            return Ok(());
+        }
+
+        // Ownership-based idempotency check — same rationale as the
+        // calendar hook. Any existing owned address book (auto-
+        // provisioned earlier, user-created, migrated) is respected.
+        let existing = self
+            .address_book_repo
+            .get_address_books_by_owner(user.id())
+            .await
+            .map_err(|e| {
+                DomainError::internal_error(
+                    "DefaultAddressBookHook",
+                    format!("get_address_books_by_owner: {e}"),
+                )
+            })?;
+        if !existing.is_empty() {
+            return Ok(());
+        }
+
+        // Provision. The address-book service constructs the entity
+        // directly (no dedicated storage-adapter method), so we do the
+        // same here: build the `AddressBook` domain type, persist via
+        // the storage port, then seed the Owner role_grant.
+        let address_book = AddressBook::new(
+            self.default_name.clone(),
+            user.id().to_string(),
+            None,
+            None,
+            false,
+        );
+        let created = self
+            .contact_storage
+            .create_address_book(address_book)
+            .await
+            .map_err(|e| {
+                DomainError::internal_error(
+                    "DefaultAddressBookHook",
+                    format!("create_address_book: {e}"),
+                )
+            })?;
+        self.authorization
+            .set_role(
+                user.id(),
+                Subject::User(user.id()),
+                Role::Owner,
+                Resource::AddressBook(*created.id()),
+                None,
+            )
+            .await?;
+
+        tracing::info!(
+            target: "user_lifecycle",
+            hook = "default_address_book",
+            user_id = %user.id(),
+            address_book_id = %created.id(),
+            "Default address book provisioned"
+        );
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl UserLifecycleHook for DefaultAddressBookLifecycleHook {
+    fn name(&self) -> &'static str {
+        "default_address_book"
+    }
+
+    async fn on_user_created(&self, user: &User) -> Result<(), DomainError> {
+        self.provision_if_needed(user).await
+    }
+
+    async fn on_user_login(&self, user: &User) -> Result<(), DomainError> {
+        self.provision_if_needed(user).await
+    }
+
+    async fn on_upgraded_to_internal(&self, user: &User) -> Result<(), DomainError> {
+        self.provision_if_needed(user).await
+    }
+
+    async fn on_user_logout(&self, _user: &User, _reason: LogoutReason) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    async fn on_user_deleted(
+        &self,
+        _user: &User,
+        _mode: DeletionMode,
+        _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), DomainError> {
+        // `carddav.address_books.owner_id` has ON DELETE CASCADE on
+        // `auth.users(id)`, and contacts cascade off address_book. The
+        // trigger on `role_grants` reaps the token grants. No hook-side
+        // cleanup needed.
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tests — parse_vcard property surface
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod parse_vcard_tests {
+    use super::*;
+
+    /// Wrap minimal vCard 3.0 header/footer around one or more
+    /// property lines. CRLF-normalise, matching wire format.
+    fn vcard(lines: &[&str]) -> String {
+        let mut body =
+            String::from("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:parse-test\r\nFN:Parse Test\r\n");
+        for l in lines {
+            body.push_str(l);
+            body.push_str("\r\n");
+        }
+        body.push_str("END:VCARD\r\n");
+        body
+    }
+
+    // ── TEL ───────────────────────────────────────────────────
+
+    #[test]
+    fn tel_plain_form_still_parses() {
+        // Regression pin: pre-existing shape `TEL;TYPE=CELL:+1...`
+        // (no VALUE=uri) must continue to parse cleanly.
+        let body = vcard(&["TEL;TYPE=CELL:+15551234567"]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.phone().len(), 1);
+        assert_eq!(c.phone()[0].number, "+15551234567");
+        assert_eq!(c.phone()[0].r#type, "mobile");
+    }
+
+    #[test]
+    fn tel_uri_form_survives_first_colon_split() {
+        // The #528-adjacent bug the fix targets. Pre-fix the
+        // parser `split(':').nth(1)` would return "tel", losing
+        // the actual number.
+        let body = vcard(&["TEL;TYPE=cell;VALUE=uri:tel:+15551234567"]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.phone().len(), 1);
+        assert_eq!(
+            c.phone()[0].number,
+            "+15551234567",
+            "URI-scheme prefix must be stripped so downstream UIs \
+             show a clickable number, not `tel:+15551234567`."
+        );
+        assert_eq!(c.phone()[0].r#type, "mobile");
+    }
+
+    #[test]
+    fn tel_uri_form_without_scheme_prefix_survives() {
+        // Some clients emit VALUE=uri but no explicit `tel:` in
+        // the value. Handle gracefully — we take everything after
+        // the first colon and only strip `tel:` if present.
+        let body = vcard(&["TEL;VALUE=uri:+15551234567"]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.phone()[0].number, "+15551234567");
+    }
+
+    // ── ADR ───────────────────────────────────────────────────
+
+    #[test]
+    fn adr_full_structured_value_populates_all_fields() {
+        // The reference shape from RFC 6350 §6.3.1:
+        //   ADR;TYPE=HOME:pobox;ext;street;city;region;postal;country
+        // Positions 0/1 (pobox, ext) are legacy and typically
+        // empty on real client output; we skip them by design.
+        let body = vcard(&["ADR;TYPE=HOME:;;42 Rue de Rivoli;Paris;Île-de-France;75001;France"]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.address().len(), 1);
+        let a = &c.address()[0];
+        assert_eq!(a.street.as_deref(), Some("42 Rue de Rivoli"));
+        assert_eq!(a.city.as_deref(), Some("Paris"));
+        assert_eq!(a.state.as_deref(), Some("Île-de-France"));
+        assert_eq!(a.postal_code.as_deref(), Some("75001"));
+        assert_eq!(a.country.as_deref(), Some("France"));
+        assert_eq!(a.r#type, "home");
+        assert!(a.is_primary, "first ADR should be primary");
+    }
+
+    #[test]
+    fn adr_partial_value_only_populates_present_fields() {
+        // Client sends street + city only — the other structured
+        // components stay None (not "" — that would confuse the
+        // Address DTO's Option<String>-based null semantics).
+        let body = vcard(&["ADR:;;42 Rue de Rivoli;Paris;;;"]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.address().len(), 1);
+        let a = &c.address()[0];
+        assert_eq!(a.street.as_deref(), Some("42 Rue de Rivoli"));
+        assert_eq!(a.city.as_deref(), Some("Paris"));
+        assert!(a.state.is_none());
+        assert!(a.postal_code.is_none());
+        assert!(a.country.is_none());
+        assert_eq!(a.r#type, "other", "no TYPE param → 'other'");
+    }
+
+    #[test]
+    fn adr_all_empty_is_dropped() {
+        // Some clients emit `ADR:;;;;;;` as a "clear this
+        // address" operation. Storing an empty row would show as
+        // a blank address slot in UIs. Skip it.
+        let body = vcard(&["ADR:;;;;;;"]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.address().len(), 0);
+    }
+
+    #[test]
+    fn adr_type_work_recognized() {
+        let body = vcard(&["ADR;TYPE=WORK:;;5 Wall St;NYC;NY;10005;USA"]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.address()[0].r#type, "work");
+    }
+
+    #[test]
+    fn adr_and_tel_coexist() {
+        // Two independent fixes on the same PUT should both
+        // populate — proves neither branch consumes lines meant
+        // for the other via prefix ambiguity.
+        let body = vcard(&[
+            "TEL;TYPE=CELL:+15551234567",
+            "ADR;TYPE=HOME:;;42 Rue de Rivoli;Paris;;75001;France",
+        ]);
+        let c = ContactService::parse_vcard(&body).expect("valid vcard");
+        assert_eq!(c.phone().len(), 1);
+        assert_eq!(c.phone()[0].number, "+15551234567");
+        assert_eq!(c.address().len(), 1);
+        assert_eq!(c.address()[0].city.as_deref(), Some("Paris"));
     }
 }
