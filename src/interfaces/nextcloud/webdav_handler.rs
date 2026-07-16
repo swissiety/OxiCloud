@@ -933,6 +933,11 @@ async fn handle_put(
 
     // Single streaming path — handles both update and create internally,
     // swapping the file row onto the already-ingested blob.
+    // AuthZ audit #6 (2026-07-12): route `_with_perms` errors through
+    // `AppError::from` so authz denials surface as 404 (the anti-enum
+    // shape) instead of a `map_err → internal_error` 500 that gives a
+    // probing caller an "exists-but-denied" oracle. Also preserves
+    // `QuotaExceeded → 507`, `AlreadyExists → 409`, `InvalidInput → 400`.
     let stored = upload_service
         .update_file_streaming_with_perms(
             &internal_path,
@@ -943,7 +948,7 @@ async fn handle_put(
             session.user.id,
         )
         .await
-        .map_err(|e| AppError::internal_error(format!("Failed to store file: {}", e)))?;
+        .map_err(AppError::from)?;
 
     let status = if existed {
         StatusCode::NO_CONTENT
@@ -1032,10 +1037,14 @@ async fn handle_mkcol(
         name: target_name.to_string(),
         parent_id: Some(parent_folder.id.clone()),
     };
+    // AuthZ audit #7 (2026-07-12): route `_with_perms` errors through
+    // `AppError::from` so authz denials surface as 404 (the anti-enum
+    // shape) instead of a `map_err → internal_error` 500. Also preserves
+    // `AlreadyExists → 409`, `QuotaExceeded → 507`, `InvalidInput → 400`.
     folder_service
         .create_folder_with_perms(dto, user.id)
         .await
-        .map_err(|e| AppError::internal_error(format!("Failed to create folder: {}", e)))?;
+        .map_err(AppError::from)?;
 
     Ok(Response::builder()
         .status(StatusCode::CREATED)
@@ -1077,20 +1086,22 @@ async fn handle_delete(
                     Resource::Folder(folder_uuid),
                 )
                 .await?;
+            // AuthZ audit #8 (2026-07-12): route service errors through
+            // `AppError::from` so authz denials surface as 404 (the
+            // anti-enum shape) instead of a `map_err → internal_error`
+            // 500 that gives a probing caller an "exists-but-denied"
+            // oracle. `move_to_trash` and `delete_folder_with_perms`
+            // both return `DomainError` and both call `authz.require`.
             if let Some(trash_svc) = state.trash_service.as_ref() {
                 trash_svc
                     .move_to_trash(&folder.id, "folder", user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to trash folder: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             } else {
                 folder_service
                     .delete_folder_with_perms(&folder.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to delete folder: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             }
         }
         ResolvedResource::File(file) => {
@@ -1104,21 +1115,18 @@ async fn handle_delete(
                     Resource::File(file_uuid),
                 )
                 .await?;
+            // AuthZ audit #8 (2026-07-12): same anti-enum fix as folder branch above.
             if let Some(trash_svc) = state.trash_service.as_ref() {
                 trash_svc
                     .move_to_trash(&file.id, "file", user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to trash file: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             } else {
                 let file_mgmt = &state.applications.file_management_service;
                 file_mgmt
                     .delete_file_with_perms(&file.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to delete file: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             }
         }
     }
@@ -1196,6 +1204,12 @@ async fn handle_move(
         // then proceed with the move. Trashing is fine: per RFC the source
         // resource appears at the destination URI; what happens to the
         // overwritten one is up to the server.
+        //
+        // AuthZ audit #9 (2026-07-12): route the `_with_perms` delete
+        // errors through `AppError::from` so authz denials surface as 404
+        // (anti-enum) instead of `map_err → internal_error` 500. Also
+        // preserves `QuotaExceeded → 507`, `AlreadyExists → 409`,
+        // `InvalidInput → 400`.
         match existing {
             ResolvedResource::File(existing_file) => {
                 let file_uuid = Uuid::parse_str(&existing_file.id).map_err(|_| {
@@ -1212,12 +1226,7 @@ async fn handle_move(
                 file_mgmt
                     .delete_and_cleanup_with_perms(&existing_file.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to overwrite destination file: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
             ResolvedResource::Folder(existing_folder) => {
                 let folder_uuid = Uuid::parse_str(&existing_folder.id).map_err(|_| {
@@ -1234,12 +1243,7 @@ async fn handle_move(
                 folder_service
                     .delete_folder_with_perms(&existing_folder.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to overwrite destination folder: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
         }
     }
@@ -1267,12 +1271,15 @@ async fn handle_move(
             None => "",
         };
 
+        // AuthZ audit #9 (2026-07-12): route `_with_perms` errors
+        // through `AppError::from` so authz denials surface as 404
+        // (anti-enum) instead of `map_err → internal_error` 500.
         if src_parent_sub == dest_parent_sub {
             // Same parent → rename.
             file_mgmt
                 .rename_file_with_perms(&file.id, user.id, dest_name)
                 .await
-                .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                .map_err(AppError::from)?;
         } else {
             // Different parent → move.
             let dest_parent = folder_service
@@ -1283,14 +1290,14 @@ async fn handle_move(
             file_mgmt
                 .move_file_with_perms(&file.id, user.id, Some(dest_parent.id.clone()))
                 .await
-                .map_err(|e| AppError::internal_error(format!("Move failed: {}", e)))?;
+                .map_err(AppError::from)?;
 
             // If the filename changed too, rename after move.
             if file.name != dest_name {
                 file_mgmt
                     .rename_file_with_perms(&file.id, user.id, dest_name)
                     .await
-                    .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                    .map_err(AppError::from)?;
             }
         }
 
@@ -1332,6 +1339,9 @@ async fn handle_move(
             None => "",
         };
 
+        // AuthZ audit #9 (2026-07-12): route `_with_perms` errors
+        // through `AppError::from` so authz denials surface as 404
+        // (anti-enum) instead of `map_err → internal_error` 500.
         if src_parent_sub == dest_parent_sub {
             // Same parent → rename.
             use crate::application::dtos::folder_dto::RenameFolderDto;
@@ -1344,7 +1354,7 @@ async fn handle_move(
                     user.id,
                 )
                 .await
-                .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                .map_err(AppError::from)?;
         } else {
             // Different parent → move.
             let dest_parent = folder_service
@@ -1362,7 +1372,7 @@ async fn handle_move(
                     user.id,
                 )
                 .await
-                .map_err(|e| AppError::internal_error(format!("Move failed: {}", e)))?;
+                .map_err(AppError::from)?;
 
             // If the name changed too, rename.
             if folder.name != dest_name {
@@ -1376,7 +1386,7 @@ async fn handle_move(
                         user.id,
                     )
                     .await
-                    .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                    .map_err(AppError::from)?;
             }
         }
 
