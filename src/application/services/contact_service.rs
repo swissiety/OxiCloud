@@ -756,8 +756,14 @@ impl ContactUseCase for ContactService {
             .await?
             .ok_or_else(|| DomainError::not_found("Contact", "not found"))?;
 
-        // Check if user has write access to the address book
-        self.require_address_book_perm(contact.address_book_id(), &user_id, Permission::Update)
+        // AuthZ audit #13 (2026-07-12): previously required
+        // `Permission::Update`, which the Editor role bundle satisfies
+        // (Read + Comment + Create + Update). Every Editor grantee on a
+        // shared address book could delete individual contacts — a
+        // silent privilege escalation because the intent for CardDAV
+        // deletion is Delete, not Update. Sibling
+        // `CalendarService::delete_event` was the ground-truth pattern.
+        self.require_address_book_perm(contact.address_book_id(), &user_id, Permission::Delete)
             .await?;
 
         // Delete the contact
@@ -940,8 +946,11 @@ impl ContactUseCase for ContactService {
             .await?
             .ok_or_else(|| DomainError::not_found("Contact group", "not found"))?;
 
-        // Check if user has write access to the address book
-        self.require_address_book_perm(group.address_book_id(), &user_id, Permission::Update)
+        // AuthZ audit #13 (2026-07-12): see the sibling `delete_contact`
+        // above — required `Update` (in the Editor bundle) instead of
+        // `Delete`, letting any Editor on a shared address book delete
+        // groups they shouldn't.
+        self.require_address_book_perm(group.address_book_id(), &user_id, Permission::Delete)
             .await?;
 
         // Delete the group

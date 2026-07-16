@@ -455,6 +455,69 @@ Authorization: Bearer {{bob_token}}
 HTTP 403
 
 
+# ─────────────────────────────────────────────────────────────
+# Step 21d–21g — Regression pin for AuthZ audit #13 (2026-07-12).
+#
+# `ContactService::delete_contact` used to `authz.require(Update)`
+# on the address book instead of `Delete`. Editor role bundle
+# (Read + Comment + Create + Update) satisfies Update → any
+# Editor grantee on a shared address book could delete individual
+# contacts. Fix: swap the required Permission on delete_contact
+# + delete_group to `Delete`. Sibling `CalendarService::delete_event`
+# was the ground-truth pattern.
+#
+# The pin promotes Bob to Editor (so his bundle includes Update
+# but NOT Delete — exactly the pre-fix bypass condition), seeds a
+# canary contact as Alice, has Bob attempt DELETE, then confirms
+# Alice still sees the contact. Pre-fix would 204; post-fix 403.
+# ─────────────────────────────────────────────────────────────
+
+# 21d — Promote Bob from Viewer to Editor.
+PUT {{base_url}}/api/grants/role
+Authorization: Bearer {{token}}
+Content-Type: application/json
+{
+  "subject":  { "type": "user",         "id": "{{bob_user_id}}" },
+  "resource": { "type": "address_book", "id": "{{share_book_id}}" },
+  "role":     "editor"
+}
+
+HTTP 200
+
+
+# 21e — Alice seeds a canary contact in the shared book.
+POST {{base_url}}/api/address-books/{{share_book_id}}/contacts
+Authorization: Bearer {{token}}
+Content-Type: application/json
+{
+  "full_name": "audit-13 delete-permission canary"
+}
+
+HTTP 201
+[Captures]
+audit13_contact_id: jsonpath "$.id"
+
+
+# 21f — Bob (Editor) DELETE the canary → 403. Editor has Read
+# so graduated denial fires with `visibility=visible`. Pre-fix
+# this returned 204 because `require(Update)` succeeded on the
+# Editor bundle.
+DELETE {{base_url}}/api/address-books/{{share_book_id}}/contacts/{{audit13_contact_id}}
+Authorization: Bearer {{bob_token}}
+
+HTTP 403
+
+
+# 21g — Alice re-fetches to confirm the canary is still there
+# (Bob's DELETE really was refused, not just responded to).
+GET {{base_url}}/api/address-books/{{share_book_id}}/contacts/{{audit13_contact_id}}
+Authorization: Bearer {{token}}
+
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{audit13_contact_id}}"
+
+
 # Step 22 — Alice revokes the grant.
 DELETE {{base_url}}/api/grants/{{share_grant_id}}
 Authorization: Bearer {{token}}
