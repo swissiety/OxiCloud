@@ -70,7 +70,7 @@ use crate::interfaces::api::handlers::i18n_handler::{
     get_locales, get_translations_by_locale, translate,
 };
 use crate::interfaces::api::handlers::search_handler::{
-    clear_search_cache, search_files_get, search_files_post, suggest_files,
+    search_files_get, search_files_post, suggest_files,
 };
 use crate::interfaces::api::handlers::trash_handler;
 
@@ -275,8 +275,11 @@ pub fn create_api_routes(app_state: &Arc<AppState>) -> Router<Arc<AppState>> {
             .route("/suggest", get(suggest_files))
             // Advanced search with full criteria object
             .route("/advanced", post(search_files_post))
-            // Clear search cache
-            .route("/cache", delete(clear_search_cache))
+            // `DELETE /api/search/cache` used to live here as a per-user-
+            // reachable endpoint. It's an operator-only debug lever
+            // (moka `invalidate_all()` — nukes every tenant), so it
+            // moved to `/api/admin/search/cache` where the URL declares
+            // intent. AuthZ audit #14 (2026-07-16).
             .with_state(app_state.clone())
     } else {
         Router::new()

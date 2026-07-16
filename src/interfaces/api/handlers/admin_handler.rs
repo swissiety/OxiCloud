@@ -27,6 +27,7 @@ use crate::application::ports::storage_ports::StorageUsagePort;
 use crate::common::di::AppState;
 use crate::domain::repositories::drive_repository::DriveRepository;
 use crate::domain::services::authorization::{Resource, Subject};
+use crate::interfaces::api::handlers::search_handler::clear_search_cache;
 use crate::interfaces::errors::AppError;
 use crate::interfaces::middleware::admin::require_admin;
 use std::sync::Arc;
@@ -89,6 +90,12 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/plugins/{id}/logs/stream", get(stream_plugin_logs))
         .route("/plugins/{id}/retention", get(get_plugin_retention))
         .route("/plugins/{id}/retention", put(set_plugin_retention))
+        // Search — operator flush of the shared moka results cache
+        // (AuthZ audit #14, 2026-07-16). `invalidate_all()` semantics
+        // touch every tenant, so this is admin-only. Lived at
+        // `/api/search/cache` pre-2026-07-17; the URL now declares
+        // its admin intent up front.
+        .route("/search/cache", delete(clear_search_cache))
         // SMTP diagnostics
         .route("/smtp/info", get(get_smtp_info))
         .route("/smtp/test", post(send_smtp_test))
