@@ -32,6 +32,7 @@ use crate::application::adapters::caldav_adapter::{
     CalDavAdapter, CalDavReportType, CalendarObjectRow, bundle_to_calendar_body,
     extract_object_chunk, extract_vtimezone_chunks, group_objects_by_uid, vtimezone_tzid,
 };
+use crate::application::adapters::sync_collection_xml;
 use crate::application::adapters::uid_from_multiget_href;
 use crate::application::adapters::webdav_adapter::{PropFindRequest, PropFindType};
 use crate::application::dtos::calendar_dto::{
@@ -41,6 +42,7 @@ use crate::application::ports::calendar_ports::{
     AccessibleCalendar, CalendarObject, CalendarUseCase,
 };
 use crate::application::ports::change_log_port::SyncChange;
+use crate::application::services::caldav_sync_collection_service::CaldavSyncCollectionService;
 use crate::application::services::calendar_service::CalendarService;
 use crate::common::di::AppState;
 use crate::domain::entities::sync_token::SyncToken;
@@ -218,7 +220,7 @@ fn build_streaming_report_response(
         {
             let mut w = Writer::new(&mut buf);
             if let Some(token) = sync_token.as_deref() {
-                CalDavAdapter::write_sync_token(&mut w, token)
+                sync_collection_xml::write_sync_token(&mut w, "D:", token)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
             CalDavAdapter::write_caldav_multistatus_end(&mut w)
@@ -578,6 +580,21 @@ fn get_calendar_service(state: &AppState) -> Result<&Arc<CalendarService>, AppEr
             "NotImplemented",
         )
     })
+}
+
+fn get_caldav_sync_collection_service(
+    state: &AppState,
+) -> Result<&Arc<CaldavSyncCollectionService>, AppError> {
+    state
+        .caldav_sync_collection_service
+        .as_ref()
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "CalDAV sync-collection service is not configured",
+                "NotImplemented",
+            )
+        })
 }
 
 // ─── OPTIONS ─────────────────────────────────────────────────────────
@@ -963,9 +980,11 @@ async fn handle_report(
         // Minted BEFORE the snapshot is read: a change landing mid-stream
         // is then re-sent on the next delta instead of being lost.
         let sync_token = if initial_sync {
+            let calendar_uuid = Uuid::parse_str(calendar_id)
+                .map_err(|_| AppError::bad_request("Invalid calendar ID"))?;
             Some(
-                calendar_service
-                    .mint_initial_event_token(calendar_id, user.id)
+                get_caldav_sync_collection_service(&state)?
+                    .mint_initial_token(calendar_uuid, user.id)
                     .await?
                     .to_string(),
             )
@@ -1035,8 +1054,8 @@ async fn handle_report(
                 .map_err(|_| AppError::bad_request("Invalid calendar ID"))?;
             let token = SyncToken::parse_for_collection(raw, calendar_uuid)
                 .map_err(|e| AppError::bad_request(format!("Invalid sync-token: {e}")))?;
-            let delta = calendar_service
-                .list_event_changes_with_perms(calendar_id, Some(token), user.id)
+            let delta = get_caldav_sync_collection_service(&state)?
+                .list_changes_with_perms(calendar_uuid, Some(token), user.id)
                 .await?;
 
             // The log is per ROW, but a resource is a UID bundle (master
@@ -1086,11 +1105,11 @@ async fn handle_report(
         CalDavAdapter::write_report_page(&mut xml_writer, &todos, &report, base_href)
             .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
         for href in &deleted_hrefs {
-            CalDavAdapter::write_deleted_event_response(&mut xml_writer, href)
+            sync_collection_xml::write_deleted_response(&mut xml_writer, "D:", href)
                 .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
         }
         if let Some(token) = sync_token.as_deref() {
-            CalDavAdapter::write_sync_token(&mut xml_writer, token)
+            sync_collection_xml::write_sync_token(&mut xml_writer, "D:", token)
                 .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
         }
         CalDavAdapter::write_caldav_multistatus_end(&mut xml_writer)

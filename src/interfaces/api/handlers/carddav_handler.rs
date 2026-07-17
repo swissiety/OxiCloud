@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::application::adapters::carddav_adapter::{
     CardDavAdapter, CardDavReportType, contact_to_vcard,
 };
+use crate::application::adapters::sync_collection_xml;
 use crate::application::adapters::uid_from_multiget_href;
 use crate::application::adapters::webdav_adapter::{PropFindRequest, PropFindType};
 use crate::application::dtos::address_book_dto::{CreateAddressBookDto, UpdateAddressBookDto};
@@ -261,7 +262,7 @@ fn build_streaming_contacts_report(
         {
             let mut w = Writer::new(&mut buf);
             if let Some(token) = sync_token.as_deref() {
-                CardDavAdapter::write_sync_token(&mut w, token)
+                sync_collection_xml::write_sync_token(&mut w, "D:", token)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
             CardDavAdapter::write_carddav_multistatus_end(&mut w)
