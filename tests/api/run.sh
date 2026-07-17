@@ -421,6 +421,8 @@ HURL_FILES=( \
   "$API_DIR/webdav_permissions.hurl" \
   "$API_DIR/webdav_nested_move_cascade.hurl" \
   "$API_DIR/nfc_normalization.hurl" \
+  "$API_DIR/webdav_sync_collection.hurl" \
+  "$API_DIR/nc_webdav_sync_collection.hurl" \
   "$API_DIR/wopi_authz.hurl" \
   "$API_DIR/wopi_shared_drive.hurl" \
   `# Second-to-last. The slowest file in the suite BY DESIGN: it waits` \
