@@ -707,6 +707,13 @@ impl AppServiceFactory {
         // File metadata repository — EXIF/media metadata for images
         let file_metadata_repository = Arc::new(FileMetadataRepository::new(db_pool.clone()));
 
+        // Sync-collection change log — RFC 6578 incremental WebDAV sync.
+        let folder_sync_change_repository = Arc::new(
+            crate::infrastructure::repositories::pg::FolderSyncChangePgRepository::new(
+                db_pool.clone(),
+            ),
+        );
+
         tracing::info!(
             "Repository services initialized with 100% blob storage model (PG metadata + BlobHandler blobs)"
         );
@@ -719,6 +726,7 @@ impl AppServiceFactory {
             file_metadata_repository,
             i18n_repository,
             trash_repository,
+            folder_sync_change_repository,
         }
     }
 
@@ -908,6 +916,15 @@ impl AppServiceFactory {
             self.config.search_cache.max_bytes,
         )));
 
+        let webdav_sync_collection_service = Arc::new(
+            crate::application::services::webdav_sync_collection_service::WebdavSyncCollectionService::new(
+                repos.folder_sync_change_repository.clone(),
+                repos.folder_repository.clone(),
+                repos.file_read_repository.clone(),
+                authz.clone(),
+            ),
+        );
+
         tracing::info!("Application services initialized");
 
         ApplicationServices {
@@ -929,6 +946,7 @@ impl AppServiceFactory {
             recent_service: None,    // Configured later with create_recent_service
             audio_metadata_service: core.audio_metadata_service.clone(),
             media_metadata_service: core.media_metadata_service.clone(),
+            webdav_sync_collection_service,
         }
     }
 
@@ -3801,6 +3819,9 @@ pub struct RepositoryServices {
     pub file_metadata_repository: Arc<FileMetadataRepository>,
     pub i18n_repository: Arc<FileSystemI18nService>,
     pub trash_repository: Option<Arc<TrashDbRepository>>,
+    /// RFC 6578 `sync-collection` change log for WebDAV files/folders.
+    pub folder_sync_change_repository:
+        Arc<crate::infrastructure::repositories::pg::FolderSyncChangePgRepository>,
 }
 
 /// Container for application services
@@ -3827,6 +3848,11 @@ pub struct ApplicationServices {
     pub recent_service: Option<Arc<RecentService>>,
     pub audio_metadata_service: Option<Arc<AudioMetadataService>>,
     pub media_metadata_service: Arc<MediaMetadataService>,
+    /// RFC 6578 `sync-collection` REPORT — real incremental sync for
+    /// WebDAV files/folders (plain WebDAV + NextCloud surfaces).
+    pub webdav_sync_collection_service: Arc<
+        crate::application::services::webdav_sync_collection_service::WebdavSyncCollectionService,
+    >,
 }
 
 /// Container for authentication services

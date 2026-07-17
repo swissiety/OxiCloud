@@ -1031,14 +1031,22 @@ async fn handle_report(
     let subfolders: Vec<(FolderDto, String)> = subfolders
         .into_iter()
         .map(|f| {
-            let href = format!("{}{}/", base_href, encode_path_segment(&f.name));
+            let href = format!(
+                "{}{}/",
+                base_href,
+                utf8_percent_encode(&f.name, PATH_SEGMENT_ENCODE_SET)
+            );
             (f, href)
         })
         .collect();
     let files: Vec<(FileDto, String)> = files
         .into_iter()
         .map(|f| {
-            let href = format!("{}{}", base_href, encode_path_segment(&f.name));
+            let href = format!(
+                "{}{}",
+                base_href,
+                utf8_percent_encode(&f.name, PATH_SEGMENT_ENCODE_SET)
+            );
             (f, href)
         })
         .collect();

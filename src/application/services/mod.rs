@@ -42,6 +42,7 @@ pub mod storage_usage_service;
 pub mod subject_group_service;
 pub mod trash_service;
 pub mod user_lifecycle_service;
+pub mod webdav_sync_collection_service;
 pub mod wopi_lock_service;
 pub mod wopi_token_service;
 
