@@ -594,6 +594,7 @@ HURL_FILES=( \
   "$API_DIR/carddav_vcard_properties.hurl" \
   "$API_DIR/webdav_carddav_param_encoding.hurl" \
   "$API_DIR/contacts.hurl" \
+  "$API_DIR/contact_sync_collection.hurl" \
   "$API_DIR/calendar.hurl" \
   "$API_DIR/caldav_shared_roles.hurl" \
   "$API_DIR/caldav_recurring.hurl" \

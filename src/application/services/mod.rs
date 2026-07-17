@@ -5,6 +5,7 @@ pub mod backend_write_gate;
 pub mod batch_operations;
 pub mod blob_lifecycle_service;
 pub mod calendar_service;
+pub mod carddav_sync_collection_service;
 pub mod collab_session_service;
 pub mod collab_wire;
 pub mod contact_service;
