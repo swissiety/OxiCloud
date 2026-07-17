@@ -26,6 +26,7 @@ use percent_encoding::percent_decode_str;
 use quick_xml::Writer;
 use std::fmt::Write;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::application::adapters::caldav_adapter::{
     CalDavAdapter, CalDavReportType, CalendarObjectRow, bundle_to_calendar_body,
@@ -39,8 +40,10 @@ use crate::application::dtos::calendar_dto::{
 use crate::application::ports::calendar_ports::{
     AccessibleCalendar, CalendarObject, CalendarUseCase,
 };
+use crate::application::ports::change_log_port::SyncChange;
 use crate::application::services::calendar_service::CalendarService;
 use crate::common::di::AppState;
+use crate::domain::entities::sync_token::SyncToken;
 use crate::interfaces::errors::AppError;
 use crate::interfaces::middleware::auth::AuthUser;
 
@@ -140,6 +143,10 @@ where
 /// `target` decides which stored kinds stream (#754): events, tasks,
 /// or both (events first, then tasks — multistatus member order is
 /// not significant).
+///
+/// `sync_token` is `Some` only for an initial (token-less)
+/// sync-collection: the full snapshot streams like a no-range
+/// calendar-query, then the RFC 6578 `<D:sync-token>` closes it.
 fn build_streaming_report_response(
     calendar_service: Arc<CalendarService>,
     calendar_id: String,
@@ -147,6 +154,7 @@ fn build_streaming_report_response(
     base_href: String,
     user_id: uuid::Uuid,
     target: CompTarget,
+    sync_token: Option<String>,
 ) -> Response<Body> {
     let stream = async_stream::try_stream! {
         let mut buf = Vec::with_capacity(256);
@@ -206,9 +214,13 @@ fn build_streaming_report_response(
             }
         }
 
-        let mut buf = Vec::with_capacity(32);
+        let mut buf = Vec::with_capacity(128);
         {
             let mut w = Writer::new(&mut buf);
+            if let Some(token) = sync_token.as_deref() {
+                CalDavAdapter::write_sync_token(&mut w, token)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
             CalDavAdapter::write_caldav_multistatus_end(&mut w)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
@@ -868,12 +880,16 @@ async fn handle_propfind(
                     std::slice::from_ref(event),
                     &report_type,
                     base_href,
+                    &[],
+                    None,
                 ),
                 CalendarObject::Todo(todo) => CalDavAdapter::generate_calendar_events_response(
                     &mut response_body,
                     std::slice::from_ref(todo),
                     &report_type,
                     base_href,
+                    &[],
+                    None,
                 ),
             };
             xml.map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
@@ -912,11 +928,13 @@ async fn handle_report(
         return Err(AppError::bad_request("Calendar ID required in path"));
     }
 
-    // Whole-calendar shapes (no-range calendar-query, sync-collection)
-    // stream: header + one chunk per hydrated UID page + footer, instead
-    // of materialising every DTO AND the full multistatus in RAM with
-    // TTFB = complete generation. Bounded shapes (time-range query,
-    // multiget) keep the buffered path.
+    // Whole-calendar shapes (no-range calendar-query, initial
+    // sync-collection) stream: header + one chunk per hydrated UID page +
+    // footer, instead of materialising every DTO AND the full multistatus
+    // in RAM with TTFB = complete generation. Bounded shapes (time-range
+    // query, multiget) and an incremental sync-collection — whose delta is
+    // bounded by the change log, not by the calendar — keep the buffered
+    // path below.
     let target = match &report {
         CalDavReportType::CalendarQuery { comp, .. } => comp_target(comp.as_deref()),
         // Multiget addresses objects by href and sync-collection covers
@@ -924,18 +942,36 @@ async fn handle_report(
         _ => CompTarget::All,
     };
 
-    if matches!(
+    let initial_sync = matches!(
         &report,
-        CalDavReportType::CalendarQuery {
-            time_range: None,
-            ..
-        } | CalDavReportType::SyncCollection { .. }
-    ) {
+        CalDavReportType::SyncCollection { sync_token, .. } if sync_token.is_empty()
+    );
+    if initial_sync
+        || matches!(
+            &report,
+            CalDavReportType::CalendarQuery {
+                time_range: None,
+                ..
+            }
+        )
+    {
         // Surface not-found / authz before committing to a 207 stream.
         calendar_service
             .get_calendar(calendar_id, user.id)
             .await
             .map_err(AppError::from)?;
+        // Minted BEFORE the snapshot is read: a change landing mid-stream
+        // is then re-sent on the next delta instead of being lost.
+        let sync_token = if initial_sync {
+            Some(
+                calendar_service
+                    .mint_initial_event_token(calendar_id, user.id)
+                    .await?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
         let base_href = super::dav_paths::collection_href("caldav", &request_path, calendar_id);
         return Ok(build_streaming_report_response(
             calendar_service.clone(),
@@ -944,11 +980,15 @@ async fn handle_report(
             base_href,
             user.id,
             target,
+            sync_token,
         ));
     }
 
+    let base_href = &super::dav_paths::collection_href("caldav", &request_path, calendar_id);
     let mut events: Vec<CalendarEventDto> = Vec::new();
     let mut todos: Vec<CalendarTodoDto> = Vec::new();
+    let mut deleted_hrefs: Vec<String> = Vec::new();
+    let mut sync_token: Option<String> = None;
     match &report {
         CalDavReportType::CalendarQuery { time_range, .. } => {
             if let Some((start, end)) = time_range {
@@ -988,12 +1028,51 @@ async fn handle_report(
                 .await
                 .map_err(AppError::from)?;
         }
-        CalDavReportType::SyncCollection { .. } => {
-            unreachable!("sync-collection streams above")
+        CalDavReportType::SyncCollection {
+            sync_token: raw, ..
+        } => {
+            let calendar_uuid = Uuid::parse_str(calendar_id)
+                .map_err(|_| AppError::bad_request("Invalid calendar ID"))?;
+            let token = SyncToken::parse_for_collection(raw, calendar_uuid)
+                .map_err(|e| AppError::bad_request(format!("Invalid sync-token: {e}")))?;
+            let delta = calendar_service
+                .list_event_changes_with_perms(calendar_id, Some(token), user.id)
+                .await?;
+
+            // The log is per ROW, but a resource is a UID bundle (master
+            // + RECURRENCE-ID overrides share one href). Re-hydrate every
+            // touched UID as a whole: rows left → upsert with the full
+            // bundle; none left → tombstone. Rendering a lone changed
+            // override, or a 404 for a deleted override whose master
+            // survives, would corrupt the client's copy.
+            let mut touched: Vec<String> = Vec::new();
+            for change in delta.changes {
+                let uid = match change {
+                    SyncChange::Upserted(event) => event.ical_uid,
+                    SyncChange::Deleted { href_hint, .. } => href_hint
+                        .strip_suffix(".ics")
+                        .map(str::to_owned)
+                        .unwrap_or(href_hint),
+                };
+                if !touched.contains(&uid) {
+                    touched.push(uid);
+                }
+            }
+            if !touched.is_empty() {
+                events = calendar_service
+                    .get_events_by_ical_uids(calendar_id, &touched, user.id)
+                    .await
+                    .map_err(AppError::from)?;
+            }
+            deleted_hrefs = touched
+                .iter()
+                .filter(|uid| !events.iter().any(|e| &e.ical_uid == *uid))
+                .map(|uid| format!("{}{}.ics", base_href, uid))
+                .collect();
+            sync_token = Some(delta.new_token.to_string());
         }
     };
 
-    let base_href = &super::dav_paths::collection_href("caldav", &request_path, calendar_id);
     // One multistatus carrying both kinds: events first, then tasks.
     // `write_report_page` over an empty slice emits nothing, so the
     // kinds not targeted above cost no bytes.
@@ -1006,6 +1085,14 @@ async fn handle_report(
             .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
         CalDavAdapter::write_report_page(&mut xml_writer, &todos, &report, base_href)
             .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
+        for href in &deleted_hrefs {
+            CalDavAdapter::write_deleted_event_response(&mut xml_writer, href)
+                .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
+        }
+        if let Some(token) = sync_token.as_deref() {
+            CalDavAdapter::write_sync_token(&mut xml_writer, token)
+                .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
+        }
         CalDavAdapter::write_caldav_multistatus_end(&mut xml_writer)
             .map_err(|e| AppError::internal_error(format!("Failed to generate XML: {}", e)))?;
     }

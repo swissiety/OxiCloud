@@ -600,6 +600,7 @@ HURL_FILES=( \
   "$API_DIR/caldav_tzid.hurl" \
   "$API_DIR/caldav_vtodo.hurl" \
   "$API_DIR/caldav_calendar_query.hurl" \
+  "$API_DIR/calendar_sync_collection.hurl" \
   "$API_DIR/playlists.hurl" \
   # Adjacent to playlists.hurl because it drives the same
   # /api/playlists/audio-metadata endpoint — but it is about the
