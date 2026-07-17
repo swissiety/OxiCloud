@@ -372,6 +372,7 @@ HURL_FILES=( \
   "$API_DIR/caldav_shared_roles.hurl" \
   "$API_DIR/caldav_recurring.hurl" \
   "$API_DIR/caldav_calendar_query.hurl" \
+  "$API_DIR/calendar_sync_collection.hurl" \
   "$API_DIR/playlists.hurl" \
   "$API_DIR/public_shares.hurl" \
   "$API_DIR/anonymous_share_session.hurl" \
