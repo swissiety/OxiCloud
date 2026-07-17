@@ -12,6 +12,7 @@ use quick_xml::{
 use std::io::{BufReader, Read, Write};
 
 use crate::application::adapters::param_encoding::render_param_value;
+use crate::application::adapters::sync_collection_xml;
 use crate::application::adapters::webdav_adapter::{
     PropFindRequest, PropFindType, QualifiedName, Result, WebDavAdapter, WebDavError,
 };
@@ -763,45 +764,14 @@ impl CardDavAdapter {
         Self::write_contacts_report_page(&mut xml_writer, contacts, report, base_href)?;
 
         for href in deleted_hrefs {
-            Self::write_deleted_contact_response(&mut xml_writer, href)?;
+            sync_collection_xml::write_deleted_response(&mut xml_writer, "D:", href)?;
         }
 
         if let Some(token) = sync_token {
-            Self::write_sync_token(&mut xml_writer, token)?;
+            sync_collection_xml::write_sync_token(&mut xml_writer, "D:", token)?;
         }
 
         Self::write_carddav_multistatus_end(&mut xml_writer)
-    }
-
-    /// RFC 6578 §6.2 trailing `<D:sync-token>` — the last child of the
-    /// multistatus, written just before `write_carddav_multistatus_end`.
-    /// Shared by the buffered response above and the streamed initial
-    /// sync-collection snapshot.
-    pub fn write_sync_token<W: Write>(xml_writer: &mut Writer<W>, token: &str) -> Result<()> {
-        xml_writer.write_event(Event::Start(BytesStart::new("D:sync-token")))?;
-        xml_writer.write_event(Event::Text(BytesText::new(token)))?;
-        xml_writer.write_event(Event::End(BytesEnd::new("D:sync-token")))?;
-        Ok(())
-    }
-
-    /// RFC 6578 §3.7 removed-member sub-response: a `<D:response>` whose
-    /// `<D:status>` is 404, with no `<D:propstat>` block.
-    fn write_deleted_contact_response<W: Write>(
-        xml_writer: &mut Writer<W>,
-        href: &str,
-    ) -> Result<()> {
-        xml_writer.write_event(Event::Start(BytesStart::new("D:response")))?;
-
-        xml_writer.write_event(Event::Start(BytesStart::new("D:href")))?;
-        xml_writer.write_event(Event::Text(BytesText::new(href)))?;
-        xml_writer.write_event(Event::End(BytesEnd::new("D:href")))?;
-
-        xml_writer.write_event(Event::Start(BytesStart::new("D:status")))?;
-        xml_writer.write_event(Event::Text(BytesText::new("HTTP/1.1 404 Not Found")))?;
-        xml_writer.write_event(Event::End(BytesEnd::new("D:status")))?;
-
-        xml_writer.write_event(Event::End(BytesEnd::new("D:response")))?;
-        Ok(())
     }
 
     /// Write a single contact response element
