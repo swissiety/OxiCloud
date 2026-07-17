@@ -61,6 +61,29 @@ impl WebdavSyncCollectionService {
         }
     }
 
+    /// Mints the token an **initial** sync response should hand back
+    /// (empty/absent client `sync-token` — the caller renders a full
+    /// listing itself and just needs a cursor for the client's *next*
+    /// poll). Cheaper than routing through `list_changes_with_perms`,
+    /// which would also walk the collection's full change history only
+    /// to discard it.
+    pub async fn mint_initial_token(
+        &self,
+        collection_folder_id: Uuid,
+        caller_id: Uuid,
+    ) -> Result<SyncToken, DomainError> {
+        self.authz
+            .require(
+                Subject::User(caller_id),
+                Permission::Read,
+                Resource::Folder(collection_folder_id),
+            )
+            .await?;
+
+        let seq = self.change_log.current_seq(collection_folder_id).await?;
+        Ok(SyncToken::mint(collection_folder_id, seq))
+    }
+
     /// Resolves the delta for `collection_folder_id` since `since_token`
     /// (`None` for an initial sync — still walks the log with `since = 0`
     /// so `new_token` is correctly minted, but callers doing a true
@@ -110,6 +133,7 @@ impl WebdavSyncCollectionService {
                     changes.push(SyncChange::Deleted {
                         member_id: row.member_id,
                         href_hint: row.href_name,
+                        is_collection: matches!(row.member_type, SyncMemberType::Folder),
                     });
                 }
                 SyncChangeKind::Created | SyncChangeKind::Updated => {
@@ -138,6 +162,7 @@ impl WebdavSyncCollectionService {
                         Some(member) => changes.push(SyncChange::Upserted(member)),
                         None => changes.push(SyncChange::Deleted {
                             member_id: row.member_id,
+                            is_collection: matches!(row.member_type, SyncMemberType::Folder),
                             href_hint: row.href_name,
                         }),
                     }
