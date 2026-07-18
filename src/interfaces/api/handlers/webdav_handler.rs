@@ -74,8 +74,9 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b':')
     .remove(b'@');
 
-/// Percent-encode a single URI path segment (folder/file name).
-/// Percent-encode a full slash-separated path, encoding each segment individually.
+/// Percent-encode a full slash-separated path, encoding each segment
+/// individually — also safe for a single segment (folder/file name),
+/// which just has no `/` to split on.
 pub(crate) fn encode_uri_path(path: &str) -> String {
     use std::fmt::Write as _;
     // `utf8_percent_encode` returns a `Display` adapter, so write each encoded
