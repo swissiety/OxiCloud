@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::application::adapters::webdav_adapter::{
     LockInfo, PropFindRequest, PropPatchOp, QualifiedName, WebDavAdapter, is_protected_property,
 };
+use crate::application::dtos::display_helpers::intern_display;
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
 use crate::application::ports::authorization_ports::AuthorizationEngine;
@@ -65,10 +66,6 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'@');
 
 /// Percent-encode a single URI path segment (folder/file name).
-fn encode_path_segment(segment: &str) -> String {
-    utf8_percent_encode(segment, PATH_SEGMENT_ENCODE_SET).to_string()
-}
-
 /// Percent-encode a full slash-separated path, encoding each segment individually.
 pub(crate) fn encode_uri_path(path: &str) -> String {
     use std::fmt::Write as _;
@@ -373,14 +370,14 @@ async fn lookup_drive_selector(
         .list_readable_by(user_id)
         .await
         .map_err(|e| AppError::internal_error(format!("Failed to list drives: {:?}", e)))?;
-    for d in visible {
+    for d in visible.iter() {
         if let Some(uuid) = uuid_opt
             && d.drive.id == uuid
         {
-            return Ok(d);
+            return Ok(d.clone());
         }
         if d.root_folder_name == selector_decoded.as_ref() {
-            return Ok(d);
+            return Ok(d.clone());
         }
     }
     Err(AppError::not_found(format!(
@@ -552,9 +549,9 @@ async fn handle_propfind(
                 created_at: Utc::now().timestamp() as u64,
                 modified_at: Utc::now().timestamp() as u64,
                 is_root: true,
-                icon_class: Arc::from("fas fa-folder"),
-                icon_special_class: Arc::from("folder-icon"),
-                category: Arc::from("Folder"),
+                icon_class: intern_display("fas fa-folder"),
+                icon_special_class: intern_display("folder-icon"),
+                category: intern_display("Folder"),
                 created_by: None,
                 updated_by: None,
             };
@@ -781,25 +778,25 @@ async fn build_streaming_propfind_response(
 
         // ── Children (only if Depth == 1) ────────────────────────
         if depth == "1" {
-            let pagination = crate::application::dtos::pagination::PaginationRequestDto {
-                page: 0,
-                page_size: PROPFIND_BATCH_SIZE as usize,
-            };
             let fid_ref = folder_id.as_deref();
 
-            // Stream sub-folders in pages (user-scoped)
-            let mut page = 0usize;
+            // Stream sub-folders in pages (user-scoped, keyset cursor —
+            // O(page) per page off idx_folders_unique_name instead of the
+            // quadratic COUNT(*) OVER() + LIMIT/OFFSET walk; 4.5x on a
+            // 5k-dir parent, benches/FOLDER-KEYSET.md).
+            let mut after_folder: Option<String> = None;
             loop {
-                let pag = crate::application::dtos::pagination::PaginationRequestDto {
-                    page,
-                    page_size: pagination.page_size,
-                };
-                let result = folder_service
-                    .list_folders_paginated_with_perms(fid_ref, user_id, &pag)
+                let batch = folder_service
+                    .list_folders_batch_with_perms(
+                        fid_ref,
+                        user_id,
+                        after_folder.as_deref(),
+                        PROPFIND_BATCH_SIZE as usize,
+                    )
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                if result.items.is_empty() {
+                if batch.is_empty() {
                     break;
                 }
 
@@ -808,25 +805,29 @@ async fn build_streaming_propfind_response(
                 // 1-4.5 s of pure DB chatter on a 2000-child folder
                 // (measured in benches/DEAD-PROPS.md).
                 let subfolder_deads =
-                    folders_dead_props_map(&dead_props_store, &result.items).await;
+                    folders_dead_props_map(&dead_props_store, &batch).await;
 
-                let mut chunk = Vec::with_capacity(result.items.len() * 800);
+                let mut chunk = Vec::with_capacity(batch.len() * 800);
                 {
                     let mut w = Writer::new(&mut chunk);
-                    for subfolder in result.items.iter() {
+                    for subfolder in batch.iter() {
                         let child_dead = dead_props_for(&subfolder.id, &subfolder_deads);
-                        let href = format!("{}{}/", base_href, encode_path_segment(&subfolder.name));
+                        let href = format!(
+                            "{}{}/",
+                            base_href,
+                            utf8_percent_encode(&subfolder.name, PATH_SEGMENT_ENCODE_SET)
+                        );
                         WebDavAdapter::write_folder_entry_with_dead_props(&mut w, subfolder, &propfind_request, &href, child_dead, quota)
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
                     }
                 }
-                let has_more = result.pagination.has_next;
+                let has_more = (batch.len() as i64) == PROPFIND_BATCH_SIZE;
+                after_folder = batch.last().map(|f| f.name.clone());
                 yield Bytes::from(chunk);
 
                 if !has_more {
                     break;
                 }
-                page += 1;
             }
 
             // Stream files in pages (user-scoped, keyset cursor — O(page)
@@ -856,7 +857,11 @@ async fn build_streaming_propfind_response(
                     let mut w = Writer::new(&mut chunk);
                     for file in batch.iter() {
                         let child_dead = dead_props_for(&file.id, &file_deads);
-                        let href = format!("{}{}", base_href, encode_path_segment(&file.name));
+                        let href = format!(
+                            "{}{}",
+                            base_href,
+                            utf8_percent_encode(&file.name, PATH_SEGMENT_ENCODE_SET)
+                        );
                         WebDavAdapter::write_file_entry_with_dead_props(&mut w, file, &propfind_request, &href, child_dead)
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
                     }
@@ -2220,18 +2225,27 @@ async fn handle_delete(
     // optimized resolver and the read repositories disagree on path
     // shape for some files; see `resolve_or_legacy` docs.
     let _ = file_retrieval_service; // present for legacy fallback if needed elsewhere
+    // AuthZ audit #2 (2026-07-12): route service errors through
+    // `AppError::from` so authz denials from `_with_perms` surface as
+    // 404 (the anti-enum shape). The prior `map_err(|e| internal_error…)`
+    // collapsed every error — including the `NotFound` that
+    // `authz.require` returns on denial — into HTTP 500, giving a
+    // reliable "exists-but-denied" vs "missing" oracle to a probing
+    // caller. Also preserves `QuotaExceeded → 507`,
+    // `AlreadyExists → 409`, `InvalidInput → 400` shapes surfacing
+    // through the standard error mapping.
     match resolve_or_legacy(&state, &path, drive_id).await {
         Some(ResolvedResource::Folder(folder)) => {
             folder_service
                 .delete_folder_with_perms(&folder.id, user.id)
                 .await
-                .map_err(|e| AppError::internal_error(format!("Failed to delete folder: {}", e)))?;
+                .map_err(AppError::from)?;
         }
         Some(ResolvedResource::File(file)) => {
             file_management_service
                 .delete_file_with_perms(&file.id, user.id)
                 .await
-                .map_err(|e| AppError::internal_error(format!("Failed to delete file: {}", e)))?;
+                .map_err(AppError::from)?;
         }
         None => return Err(AppError::not_found(format!("Resource not found: {}", path))),
     }
@@ -2380,28 +2394,23 @@ async fn handle_move(
         // RFC 4918 §9.9.3: when Overwrite: T, perform a DELETE on the
         // destination before moving. Without this the rename/move fails
         // on a unique-index conflict (same name in same parent).
+        // AuthZ audit #2 (2026-07-12): `_with_perms` returns `DomainError`;
+        // route through `AppError::from` so authz denials surface as 404 (the
+        // anti-enum shape) instead of a `map_err → internal_error` 500 that
+        // gives a probing caller an "exists-but-denied" oracle. Also preserves
+        // `QuotaExceeded → 507`, `AlreadyExists → 409`, `InvalidInput → 400`.
         match resolve_or_legacy(&state, &destination_path, dst_drive_id).await {
             Some(ResolvedResource::Folder(f)) => {
                 folder_service
                     .delete_folder_with_perms(&f.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to delete existing destination: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
             Some(ResolvedResource::File(f)) => {
                 file_management_service
                     .delete_file_with_perms(&f.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to delete existing destination: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
             None => {}
         }
@@ -2679,28 +2688,23 @@ async fn handle_copy(
         // RFC 4918 §9.8.4: when Overwrite: T, the server MUST perform a
         // DELETE on the destination before the copy. Without this the copy
         // service returns a unique-index conflict (500).
+        // AuthZ audit #2 (2026-07-12): `_with_perms` returns `DomainError`;
+        // route through `AppError::from` so authz denials surface as 404 (the
+        // anti-enum shape) instead of a `map_err → internal_error` 500 that
+        // gives a probing caller an "exists-but-denied" oracle. Also preserves
+        // `QuotaExceeded → 507`, `AlreadyExists → 409`, `InvalidInput → 400`.
         match resolve_or_legacy(&state, &destination_path, dst_drive_id).await {
             Some(ResolvedResource::Folder(f)) => {
                 folder_service
                     .delete_folder_with_perms(&f.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to delete existing destination: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
             Some(ResolvedResource::File(f)) => {
                 file_management_service
                     .delete_file_with_perms(&f.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to delete existing destination: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
             None => {}
         }
@@ -2754,6 +2758,12 @@ async fn handle_copy(
         }
     };
 
+    // AuthZ audit #2 (2026-07-12): route service errors through
+    // `AppError::from` so authz denials from `_with_perms` surface as 404
+    // (the anti-enum shape) instead of a `map_err → internal_error` 500
+    // that gives a probing caller an "exists-but-denied" oracle. Also
+    // preserves `QuotaExceeded → 507`, `AlreadyExists → 409`,
+    // `InvalidInput → 400` shapes.
     match resolved {
         ResolvedResource::Folder(folder) => {
             let recursive = depth != "0";
@@ -2766,9 +2776,7 @@ async fn handle_copy(
                         Some(dest_name.to_string()),
                     )
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to copy folder tree: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             } else {
                 let create_dto = crate::application::dtos::folder_dto::CreateFolderDto {
                     name: dest_name.to_string(),
@@ -2777,12 +2785,7 @@ async fn handle_copy(
                 folder_service
                     .create_folder_with_perms(create_dto, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to create destination folder: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
         }
         ResolvedResource::File(file) => {
@@ -2790,7 +2793,7 @@ async fn handle_copy(
             file_management_service
                 .copy_file_with_perms(&file.id, user.id, target_parent_id, copy_name)
                 .await
-                .map_err(|e| AppError::internal_error(format!("Failed to copy file: {}", e)))?;
+                .map_err(AppError::from)?;
         }
     }
 

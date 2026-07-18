@@ -1,11 +1,35 @@
 use uuid::Uuid;
 
 use crate::domain::services::path_service::{
-    StoragePath, normalize_storage_name, validate_storage_name,
+    StoragePath, normalize_storage_name_owned, validate_storage_name,
 };
 
 // Re-export entity errors from the centralized module
 pub use super::entity_errors::{FolderError, FolderResult};
+
+/// Owned parts of a [`Folder`] entity, produced by [`Folder::into_parts()`].
+///
+/// Consuming a `Folder` into `FolderParts` **moves** every field without
+/// cloning, eliminating the 3-4 heap allocations that previously occurred
+/// when converting `Folder → FolderDto` via `.to_string()` on each getter.
+/// Mirrors [`super::file::FileParts`].
+pub struct FolderParts {
+    pub id: String,
+    pub name: String,
+    pub storage_path: StoragePath,
+    pub path_string: String,
+    pub parent_id: Option<String>,
+    /// Drive that owns this folder. See [`Folder::drive_id`].
+    pub drive_id: Uuid,
+    pub created_at: u64,
+    pub modified_at: u64,
+    /// Descendant-rollup timestamp. See [`Folder::tree_modified_at`].
+    pub tree_modified_at: u64,
+    /// §14 provenance: original creator. See [`Folder::created_by`].
+    pub created_by: Option<Uuid>,
+    /// §14 provenance: most recent mutator. See [`Folder::updated_by`].
+    pub updated_by: Option<Uuid>,
+}
 
 /// Represents a folder entity in the domain
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +120,7 @@ impl Folder {
         storage_path: StoragePath,
         parent_id: Option<String>,
     ) -> FolderResult<Self> {
-        let name = normalize_storage_name(&name);
+        let name = normalize_storage_name_owned(name);
         if let Err(reason) = validate_storage_name(&name) {
             return Err(FolderError::InvalidFolderName(format!("{name}: {reason}")));
         }
@@ -106,7 +130,7 @@ impl Folder {
             .unwrap_or_default()
             .as_secs();
 
-        let path_string = storage_path.to_string();
+        let path_string = storage_path.to_path_string();
 
         Ok(Self {
             id,
@@ -197,12 +221,12 @@ impl Folder {
         created_by: Option<Uuid>,
         updated_by: Option<Uuid>,
     ) -> FolderResult<Self> {
-        let name = normalize_storage_name(&name);
+        let name = normalize_storage_name_owned(name);
         if let Err(reason) = validate_storage_name(&name) {
             return Err(FolderError::InvalidFolderName(format!("{name}: {reason}")));
         }
 
-        let path_string = storage_path.to_string();
+        let path_string = storage_path.to_path_string();
 
         Ok(Self {
             id,
@@ -217,6 +241,70 @@ impl Folder {
             created_by,
             updated_by,
         })
+    }
+
+    /// PG-row constructor: the per-listing-row hot path.
+    ///
+    /// Takes the materialized `storage.folders.path` column by value and
+    /// splits it once via [`StoragePath::from_joined`] — when the stored
+    /// path is already canonical (every row the repository writes), the
+    /// input `String` is reused as `path_string` with zero copies,
+    /// replacing the old `from_string` split + `Display` re-join pair.
+    /// The owned `name` is NFC-normalized without the always-copy of the
+    /// borrowing variant (DB rows are NFC by invariant).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_materialized_row(
+        id: String,
+        name: String,
+        path: String,
+        parent_id: Option<String>,
+        drive_id: Uuid,
+        created_at: u64,
+        modified_at: u64,
+        tree_modified_at: u64,
+        created_by: Option<Uuid>,
+        updated_by: Option<Uuid>,
+    ) -> FolderResult<Self> {
+        let name = normalize_storage_name_owned(name);
+        if let Err(reason) = validate_storage_name(&name) {
+            return Err(FolderError::InvalidFolderName(format!("{name}: {reason}")));
+        }
+
+        let (storage_path, path_string) = StoragePath::from_joined(path);
+
+        Ok(Self {
+            id,
+            name,
+            storage_path,
+            path_string,
+            parent_id,
+            drive_id,
+            created_at,
+            modified_at,
+            tree_modified_at,
+            created_by,
+            updated_by,
+        })
+    }
+
+    /// Consume the entity and return all fields by ownership.
+    ///
+    /// Use this when converting `Folder` into a DTO to avoid cloning
+    /// every `String` field (saves 3-4 heap allocations per folder).
+    pub fn into_parts(self) -> FolderParts {
+        FolderParts {
+            id: self.id,
+            name: self.name,
+            storage_path: self.storage_path,
+            path_string: self.path_string,
+            parent_id: self.parent_id,
+            drive_id: self.drive_id,
+            created_at: self.created_at,
+            modified_at: self.modified_at,
+            tree_modified_at: self.tree_modified_at,
+            created_by: self.created_by,
+            updated_by: self.updated_by,
+        }
     }
 
     // Getters
@@ -326,8 +414,25 @@ impl Folder {
     ///   changed; the folder's own value stays untouched
     ///   (self-exclusion).
     pub fn compute_etag(id: &str, tree_modified_at: u64) -> String {
-        let prefix: String = id.chars().take(16).collect();
-        format!("{}-{}", prefix, tree_modified_at)
+        use std::fmt::Write as _;
+
+        // Byte index just past the 16th char (whole string when shorter).
+        // `id` is a UUID string (ASCII) in practice, so this is
+        // effectively `min(len, 16)`, but `char_indices` keeps the slice
+        // char-boundary-safe for exotic fixture values — byte-identical
+        // to the old `chars().take(16).collect::<String>()` without the
+        // intermediate allocation.
+        let end = match id.char_indices().nth(16) {
+            Some((i, _)) => i,
+            None => id.len(),
+        };
+
+        // Single allocation: prefix + '-' + up to 20 digits (u64::MAX).
+        let mut etag = String::with_capacity(end + 1 + 20);
+        etag.push_str(&id[..end]);
+        etag.push('-');
+        let _ = write!(etag, "{tree_modified_at}");
+        etag
     }
 
     /// Creates a new Folder instance from a DTO
@@ -350,7 +455,7 @@ impl Folder {
         // round-trips lose the real rollup signal, so callers that
         // need a freshly-rolled-up etag must reload from the
         // repository.
-        let name = normalize_storage_name(&name);
+        let name = normalize_storage_name_owned(name);
         Self {
             id,
             name,
@@ -376,7 +481,7 @@ impl Folder {
 
     /// Creates a new version of the folder with updated name
     pub fn with_name(&self, new_name: String) -> FolderResult<Self> {
-        let new_name = normalize_storage_name(&new_name);
+        let new_name = normalize_storage_name_owned(new_name);
         if let Err(reason) = validate_storage_name(&new_name) {
             return Err(FolderError::InvalidFolderName(format!(
                 "{new_name}: {reason}"
@@ -391,7 +496,7 @@ impl Folder {
         };
 
         // Update string representation
-        let new_path_string = new_storage_path.to_string();
+        let new_path_string = new_storage_path.to_path_string();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -431,7 +536,7 @@ impl Folder {
         };
 
         // Update string representation
-        let new_path_string = new_storage_path.to_string();
+        let new_path_string = new_storage_path.to_path_string();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

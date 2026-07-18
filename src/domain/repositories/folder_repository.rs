@@ -98,6 +98,32 @@ pub trait FolderRepository: Send + Sync + 'static {
         include_total: bool,
     ) -> Result<(Vec<Folder>, Option<usize>), DomainError>;
 
+    /// Keyset-paged listing of `parent_id`'s direct sub-folders in name
+    /// order — `name > $after_name ORDER BY name LIMIT $limit`, one bounded
+    /// index-range read per page off the partial unique index
+    /// `idx_folders_unique_name`. Streaming PROPFIND drains sub-folders
+    /// with this instead of `COUNT(*) OVER() … LIMIT/OFFSET`, which
+    /// window-aggregated and rescanned all N sub-folders on every page
+    /// (4.5x on a 5k-dir parent, benches/FOLDER-KEYSET.md). `has_next`
+    /// falls out of `rows.len() == limit` — no total needed.
+    ///
+    /// The default implementation falls back to `list_folders` + in-memory
+    /// slice so stubs and mocks compile without changes.
+    async fn list_folders_batch(
+        &self,
+        parent_id: Option<&str>,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Folder>, DomainError> {
+        let mut all = self.list_folders(parent_id).await?;
+        all.sort_by(|a, b| a.name().cmp(b.name()));
+        Ok(all
+            .into_iter()
+            .filter(|f| after_name.is_none_or(|a| f.name() > a))
+            .take(limit)
+            .collect())
+    }
+
     /// Renames a folder. `caller_id` is stamped into `updated_by`
     /// alongside the `updated_at = NOW()` bump (§14 provenance).
     async fn rename_folder(
@@ -243,13 +269,21 @@ pub trait FolderRepository: Send + Sync + 'static {
     /// Results are ordered by relevance (exact > starts-with > contains) for
     /// autocomplete suggestions.
     ///
+    /// `caller_id` scopes results to folders whose owning drive the caller
+    /// can Read (direct or group-mediated `role_grants`). Without it the
+    /// endpoint leaked names + paths across every tenant on the instance —
+    /// closed as AuthZ audit finding #1 (2026-07-12).
+    ///
     /// The default implementation falls back to `list_folders` + in-memory
-    /// filter so that stubs and mocks compile without changes.
+    /// filter so that stubs and mocks compile without changes. Stub-mode
+    /// callers already operate against a single tenant's data, so ignoring
+    /// `caller_id` here is safe; the PG impl enforces the real scope.
     async fn suggest_folders_by_name(
         &self,
         parent_id: Option<&str>,
         query: &str,
         limit: usize,
+        _caller_id: uuid::Uuid,
     ) -> Result<Vec<Folder>, DomainError> {
         let all = self.list_folders(parent_id).await?;
         let q = query.to_lowercase();

@@ -656,8 +656,12 @@ impl AppServiceFactory {
             content_index_port,
             Some(authz.clone()),
             Some(drive_repo.clone()),
-            300,  // Cache TTL in seconds (5 minutes)
-            1000, // Maximum cache entries
+            300, // Cache TTL in seconds (5 minutes)
+            // Byte budget for cached result pages (weigher-bounded, 32 MiB
+            // default; env OXICLOUD_SEARCH_CACHE_MAX_BYTES). Replaces the old
+            // entry-count capacity, which let 500-row pages keyed by
+            // user×query×offset×limit pin hundreds of MB for the TTL.
+            self.config.search_cache.max_bytes,
         )));
 
         tracing::info!("Application services initialized");
@@ -1052,14 +1056,26 @@ impl AppServiceFactory {
         _repos: &RepositoryServices,
         db_pool: &Arc<PgPool>,
         maintenance_pool: &Arc<PgPool>,
+        drive_repo: Arc<crate::infrastructure::repositories::pg::DrivePgRepository>,
     ) -> Arc<StorageUsageService> {
         let user_repository = Arc::new(
             crate::infrastructure::repositories::pg::UserPgRepository::new(db_pool.clone()),
         );
+        // The `drive_repo` passed in is the SAME instance held on
+        // `AppState`, so its `readable_cache` / `default_drive_cache`
+        // are the caches the request path reads from. A separately
+        // constructed `DrivePgRepository` would have its OWN caches
+        // and invalidation would be a no-op observed by nobody —
+        // this is the trap that regressed the used_bytes freshness
+        // after perf commit `12dc648c`.
         let service = Arc::new(
             crate::application::services::storage_usage_service::StorageUsageService::new(
                 maintenance_pool.clone(),
                 user_repository,
+            )
+            .with_drive_repo(
+                drive_repo
+                    as Arc<dyn crate::domain::repositories::drive_repository::DriveRepository>,
             ),
         );
         // Keep cached storage usage fresh off the request path: GET /api/auth/me
@@ -1246,7 +1262,8 @@ impl AppServiceFactory {
         // 3c. Storage usage / quota service (needed by the instant-upload
         // path inside the application services, and re-exposed on AppState
         // for the handler-side quota checks of the byte-upload paths).
-        let storage_usage = self.create_storage_usage_service(&repos, &pool, &maintenance_pool);
+        let storage_usage =
+            self.create_storage_usage_service(&repos, &pool, &maintenance_pool, drive_repo.clone());
 
         // 3d. Content index (embedded Tantivy) — opened before application
         // services so SearchService can hold the query port; the feeding
@@ -1678,6 +1695,7 @@ impl AppServiceFactory {
                         ),
                     ),
                     authorization.clone(),
+                    drive_repo.clone(),
                 ),
             )),
             email_sender: None,                   // populated below

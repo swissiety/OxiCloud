@@ -16,7 +16,6 @@ use uuid::Uuid;
 use crate::application::adapters::webdav_adapter::{
     PropFindRequest, PropPatchOp, QualifiedName, WebDavAdapter, is_protected_property,
 };
-use crate::application::dtos::pagination::PaginationRequestDto;
 use crate::application::ports::authorization_ports::AuthorizationEngine;
 use crate::application::ports::favorites_ports::FavoritesUseCase;
 use crate::application::ports::file_ports::{
@@ -219,7 +218,7 @@ pub fn nc_href(username: &str, subpath: &str) -> String {
 pub async fn handle_nc_webdav(
     state: Arc<AppState>,
     req: Request<Body>,
-    session: crate::interfaces::nextcloud::session::NcSession,
+    session: crate::interfaces::nextcloud::session::SharedNcSession,
     subpath: String,
 ) -> Result<Response<Body>, AppError> {
     // Validate up-front that we have a chroot — every method below is
@@ -933,6 +932,11 @@ async fn handle_put(
 
     // Single streaming path — handles both update and create internally,
     // swapping the file row onto the already-ingested blob.
+    // AuthZ audit #6 (2026-07-12): route `_with_perms` errors through
+    // `AppError::from` so authz denials surface as 404 (the anti-enum
+    // shape) instead of a `map_err → internal_error` 500 that gives a
+    // probing caller an "exists-but-denied" oracle. Also preserves
+    // `QuotaExceeded → 507`, `AlreadyExists → 409`, `InvalidInput → 400`.
     let stored = upload_service
         .update_file_streaming_with_perms(
             &internal_path,
@@ -943,7 +947,7 @@ async fn handle_put(
             session.user.id,
         )
         .await
-        .map_err(|e| AppError::internal_error(format!("Failed to store file: {}", e)))?;
+        .map_err(AppError::from)?;
 
     let status = if existed {
         StatusCode::NO_CONTENT
@@ -1032,10 +1036,14 @@ async fn handle_mkcol(
         name: target_name.to_string(),
         parent_id: Some(parent_folder.id.clone()),
     };
+    // AuthZ audit #7 (2026-07-12): route `_with_perms` errors through
+    // `AppError::from` so authz denials surface as 404 (the anti-enum
+    // shape) instead of a `map_err → internal_error` 500. Also preserves
+    // `AlreadyExists → 409`, `QuotaExceeded → 507`, `InvalidInput → 400`.
     folder_service
         .create_folder_with_perms(dto, user.id)
         .await
-        .map_err(|e| AppError::internal_error(format!("Failed to create folder: {}", e)))?;
+        .map_err(AppError::from)?;
 
     Ok(Response::builder()
         .status(StatusCode::CREATED)
@@ -1077,20 +1085,22 @@ async fn handle_delete(
                     Resource::Folder(folder_uuid),
                 )
                 .await?;
+            // AuthZ audit #8 (2026-07-12): route service errors through
+            // `AppError::from` so authz denials surface as 404 (the
+            // anti-enum shape) instead of a `map_err → internal_error`
+            // 500 that gives a probing caller an "exists-but-denied"
+            // oracle. `move_to_trash` and `delete_folder_with_perms`
+            // both return `DomainError` and both call `authz.require`.
             if let Some(trash_svc) = state.trash_service.as_ref() {
                 trash_svc
                     .move_to_trash(&folder.id, "folder", user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to trash folder: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             } else {
                 folder_service
                     .delete_folder_with_perms(&folder.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to delete folder: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             }
         }
         ResolvedResource::File(file) => {
@@ -1104,21 +1114,18 @@ async fn handle_delete(
                     Resource::File(file_uuid),
                 )
                 .await?;
+            // AuthZ audit #8 (2026-07-12): same anti-enum fix as folder branch above.
             if let Some(trash_svc) = state.trash_service.as_ref() {
                 trash_svc
                     .move_to_trash(&file.id, "file", user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to trash file: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             } else {
                 let file_mgmt = &state.applications.file_management_service;
                 file_mgmt
                     .delete_file_with_perms(&file.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to delete file: {}", e))
-                    })?;
+                    .map_err(AppError::from)?;
             }
         }
     }
@@ -1196,6 +1203,12 @@ async fn handle_move(
         // then proceed with the move. Trashing is fine: per RFC the source
         // resource appears at the destination URI; what happens to the
         // overwritten one is up to the server.
+        //
+        // AuthZ audit #9 (2026-07-12): route the `_with_perms` delete
+        // errors through `AppError::from` so authz denials surface as 404
+        // (anti-enum) instead of `map_err → internal_error` 500. Also
+        // preserves `QuotaExceeded → 507`, `AlreadyExists → 409`,
+        // `InvalidInput → 400`.
         match existing {
             ResolvedResource::File(existing_file) => {
                 let file_uuid = Uuid::parse_str(&existing_file.id).map_err(|_| {
@@ -1212,12 +1225,7 @@ async fn handle_move(
                 file_mgmt
                     .delete_and_cleanup_with_perms(&existing_file.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to overwrite destination file: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
             ResolvedResource::Folder(existing_folder) => {
                 let folder_uuid = Uuid::parse_str(&existing_folder.id).map_err(|_| {
@@ -1234,12 +1242,7 @@ async fn handle_move(
                 folder_service
                     .delete_folder_with_perms(&existing_folder.id, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to overwrite destination folder: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
             }
         }
     }
@@ -1267,12 +1270,15 @@ async fn handle_move(
             None => "",
         };
 
+        // AuthZ audit #9 (2026-07-12): route `_with_perms` errors
+        // through `AppError::from` so authz denials surface as 404
+        // (anti-enum) instead of `map_err → internal_error` 500.
         if src_parent_sub == dest_parent_sub {
             // Same parent → rename.
             file_mgmt
                 .rename_file_with_perms(&file.id, user.id, dest_name)
                 .await
-                .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                .map_err(AppError::from)?;
         } else {
             // Different parent → move.
             let dest_parent = folder_service
@@ -1283,14 +1289,14 @@ async fn handle_move(
             file_mgmt
                 .move_file_with_perms(&file.id, user.id, Some(dest_parent.id.clone()))
                 .await
-                .map_err(|e| AppError::internal_error(format!("Move failed: {}", e)))?;
+                .map_err(AppError::from)?;
 
             // If the filename changed too, rename after move.
             if file.name != dest_name {
                 file_mgmt
                     .rename_file_with_perms(&file.id, user.id, dest_name)
                     .await
-                    .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                    .map_err(AppError::from)?;
             }
         }
 
@@ -1332,6 +1338,9 @@ async fn handle_move(
             None => "",
         };
 
+        // AuthZ audit #9 (2026-07-12): route `_with_perms` errors
+        // through `AppError::from` so authz denials surface as 404
+        // (anti-enum) instead of `map_err → internal_error` 500.
         if src_parent_sub == dest_parent_sub {
             // Same parent → rename.
             use crate::application::dtos::folder_dto::RenameFolderDto;
@@ -1344,7 +1353,7 @@ async fn handle_move(
                     user.id,
                 )
                 .await
-                .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                .map_err(AppError::from)?;
         } else {
             // Different parent → move.
             let dest_parent = folder_service
@@ -1362,7 +1371,7 @@ async fn handle_move(
                     user.id,
                 )
                 .await
-                .map_err(|e| AppError::internal_error(format!("Move failed: {}", e)))?;
+                .map_err(AppError::from)?;
 
             // If the name changed too, rename.
             if folder.name != dest_name {
@@ -1376,7 +1385,7 @@ async fn handle_move(
                         user.id,
                     )
                     .await
-                    .map_err(|e| AppError::internal_error(format!("Rename failed: {}", e)))?;
+                    .map_err(AppError::from)?;
             }
         }
 
@@ -1446,8 +1455,7 @@ async fn write_nc_file_multistatus<W: std::io::Write>(
     extras: (&HashSet<String>, &[(QualifiedName, Option<String>)]),
 ) -> Result<(), String> {
     let (favorite_ids, dead_props) = extras;
-    let (file_id_map, _) =
-        batch_resolve_ids(file_id_svc, std::slice::from_ref(&file.id), &[]).await;
+    let (file_id_map, _) = batch_resolve_ids(file_id_svc, &[file.id.as_str()], &[]).await;
 
     let mut xml = Writer::new(writer);
     write_nc_multistatus_open(&mut xml)?;
@@ -1458,7 +1466,7 @@ async fn write_nc_file_multistatus<W: std::io::Write>(
     // shares the requested URL's prefix. `username` is the canonical
     // identity for the `oc:owner-id` field.
     let href = nc_href(url_user, subpath);
-    let file_id = file_id_map.get(&file.id).copied();
+    let file_id = nc_id_of(&file_id_map, &file.id);
     let oc_id = file_id.map(|id| format_oc_id(id, file_id_svc));
     write_file_response(
         &mut xml,
@@ -1510,7 +1518,7 @@ fn build_nc_streaming_propfind(
             HashSet::new()
         };
         let (_, folder_id_map) =
-            batch_resolve_ids(file_id_svc, &[], std::slice::from_ref(&folder.id)).await;
+            batch_resolve_ids(file_id_svc, &[], &[folder.id.as_str()]).await;
         let folder_dead = folder_dead_props(&state.webdav_dead_props, &folder).await;
 
         let mut buf = Vec::with_capacity(4096);
@@ -1518,7 +1526,7 @@ fn build_nc_streaming_propfind(
             let mut xml = Writer::new(&mut buf);
             write_nc_multistatus_open(&mut xml).map_err(std::io::Error::other)?;
             let href = nc_collection_href(&username, &subpath);
-            let fid = folder_id_map.get(&folder.id).copied();
+            let fid = nc_id_of(&folder_id_map, &folder.id);
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             write_folder_response(&mut xml, &folder, &href, (fid, oc_id.as_deref()), &username, &folder_favs, quota, &folder_dead)
                 .map_err(std::io::Error::other)?;
@@ -1527,6 +1535,19 @@ fn build_nc_streaming_propfind(
 
         // ── Children (only if Depth != 0) ────────────────────────────
         if depth != "0" {
+            // Encoded href prefix for every child: username + parent
+            // path encode ONCE here — the old per-row `nc_href` call
+            // re-split and re-encoded the constant prefix for each of
+            // the up-to-500 children of every page.
+            let child_href_prefix = {
+                let base = nc_href(&username, &subpath);
+                if base.ends_with('/') {
+                    base
+                } else {
+                    format!("{base}/")
+                }
+            };
+
             // Files in pages (keyset cursor — O(page) per page instead of
             // the quadratic LIMIT/OFFSET walk).
             let mut after_name: Option<String> = None;
@@ -1545,32 +1566,42 @@ fn build_nc_streaming_propfind(
                 }
                 let batch_len = batch.len();
 
-                // Per-page enrichment: favorites + oc:fileids, two batch queries.
-                let favs = if let Some(fav) = fav_svc {
-                    let items: Vec<(&str, &str)> =
-                        batch.iter().map(|f| (f.id.as_str(), "file")).collect();
-                    fav.batch_check_favorites(user_id, &items).await.unwrap_or_default()
-                } else {
-                    HashSet::new()
-                };
-                let file_uuids: Vec<String> = batch.iter().map(|f| f.id.clone()).collect();
-                let (file_id_map, _) = batch_resolve_ids(file_id_svc, &file_uuids, &[]).await;
-                // One batched dead-props query per page, not one per child
-                // (benches/DEAD-PROPS.md).
-                let file_deads = files_dead_props_map(&state.webdav_dead_props, &batch).await;
+                // Per-page enrichment: favorites + oc:fileids + dead props —
+                // three independent reads over the same id batch, overlapped
+                // with `join!` so a page pays ~max(RTT) instead of 3×RTT
+                // (each query still batched per page: DEAD-PROPS.md). The
+                // round-7 deferred "serial pairs" item, adopted for this
+                // per-page triple after the injected-latency A/B in
+                // benches/ROUND9.md showed no local-PG regression.
+                let fav_items: Vec<(&str, &str)> =
+                    batch.iter().map(|f| (f.id.as_str(), "file")).collect();
+                let file_uuids: Vec<&str> = batch.iter().map(|f| f.id.as_str()).collect();
+                let (favs, (file_id_map, _), file_deads) = tokio::join!(
+                    async {
+                        if let Some(fav) = fav_svc {
+                            fav.batch_check_favorites(user_id, &fav_items)
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            HashSet::new()
+                        }
+                    },
+                    batch_resolve_ids(file_id_svc, &file_uuids, &[]),
+                    files_dead_props_map(&state.webdav_dead_props, &batch),
+                );
 
                 let mut chunk = Vec::with_capacity(batch_len * 1024);
                 {
                     let mut xml = Writer::new(&mut chunk);
                     for file in batch.iter() {
                         let dead = dead_props_for(&file.id, &file_deads);
-                        let child_sub = if subpath.is_empty() {
-                            file.name.clone()
-                        } else {
-                            format!("{}/{}", subpath.trim_end_matches('/'), file.name)
-                        };
-                        let href = nc_href(&username, &child_sub);
-                        let fid = file_id_map.get(&file.id).copied();
+                        // Only the name varies per row — the encoded
+                        // username + parent prefix is computed once
+                        // outside the loops (the old `nc_href` call
+                        // re-encoded both for every child).
+                        let href =
+                            format!("{}{}", child_href_prefix, urlencoding::encode(&file.name));
+                        let fid = nc_id_of(&file_id_map, &file.id);
                         let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
                         write_file_response(&mut xml, file, &href, (fid, oc_id.as_deref()), &username, &favs, dead)
                             .map_err(std::io::Error::other)?;
@@ -1584,58 +1615,65 @@ fn build_nc_streaming_propfind(
                 after_name = batch.last().map(|f| f.name.clone());
             }
 
-            // Subfolders in pages — also collections, same trailing-slash rule.
-            let mut page = 0usize;
+            // Subfolders in pages — also collections, same trailing-slash
+            // rule. Keyset cursor: O(page) per page off
+            // idx_folders_unique_name instead of the quadratic
+            // COUNT(*) OVER() + LIMIT/OFFSET walk (benches/FOLDER-KEYSET.md).
+            let mut after_folder: Option<String> = None;
             loop {
-                let pag = PaginationRequestDto {
-                    page,
-                    page_size: PROPFIND_BATCH_SIZE as usize,
-                };
-                let result = folder_service
-                    .list_folders_paginated_with_perms(Some(&folder.id), user_id, &pag)
+                let batch = folder_service
+                    .list_folders_batch_with_perms(
+                        Some(&folder.id),
+                        user_id,
+                        after_folder.as_deref(),
+                        PROPFIND_BATCH_SIZE as usize,
+                    )
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
-                if result.items.is_empty() {
+                if batch.is_empty() {
                     break;
                 }
 
-                let favs = if let Some(fav) = fav_svc {
-                    let items: Vec<(&str, &str)> =
-                        result.items.iter().map(|sf| (sf.id.as_str(), "folder")).collect();
-                    fav.batch_check_favorites(user_id, &items).await.unwrap_or_default()
-                } else {
-                    HashSet::new()
-                };
-                let folder_uuids: Vec<String> = result.items.iter().map(|sf| sf.id.clone()).collect();
-                let (_, sub_id_map) = batch_resolve_ids(file_id_svc, &[], &folder_uuids).await;
-                // Batched — see benches/DEAD-PROPS.md.
-                let sub_deads =
-                    folders_dead_props_map(&state.webdav_dead_props, &result.items).await;
+                // Same overlapped enrichment triple as the file pages above.
+                let fav_items: Vec<(&str, &str)> =
+                    batch.iter().map(|sf| (sf.id.as_str(), "folder")).collect();
+                let folder_uuids: Vec<&str> = batch.iter().map(|sf| sf.id.as_str()).collect();
+                let (favs, (_, sub_id_map), sub_deads) = tokio::join!(
+                    async {
+                        if let Some(fav) = fav_svc {
+                            fav.batch_check_favorites(user_id, &fav_items)
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            HashSet::new()
+                        }
+                    },
+                    batch_resolve_ids(file_id_svc, &[], &folder_uuids),
+                    folders_dead_props_map(&state.webdav_dead_props, &batch),
+                );
 
-                let mut chunk = Vec::with_capacity(result.items.len() * 1024);
+                let mut chunk = Vec::with_capacity(batch.len() * 1024);
                 {
                     let mut xml = Writer::new(&mut chunk);
-                    for sf in result.items.iter() {
+                    for sf in batch.iter() {
                         let dead = dead_props_for(&sf.id, &sub_deads);
-                        let child_sub = if subpath.is_empty() {
-                            sf.name.clone()
-                        } else {
-                            format!("{}/{}", subpath.trim_end_matches('/'), sf.name)
-                        };
-                        let href = nc_collection_href(&username, &child_sub);
-                        let fid = sub_id_map.get(&sf.id).copied();
+                        // Collections carry the trailing slash; prefix
+                        // precomputed once like the file loop above.
+                        let href =
+                            format!("{}{}/", child_href_prefix, urlencoding::encode(&sf.name));
+                        let fid = nc_id_of(&sub_id_map, &sf.id);
                         let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
                         write_folder_response(&mut xml, sf, &href, (fid, oc_id.as_deref()), &username, &favs, quota, dead)
                             .map_err(std::io::Error::other)?;
                     }
                 }
-                let has_more = result.pagination.has_next;
+                let has_more = (batch.len() as i64) == PROPFIND_BATCH_SIZE;
+                after_folder = batch.last().map(|sf| sf.name.clone());
                 yield Bytes::from(chunk);
 
                 if !has_more {
                     break;
                 }
-                page += 1;
             }
         }
 
@@ -1697,21 +1735,24 @@ pub fn write_folder_response<W: std::io::Write>(
 
     write_text_element(xml, "d:displayname", &folder.name)?;
 
-    let created_at =
-        chrono::DateTime::<Utc>::from_timestamp(timestamp_to_i64(folder.created_at), 0)
-            .unwrap_or_else(Utc::now);
-    let modified_at =
-        chrono::DateTime::<Utc>::from_timestamp(timestamp_to_i64(folder.modified_at), 0)
-            .unwrap_or_else(Utc::now);
-
-    write_text_element(xml, "d:getlastmodified", &modified_at.to_rfc2822())?;
+    write_date_element(
+        xml,
+        "d:getlastmodified",
+        timestamp_to_i64(folder.modified_at),
+        true,
+    )?;
     // Route through `FolderDto::etag` (= `Folder::etag()`: the
     // descendant-aware `{id[..16]}-{tree_modified_at}` — see the
     // entity for the formula and the async-bump freshness contract).
-    write_text_element(xml, "d:getetag", &format!("\"{}\"", folder.etag))?;
+    write_etag_element(xml, "d:getetag", &folder.etag)?;
     write_text_element(xml, "d:getcontenttype", "httpd/unix-directory")?;
     write_text_element(xml, "d:getcontentlength", "0")?;
-    write_text_element(xml, "d:creationdate", &created_at.to_rfc3339())?;
+    write_date_element(
+        xml,
+        "d:creationdate",
+        timestamp_to_i64(folder.created_at),
+        false,
+    )?;
 
     // Nextcloud/ownCloud properties
     if let Some(id) = file_id {
@@ -1792,17 +1833,28 @@ pub fn write_file_response<W: std::io::Write>(
 
     write_text_element(xml, "d:displayname", &file.name)?;
     write_text_element(xml, "d:getcontenttype", &file.mime_type)?;
-    write_text_element(xml, "d:getcontentlength", &file.size.to_string())?;
+    {
+        let mut buf = [0u8; 20];
+        write_text_element(
+            xml,
+            "d:getcontentlength",
+            crate::common::fmt::u64_str(&mut buf, file.size),
+        )?;
+    }
 
-    let created_at = chrono::DateTime::<Utc>::from_timestamp(timestamp_to_i64(file.created_at), 0)
-        .unwrap_or_else(Utc::now);
-    let modified_at =
-        chrono::DateTime::<Utc>::from_timestamp(timestamp_to_i64(file.modified_at), 0)
-            .unwrap_or_else(Utc::now);
-
-    write_text_element(xml, "d:getlastmodified", &modified_at.to_rfc2822())?;
-    write_text_element(xml, "d:getetag", &format!("\"{}\"", file.etag))?;
-    write_text_element(xml, "d:creationdate", &created_at.to_rfc3339())?;
+    write_date_element(
+        xml,
+        "d:getlastmodified",
+        timestamp_to_i64(file.modified_at),
+        true,
+    )?;
+    write_etag_element(xml, "d:getetag", &file.etag)?;
+    write_date_element(
+        xml,
+        "d:creationdate",
+        timestamp_to_i64(file.created_at),
+        false,
+    )?;
 
     // Nextcloud/ownCloud properties
     if let Some(id) = file_id {
@@ -1814,7 +1866,14 @@ pub fn write_file_response<W: std::io::Write>(
     write_text_element(xml, "oc:permissions", "RGDNVW")?;
     // Numeric share-permissions bitmask: Read=1 + Update=2 + Delete=8 + Share=16 = 27
     write_text_element(xml, "ocs:share-permissions", "27")?;
-    write_text_element(xml, "oc:size", &file.size.to_string())?;
+    {
+        let mut buf = [0u8; 20];
+        write_text_element(
+            xml,
+            "oc:size",
+            crate::common::fmt::u64_str(&mut buf, file.size),
+        )?;
+    }
     write_text_element(xml, "oc:owner-id", owner)?;
     write_text_element(xml, "oc:owner-display-name", owner)?;
 
@@ -1858,6 +1917,47 @@ pub fn write_file_response<W: std::io::Write>(
     Ok(())
 }
 
+/// Stack-rendered `d:getlastmodified` / `d:creationdate` bodies
+/// (`common::fmt`) — the old per-row `to_rfc2822()` / `to_rfc3339()`
+/// ran chrono's format interpreter and allocated a String each.
+/// Out-of-range timestamps keep the chrono path, byte-identical.
+fn write_date_element<W: std::io::Write>(
+    xml: &mut Writer<W>,
+    tag: &str,
+    secs: i64,
+    rfc2822: bool,
+) -> Result<(), String> {
+    if rfc2822 {
+        let mut buf = [0u8; 31];
+        if let Some(s) = crate::common::fmt::rfc2822_utc(&mut buf, secs) {
+            return write_text_element(xml, tag, s);
+        }
+        let dt = chrono::DateTime::<Utc>::from_timestamp(secs, 0).unwrap_or_else(Utc::now);
+        write_text_element(xml, tag, &dt.to_rfc2822())
+    } else {
+        let mut buf = [0u8; 25];
+        if let Some(s) = crate::common::fmt::rfc3339_utc(&mut buf, secs) {
+            return write_text_element(xml, tag, s);
+        }
+        let dt = chrono::DateTime::<Utc>::from_timestamp(secs, 0).unwrap_or_else(Utc::now);
+        write_text_element(xml, tag, &dt.to_rfc3339())
+    }
+}
+
+/// `d:getetag` with the HTTP quoting — one exactly-sized allocation
+/// instead of `format!`'s grow-from-empty.
+fn write_etag_element<W: std::io::Write>(
+    xml: &mut Writer<W>,
+    tag: &str,
+    etag: &str,
+) -> Result<(), String> {
+    let mut quoted = String::with_capacity(etag.len() + 2);
+    quoted.push('"');
+    quoted.push_str(etag);
+    quoted.push('"');
+    write_text_element(xml, tag, &quoted)
+}
+
 pub fn write_text_element<W: std::io::Write>(
     xml: &mut Writer<W>,
     tag: &str,
@@ -1873,14 +1973,15 @@ pub fn write_text_element<W: std::io::Write>(
 
 /// Resolve every `oc:fileid` for a listing in two batch queries (one per
 /// object type) instead of one INSERT round-trip per child. Returns
-/// `(file_map, folder_map)` keyed by object UUID; entries are absent when the
-/// service is disabled or an id can't be resolved, mirroring the previous
-/// per-call `Option` behaviour. The two batches run concurrently.
+/// `(file_map, folder_map)` keyed by parsed object UUID; entries are absent
+/// when the service is disabled or an id can't be resolved, mirroring the
+/// previous per-call `Option` behaviour. The two batches run concurrently.
+/// Borrowed inputs + `Uuid` keys keep the whole resolution alloc-free.
 pub async fn batch_resolve_ids(
     svc: Option<&Arc<NextcloudFileIdService>>,
-    file_uuids: &[String],
-    folder_uuids: &[String],
-) -> (HashMap<String, i64>, HashMap<String, i64>) {
+    file_uuids: &[&str],
+    folder_uuids: &[&str],
+) -> (HashMap<Uuid, i64>, HashMap<Uuid, i64>) {
     let Some(svc) = svc else {
         return (HashMap::new(), HashMap::new());
     };
@@ -1889,6 +1990,11 @@ pub async fn batch_resolve_ids(
         svc.get_or_create_folder_ids(folder_uuids),
     );
     (files.unwrap_or_default(), folders.unwrap_or_default())
+}
+
+/// Look up a batch-resolved `oc:fileid` by a DTO's string UUID.
+pub fn nc_id_of(map: &HashMap<Uuid, i64>, id: &str) -> Option<i64> {
+    Uuid::parse_str(id).ok().and_then(|u| map.get(&u).copied())
 }
 
 pub fn format_oc_id(id: i64, svc: Option<&Arc<NextcloudFileIdService>>) -> String {

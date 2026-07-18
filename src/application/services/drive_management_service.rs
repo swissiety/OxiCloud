@@ -263,6 +263,12 @@ impl DriveManagementService {
         self.authz
             .invalidate_drive_role_cache_for_drive(drive_id)
             .await;
+        // Same freshness contract for the repo's readable-drives cache:
+        // the subject's drive list changed with this grant.
+        match subject {
+            Subject::User(uid) => self.drive_repo.invalidate_readable_for_user(uid).await,
+            _ => self.drive_repo.invalidate_readable_all(),
+        }
 
         // D6 §11: canonical `drive.member_added` audit event covers
         // every successful membership write (add + role-refresh, since
@@ -335,6 +341,12 @@ impl DriveManagementService {
         self.authz
             .invalidate_drive_role_cache_for_drive(drive_id)
             .await;
+        // And the repo's readable-drives cache: the drive must vanish
+        // from the removed subject's list immediately.
+        match subject {
+            Subject::User(uid) => self.drive_repo.invalidate_readable_for_user(uid).await,
+            _ => self.drive_repo.invalidate_readable_all(),
+        }
 
         // D6 §11: canonical `drive.member_removed` audit event covers
         // every successful removal (owner-driven or admin bypass).
@@ -468,6 +480,11 @@ impl DriveManagementService {
     /// supplied is overwritten. Returns the post-merge typed view.
     /// Audit emits `drive.policy_changed` with the post-merge bag for
     /// steady-state observability.
+    ///
+    /// Ed's call, 2026-07-17: intentional deviation from the AGENTS.md
+    /// "AuthZ in service layer" rule for this specific endpoint —
+    /// the handler-layer admin check stays, this method stays trusting.
+    /// See memory `feedback_drive_policies_admin_at_handler`.
     pub async fn update_policies(
         &self,
         caller_id: Uuid,

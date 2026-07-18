@@ -13,12 +13,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
+use uuid::Uuid;
 
 use crate::application::ports::blob_storage_ports::{
     BlobStorageBackend, BlobStream, StorageHealthStatus,
@@ -56,6 +58,13 @@ pub struct CachedBlobBackend {
     max_cache_bytes: u64,
     index: Arc<Mutex<LruCache<String, CacheEntry>>>,
     current_size: Arc<AtomicU64>,
+    /// Per-hash single-flight gates for cache misses. K concurrent cold
+    /// readers of one blob (e.g. a video player's parallel Range probes)
+    /// used to each download the FULL blob from the remote backend — and
+    /// race their writes on one shared `.tmp` path. The gate coalesces
+    /// them onto one fetch; waiters re-check the cache and serve locally
+    /// (16 fetches -> 1, benches/BLOB-CACHE.md).
+    inflight: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl CachedBlobBackend {
@@ -70,6 +79,7 @@ impl CachedBlobBackend {
                 NonZeroUsize::new(1_000_000).unwrap(),
             ))),
             current_size: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(DashMap::new()),
         }
     }
 
@@ -150,6 +160,7 @@ impl BlobStorageBackend for CachedBlobBackend {
             max_cache_bytes: self.max_cache_bytes,
             index: self.index.clone(),
             current_size: self.current_size.clone(),
+            inflight: self.inflight.clone(),
         };
         Box::pin(async move {
             // Write to inner backend
@@ -172,23 +183,50 @@ impl BlobStorageBackend for CachedBlobBackend {
             max_cache_bytes: self.max_cache_bytes,
             index: self.index.clone(),
             current_size: self.current_size.clone(),
+            inflight: self.inflight.clone(),
         };
         Box::pin(async move {
             let size = inner.put_blob_from_bytes(&hash, data.clone()).await?;
-            // Also cache locally (best-effort): write bytes to cache path
-            let dest = self_ref.cached_path(&hash);
-            if let Some(parent) = dest.parent() {
-                let _ = fs::create_dir_all(parent).await;
-            }
-            let _ = fs::write(&dest, &data).await;
-            let data_len = data.len() as u64;
-            let mut idx = self_ref.index.lock().await;
-            if let Some(old) = idx.put(hash, CacheEntry { size: data_len }) {
-                self_ref.current_size.fetch_sub(old.size, Ordering::Relaxed);
-            }
-            self_ref.current_size.fetch_add(data_len, Ordering::Relaxed);
+            self_ref.cache_bytes_write_through(hash, &data).await;
             Ok(size)
         })
+    }
+
+    // Without this override the trait default would re-route the CDC chunk
+    // write through `put_blob_from_bytes` above, whose inner (synced) call
+    // pays the remote exists-probe per chunk. The local write-through cache
+    // population is kept identical — post-upload readers (thumbnail/EXIF/
+    // face hooks) hit the cache instead of re-fetching from the remote.
+    fn put_blob_from_bytes_unsynced(
+        &self,
+        hash: &str,
+        data: Bytes,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<u64, DomainError>> + Send + '_>> {
+        let inner = self.inner.clone();
+        let hash = hash.to_string();
+        let self_ref = CachedRef {
+            cache_dir: self.cache_dir.clone(),
+            max_cache_bytes: self.max_cache_bytes,
+            index: self.index.clone(),
+            current_size: self.current_size.clone(),
+            inflight: self.inflight.clone(),
+        };
+        Box::pin(async move {
+            let size = inner
+                .put_blob_from_bytes_unsynced(&hash, data.clone())
+                .await?;
+            self_ref.cache_bytes_write_through(hash, &data).await;
+            Ok(size)
+        })
+    }
+
+    // The durability barrier must reach the backend that buffered the
+    // unsynced writes; the local cache copy is disposable and needs none.
+    fn sync_blobs(
+        &self,
+        hashes: &[String],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), DomainError>> + Send + '_>> {
+        self.inner.sync_blobs(hashes)
     }
 
     fn get_blob_stream(
@@ -203,6 +241,7 @@ impl BlobStorageBackend for CachedBlobBackend {
         let cache_dir = self.cache_dir.clone();
         let max_cache_bytes = self.max_cache_bytes;
         let current_size = self.current_size.clone();
+        let inflight = self.inflight.clone();
         Box::pin(async move {
             // Check cache presence (and bump LRU recency) under a brief lock,
             // then release it BEFORE touching the filesystem so concurrent
@@ -219,14 +258,17 @@ impl BlobStorageBackend for CachedBlobBackend {
                 }
             }
 
-            // Cache miss — fetch from inner, spool to cache
+            // Cache miss — fetch from inner (single-flight), spool to cache
             let self_ref = CachedRef {
                 cache_dir,
                 max_cache_bytes,
                 index: index.clone(),
                 current_size: current_size.clone(),
+                inflight,
             };
-            let dest = self_ref.fetch_and_cache_static(&hash, &*inner).await?;
+            let dest = self_ref
+                .fetch_and_cache_singleflight(&hash, &*inner, &cached)
+                .await?;
             let file = fs::File::open(&dest).await.map_err(|e| {
                 DomainError::internal_error("BlobCache", format!("re-open cached: {e}"))
             })?;
@@ -249,6 +291,7 @@ impl BlobStorageBackend for CachedBlobBackend {
         let cache_dir = self.cache_dir.clone();
         let max_cache_bytes = self.max_cache_bytes;
         let current_size = self.current_size.clone();
+        let inflight = self.inflight.clone();
         Box::pin(async move {
             // Check cache presence (and bump LRU recency) under a brief lock,
             // then release it BEFORE the open()/seek() syscalls so concurrent
@@ -271,14 +314,19 @@ impl BlobStorageBackend for CachedBlobBackend {
                 }
             }
 
-            // Cache miss — fetch full blob into cache, then serve range
+            // Cache miss — fetch full blob into cache (single-flight: a
+            // player's parallel cold Range probes coalesce onto ONE remote
+            // download), then serve the range locally.
             let self_ref = CachedRef {
                 cache_dir,
                 max_cache_bytes,
                 index: index.clone(),
                 current_size: current_size.clone(),
+                inflight,
             };
-            let dest = self_ref.fetch_and_cache_static(&hash, &*inner).await?;
+            let dest = self_ref
+                .fetch_and_cache_singleflight(&hash, &*inner, &cached)
+                .await?;
             let mut file = fs::File::open(&dest)
                 .await
                 .map_err(|e| DomainError::internal_error("BlobCache", format!("re-open: {e}")))?;
@@ -406,12 +454,62 @@ struct CachedRef {
     max_cache_bytes: u64,
     index: Arc<Mutex<LruCache<String, CacheEntry>>>,
     current_size: Arc<AtomicU64>,
+    inflight: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl CachedRef {
     fn cached_path(&self, hash: &str) -> PathBuf {
         let prefix = &hash[..2.min(hash.len())];
         self.cache_dir.join(prefix).join(format!("{hash}.blob"))
+    }
+
+    /// Best-effort write-through cache population shared by both blob-bytes
+    /// PUT paths. Deliberately no eviction sweep here — the byte budget is
+    /// enforced on read-miss inserts (`insert_into_cache_static`), matching
+    /// the historical write-path behavior.
+    async fn cache_bytes_write_through(&self, hash: String, data: &Bytes) {
+        let dest = self.cached_path(&hash);
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+        let _ = fs::write(&dest, data).await;
+        let data_len = data.len() as u64;
+        let mut idx = self.index.lock().await;
+        if let Some(old) = idx.put(hash, CacheEntry { size: data_len }) {
+            self.current_size.fetch_sub(old.size, Ordering::Relaxed);
+        }
+        self.current_size.fetch_add(data_len, Ordering::Relaxed);
+    }
+
+    /// Single-flight wrapper around [`Self::fetch_and_cache_static`]: the
+    /// first caller for a hash becomes the leader and downloads; concurrent
+    /// callers queue on the per-hash gate, then re-check the cache and serve
+    /// the leader's file without touching the remote backend. Errors are not
+    /// cached — the gate entry is dropped, so the next caller retries.
+    async fn fetch_and_cache_singleflight(
+        &self,
+        hash: &str,
+        inner: &dyn BlobStorageBackend,
+        cached: &Path,
+    ) -> Result<PathBuf, DomainError> {
+        let gate = self
+            .inflight
+            .entry(hash.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = gate.lock().await;
+
+        // Re-check under the gate: if we queued behind the leader, the blob
+        // is on disk now and this turns into a local open.
+        if self.index.lock().await.get(hash).is_some() && fs::metadata(cached).await.is_ok() {
+            return Ok(cached.to_path_buf());
+        }
+
+        let result = self.fetch_and_cache_static(hash, inner).await;
+        // Drop the gate whether we succeeded or failed; a late-arriving
+        // caller after an error creates a fresh gate and retries the fetch.
+        self.inflight.remove(hash);
+        result
     }
 
     /// Pop LRU entries until the cache is back within its byte budget,
@@ -486,31 +584,51 @@ impl CachedRef {
             })?;
         }
 
-        let tmp = dest.with_extension("tmp");
-        let mut file = fs::File::create(&tmp)
-            .await
-            .map_err(|e| DomainError::internal_error("BlobCache", format!("create tmp: {e}")))?;
-
-        use futures::StreamExt;
-        let mut stream = stream;
-        let mut total = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| {
-                DomainError::internal_error("BlobCache", format!("stream read: {e}"))
+        // Unique temp name: even if two fetches for one hash ever race
+        // (e.g. across processes sharing a cache dir), each writes its own
+        // inode and the rename is atomic — a torn/interleaved file can
+        // never land at the final path.
+        let tmp = dest.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let write_result: Result<u64, DomainError> = async {
+            let mut file = fs::File::create(&tmp).await.map_err(|e| {
+                DomainError::internal_error("BlobCache", format!("create tmp: {e}"))
             })?;
-            total += bytes.len() as u64;
-            file.write_all(&bytes)
-                .await
-                .map_err(|e| DomainError::internal_error("BlobCache", format!("write: {e}")))?;
-        }
-        file.flush()
-            .await
-            .map_err(|e| DomainError::internal_error("BlobCache", format!("flush: {e}")))?;
-        drop(file);
 
-        fs::rename(&tmp, &dest)
-            .await
-            .map_err(|e| DomainError::internal_error("BlobCache", format!("rename: {e}")))?;
+            use futures::StreamExt;
+            let mut stream = stream;
+            let mut total = 0u64;
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.map_err(|e| {
+                    DomainError::internal_error("BlobCache", format!("stream read: {e}"))
+                })?;
+                total += bytes.len() as u64;
+                file.write_all(&bytes)
+                    .await
+                    .map_err(|e| DomainError::internal_error("BlobCache", format!("write: {e}")))?;
+            }
+            file.flush()
+                .await
+                .map_err(|e| DomainError::internal_error("BlobCache", format!("flush: {e}")))?;
+            Ok(total)
+        }
+        .await;
+        let total = match write_result {
+            Ok(total) => total,
+            Err(e) => {
+                // Unique tmp names never get overwritten by a later fetch —
+                // reap the partial file instead of leaking it.
+                let _ = fs::remove_file(&tmp).await;
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = fs::rename(&tmp, &dest).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(DomainError::internal_error(
+                "BlobCache",
+                format!("rename: {e}"),
+            ));
+        }
 
         let to_evict = {
             let mut idx = self.index.lock().await;

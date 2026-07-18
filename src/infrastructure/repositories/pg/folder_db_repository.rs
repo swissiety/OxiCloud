@@ -32,11 +32,15 @@ use crate::domain::services::path_service::StoragePath;
 /// Post-D7-step-6: `storage.folders.user_id` dropped, so the tuple
 /// no longer carries it. The domain entity's `user_id` field is
 /// populated with `None` at `row_to_folder` construction.
+/// `id` / `parent_id` decode as binary `Uuid` (16 bytes on the wire vs 36
+/// as `::text`, and the server skips the cast); `row_to_folder` renders
+/// them to `String` once app-side — the round-6 `row_to_file` shape
+/// (benches/ROUND6.md §10) applied to the folder listings.
 type FolderRow = (
+    Uuid,
     String,
     String,
-    String,
-    Option<String>,
+    Option<Uuid>,
     Uuid,
     i64,
     i64,
@@ -49,10 +53,10 @@ type FolderRow = (
 /// the last element after the §14 provenance columns). Same
 /// column set as [`FolderRow`] plus the trailing count.
 type FolderRowPaginated = (
+    Uuid,
     String,
     String,
-    String,
-    Option<String>,
+    Option<Uuid>,
     Uuid,
     i64,
     i64,
@@ -131,10 +135,10 @@ impl FolderDbRepository {
     /// `Option<Uuid>` because the FK is `ON DELETE SET NULL`.
     #[allow(clippy::too_many_arguments)]
     fn row_to_folder(
-        id: String,
+        id: Uuid,
         name: String,
         path: String,
-        parent_id: Option<String>,
+        parent_id: Option<Uuid>,
         drive_id: Uuid,
         created_at: i64,
         modified_at: i64,
@@ -142,12 +146,11 @@ impl FolderDbRepository {
         created_by: Option<Uuid>,
         updated_by: Option<Uuid>,
     ) -> Result<Folder, DomainError> {
-        let storage_path = StoragePath::from_string(&path);
-        Folder::with_timestamps_tree_and_provenance(
-            id,
+        Folder::from_materialized_row(
+            id.to_string(),
             name,
-            storage_path,
-            parent_id,
+            path,
+            parent_id.map(|u| u.to_string()),
             drive_id,
             created_at as u64,
             modified_at as u64,
@@ -171,7 +174,7 @@ impl FolderDbRepository {
 
         let rows = sqlx::query_as::<_, FolderRow>(
             r#"
-            SELECT id::text, name, path, parent_id::text, drive_id,
+            SELECT id, name, path, parent_id, drive_id,
                    EXTRACT(EPOCH FROM created_at)::bigint,
                    EXTRACT(EPOCH FROM updated_at)::bigint,
                    EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -236,12 +239,25 @@ impl FolderRepository for FolderDbRepository {
         //
         // RETURNING surfaces the two provenance columns so the built
         // entity / DTO carries fresh values without a re-read.
-        let row = sqlx::query_as::<_, (String, String, i64, i64, i64, Option<Uuid>, Option<Uuid>)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Option<Uuid>,
+                String,
+                i64,
+                i64,
+                i64,
+                Option<Uuid>,
+                Option<Uuid>,
+            ),
+        >(
             r#"
             INSERT INTO storage.folders
                 (name, parent_id, drive_id, created_by, updated_by)
             VALUES ($1, $2::uuid, $3, $4, $4)
-            RETURNING id::text,
+            RETURNING id,
+                      parent_id,
                       path,
                       EXTRACT(EPOCH FROM created_at)::bigint,
                       EXTRACT(EPOCH FROM updated_at)::bigint,
@@ -269,16 +285,16 @@ impl FolderRepository for FolderDbRepository {
         })?;
 
         Self::row_to_folder(
-            row.0, name, row.1, parent_id, drive_id, row.2, row.3, row.4,
+            row.0, name, row.2, row.1, drive_id, row.3, row.4, row.5,
             // Fresh from RETURNING — caller_id was bound to both columns.
-            row.5, row.6,
+            row.6, row.7,
         )
     }
 
     async fn get_folder(&self, id: &str) -> Result<Folder, DomainError> {
         let row = sqlx::query_as::<_, FolderRow>(
             r#"
-            SELECT id::text, name, path, parent_id::text, drive_id,
+            SELECT id, name, path, parent_id, drive_id,
                    EXTRACT(EPOCH FROM created_at)::bigint,
                    EXTRACT(EPOCH FROM updated_at)::bigint,
                    EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -320,7 +336,7 @@ impl FolderRepository for FolderDbRepository {
         // wrapper scoping post-D0).
         let row = sqlx::query_as::<_, FolderRow>(
             r#"
-            SELECT id::text, name, path, parent_id::text, drive_id,
+            SELECT id, name, path, parent_id, drive_id,
                    EXTRACT(EPOCH FROM created_at)::bigint,
                    EXTRACT(EPOCH FROM updated_at)::bigint,
                        EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -346,7 +362,7 @@ impl FolderRepository for FolderDbRepository {
         let rows: Vec<FolderRow> = if let Some(pid) = parent_id {
             sqlx::query_as(
                 r#"
-                SELECT id::text, name, path, parent_id::text, drive_id,
+                SELECT id, name, path, parent_id, drive_id,
                        EXTRACT(EPOCH FROM created_at)::bigint,
                        EXTRACT(EPOCH FROM updated_at)::bigint,
                        EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -362,7 +378,7 @@ impl FolderRepository for FolderDbRepository {
         } else {
             sqlx::query_as(
                 r#"
-                SELECT id::text, name, path, parent_id::text, drive_id,
+                SELECT id, name, path, parent_id, drive_id,
                        EXTRACT(EPOCH FROM created_at)::bigint,
                        EXTRACT(EPOCH FROM updated_at)::bigint,
                        EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -405,7 +421,7 @@ impl FolderRepository for FolderDbRepository {
         // top of `folder_repository.rs`. Frontend cross-references
         // `/api/drives::caller_role` via `folder.drive_id`.
         let sql = format!(
-            "SELECT fo.id::text, fo.name, fo.path, fo.parent_id::text, \
+            "SELECT fo.id, fo.name, fo.path, fo.parent_id, \
                     fo.drive_id, \
                     EXTRACT(EPOCH FROM fo.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fo.updated_at)::bigint, \
@@ -446,7 +462,7 @@ impl FolderRepository for FolderDbRepository {
         let rows: Vec<FolderRowPaginated> = if let Some(pid) = parent_id {
             sqlx::query_as(
                 r#"
-                SELECT id::text, name, path, parent_id::text, drive_id,
+                SELECT id, name, path, parent_id, drive_id,
                        EXTRACT(EPOCH FROM created_at)::bigint,
                        EXTRACT(EPOCH FROM updated_at)::bigint,
                        EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -466,7 +482,7 @@ impl FolderRepository for FolderDbRepository {
         } else {
             sqlx::query_as(
                 r#"
-                SELECT id::text, name, path, parent_id::text, drive_id,
+                SELECT id, name, path, parent_id, drive_id,
                        EXTRACT(EPOCH FROM created_at)::bigint,
                        EXTRACT(EPOCH FROM updated_at)::bigint,
                        EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -501,6 +517,61 @@ impl FolderRepository for FolderDbRepository {
         Ok((folders?, total))
     }
 
+    /// Keyset sub-folder page: `name > $after ORDER BY name LIMIT $limit`,
+    /// one bounded index-range read off `idx_folders_unique_name` — the
+    /// cursor predicate is only emitted when a cursor exists (a bound
+    /// disjunction would block the index condition under generic plans,
+    /// same rule as `list_files_batch`). Root scope (`parent_id = None`)
+    /// keeps the trait's in-memory default: roots are one-per-drive, a
+    /// handful of rows.
+    async fn list_folders_batch(
+        &self,
+        parent_id: Option<&str>,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Folder>, DomainError> {
+        let Some(pid) = parent_id else {
+            let mut all = self.list_folders(None).await?;
+            all.sort_by(|a, b| a.name().cmp(b.name()));
+            return Ok(all
+                .into_iter()
+                .filter(|f| after_name.is_none_or(|a| f.name() > a))
+                .take(limit)
+                .collect());
+        };
+
+        let cursor_pred = if after_name.is_some() {
+            "AND name > $3"
+        } else {
+            "AND $3::text IS NULL"
+        };
+        let sql = format!(
+            "SELECT id, name, path, parent_id, drive_id, \
+                    EXTRACT(EPOCH FROM created_at)::bigint, \
+                    EXTRACT(EPOCH FROM updated_at)::bigint, \
+                    EXTRACT(EPOCH FROM tree_modified_at)::bigint, \
+                    created_by, updated_by \
+               FROM storage.folders \
+              WHERE parent_id = $1::uuid AND NOT is_trashed \
+                {cursor_pred} \
+              ORDER BY name \
+              LIMIT $2"
+        );
+        let rows: Vec<FolderRow> = sqlx::query_as(&sql)
+            .bind(pid)
+            .bind(limit as i64)
+            .bind(after_name)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| DomainError::internal_error("FolderDb", format!("batch: {e}")))?;
+
+        rows.into_iter()
+            .map(|(id, name, path, pid, did, ca, ma, tma, cb, ub)| {
+                Self::row_to_folder(id, name, path, pid, did, ca, ma, tma, cb, ub)
+            })
+            .collect()
+    }
+
     /// Paginated companion to `list_root_folders_for_caller` — same
     /// drive-membership predicate, adds LIMIT/OFFSET and an optional
     /// window-function COUNT so total pages can be surfaced without a
@@ -513,7 +584,7 @@ impl FolderRepository for FolderDbRepository {
         include_total: bool,
     ) -> Result<(Vec<Folder>, Option<usize>), DomainError> {
         let sql = format!(
-            "SELECT fo.id::text, fo.name, fo.path, fo.parent_id::text, \
+            "SELECT fo.id, fo.name, fo.path, fo.parent_id, \
                     fo.drive_id, \
                     EXTRACT(EPOCH FROM fo.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fo.updated_at)::bigint, \
@@ -575,7 +646,7 @@ impl FolderRepository for FolderDbRepository {
                 UPDATE storage.folders
                    SET name = $1, updated_at = NOW(), updated_by = $3
                  WHERE id = $2::uuid AND NOT is_trashed
-                RETURNING id::text, name, path, parent_id::text, drive_id,
+                RETURNING id, name, path, parent_id, drive_id,
                           EXTRACT(EPOCH FROM created_at)::bigint,
                           EXTRACT(EPOCH FROM updated_at)::bigint,
                            EXTRACT(EPOCH FROM tree_modified_at)::bigint,
@@ -636,7 +707,7 @@ impl FolderRepository for FolderDbRepository {
                        updated_at = NOW(),
                        updated_by = $3
                  WHERE f.id = $2::uuid AND NOT f.is_trashed
-                RETURNING f.id::text, f.name, f.path, f.parent_id::text, f.drive_id,
+                RETURNING f.id, f.name, f.path, f.parent_id, f.drive_id,
                           EXTRACT(EPOCH FROM f.created_at)::bigint,
                           EXTRACT(EPOCH FROM f.updated_at)::bigint,
                           EXTRACT(EPOCH FROM f.tree_modified_at)::bigint,
@@ -935,7 +1006,7 @@ impl FolderRepository for FolderDbRepository {
     /// Ordered by `fo.path` so callers can iterate in directory order.
     #[allow(clippy::type_complexity)]
     async fn list_subtree_folders(&self, folder_id: &str) -> Result<Vec<Folder>, DomainError> {
-        let sql = "SELECT fo.id::text, fo.name, fo.path, fo.parent_id::text, \
+        let sql = "SELECT fo.id, fo.name, fo.path, fo.parent_id, \
                           fo.drive_id, \
                           EXTRACT(EPOCH FROM fo.created_at)::bigint, \
                           EXTRACT(EPOCH FROM fo.updated_at)::bigint, \
@@ -1002,7 +1073,7 @@ impl FolderRepository for FolderDbRepository {
         if recursive {
             // Recursive, no folder scope → ALL folders in caller's readable drives
             let sql = format!(
-                "SELECT fo.id::text, fo.name, fo.path, fo.parent_id::text, \
+                "SELECT fo.id, fo.name, fo.path, fo.parent_id, \
                         fo.drive_id, \
                         EXTRACT(EPOCH FROM fo.created_at)::bigint, \
                         EXTRACT(EPOCH FROM fo.updated_at)::bigint, \
@@ -1041,7 +1112,7 @@ impl FolderRepository for FolderDbRepository {
         // the caller can read (parent_id already establishes the subtree).
         let sql = if parent_id.is_some() {
             format!(
-                "SELECT fo.id::text, fo.name, fo.path, fo.parent_id::text, \
+                "SELECT fo.id, fo.name, fo.path, fo.parent_id, \
                         fo.drive_id, \
                         EXTRACT(EPOCH FROM fo.created_at)::bigint, \
                         EXTRACT(EPOCH FROM fo.updated_at)::bigint, \
@@ -1061,7 +1132,7 @@ impl FolderRepository for FolderDbRepository {
                 _ => "",
             };
             format!(
-                "SELECT fo.id::text, fo.name, fo.path, fo.parent_id::text, \
+                "SELECT fo.id, fo.name, fo.path, fo.parent_id, \
                         fo.drive_id, \
                         EXTRACT(EPOCH FROM fo.created_at)::bigint, \
                         EXTRACT(EPOCH FROM fo.updated_at)::bigint, \
@@ -1134,7 +1205,7 @@ impl FolderRepository for FolderDbRepository {
         };
 
         let sql = format!(
-            "SELECT fo.id::text, fo.name, fo.path, fo.parent_id::text, \
+            "SELECT fo.id, fo.name, fo.path, fo.parent_id, \
                     fo.drive_id, \
                     EXTRACT(EPOCH FROM fo.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fo.updated_at)::bigint, \
@@ -1178,31 +1249,39 @@ impl FolderRepository for FolderDbRepository {
         parent_id: Option<&str>,
         query: &str,
         limit: usize,
+        caller_id: uuid::Uuid,
     ) -> Result<Vec<Folder>, DomainError> {
+        // Same drive-scope filter as `suggest_files_by_name` — closed as
+        // AuthZ audit finding #1 (2026-07-12). `CALLER_CAN_READ_DRIVE`
+        // aliases `storage.folders` as `fo`; the pre-fix query aliased it
+        // as an unqualified `storage.folders`, so this rewrite adds the
+        // `fo` alias in every branch.
         let pattern = super::like_escape(query);
         let limit_i64 = limit as i64;
 
         let rows: Vec<FolderRow> = if let Some(pid) = parent_id {
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 r#"
-                SELECT id::text, name, path, parent_id::text, drive_id,
-                       EXTRACT(EPOCH FROM created_at)::bigint,
-                       EXTRACT(EPOCH FROM updated_at)::bigint,
-                       EXTRACT(EPOCH FROM tree_modified_at)::bigint,
-                         created_by, updated_by
-                  FROM storage.folders
-                 WHERE parent_id = $1::uuid
-                   AND NOT is_trashed
-                   AND name ILIKE $2
+                SELECT fo.id, fo.name, fo.path, fo.parent_id, fo.drive_id,
+                       EXTRACT(EPOCH FROM fo.created_at)::bigint,
+                       EXTRACT(EPOCH FROM fo.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fo.tree_modified_at)::bigint,
+                         fo.created_by, fo.updated_by
+                  FROM storage.folders fo
+                 WHERE {CALLER_CAN_READ_DRIVE}
+                   AND fo.parent_id = $2::uuid
+                   AND NOT fo.is_trashed
+                   AND fo.name ILIKE $3
                  ORDER BY CASE
-                            WHEN name ILIKE $3 THEN 0
-                            WHEN name ILIKE $3 || '%' THEN 1
+                            WHEN fo.name ILIKE $4 THEN 0
+                            WHEN fo.name ILIKE $4 || '%' THEN 1
                             ELSE 2
                           END,
-                          name
-                 LIMIT $4
-                "#,
-            )
+                          fo.name
+                 LIMIT $5
+                "#
+            ))
+            .bind(caller_id)
             .bind(pid)
             .bind(&pattern)
             .bind(query)
@@ -1210,26 +1289,28 @@ impl FolderRepository for FolderDbRepository {
             .fetch_all(self.pool())
             .await
         } else {
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 r#"
-                SELECT id::text, name, path, parent_id::text, drive_id,
-                       EXTRACT(EPOCH FROM created_at)::bigint,
-                       EXTRACT(EPOCH FROM updated_at)::bigint,
-                       EXTRACT(EPOCH FROM tree_modified_at)::bigint,
-                         created_by, updated_by
-                  FROM storage.folders
-                 WHERE parent_id IS NULL
-                   AND NOT is_trashed
-                   AND name ILIKE $1
+                SELECT fo.id, fo.name, fo.path, fo.parent_id, fo.drive_id,
+                       EXTRACT(EPOCH FROM fo.created_at)::bigint,
+                       EXTRACT(EPOCH FROM fo.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fo.tree_modified_at)::bigint,
+                         fo.created_by, fo.updated_by
+                  FROM storage.folders fo
+                 WHERE {CALLER_CAN_READ_DRIVE}
+                   AND fo.parent_id IS NULL
+                   AND NOT fo.is_trashed
+                   AND fo.name ILIKE $2
                  ORDER BY CASE
-                            WHEN name ILIKE $2 THEN 0
-                            WHEN name ILIKE $2 || '%' THEN 1
+                            WHEN fo.name ILIKE $3 THEN 0
+                            WHEN fo.name ILIKE $3 || '%' THEN 1
                             ELSE 2
                           END,
-                          name
-                 LIMIT $3
-                "#,
-            )
+                          fo.name
+                 LIMIT $4
+                "#
+            ))
+            .bind(caller_id)
             .bind(&pattern)
             .bind(query)
             .bind(limit_i64)
@@ -1391,13 +1472,6 @@ impl FolderDbRepository {
             WHERE fm.folder_id = $1::uuid AND NOT fm.is_trashed
         "#;
 
-        let cte_inner = match (include_folders, include_files) {
-            (true, true) => format!("{folder_branch} UNION ALL {file_branch}"),
-            (true, false) => folder_branch.to_owned(),
-            (false, true) => file_branch.to_owned(),
-            (false, false) => unreachable!(),
-        };
-
         // ── Cursor binds ─────────────────────────────────────────────────────
         // $1 = parent_id   $2 = cursor_str   $3 = cursor_int
         // $4 = cursor_ts   $5 = cursor_id    $6 = limit
@@ -1406,112 +1480,184 @@ impl FolderDbRepository {
         let cursor_ts = cursor.and_then(|c| c.sort_ts);
         let cursor_id = cursor.map(|c| c.resource_id);
 
-        // ── Sort-specific WHERE + ORDER BY ───────────────────────────────────
-        // Each arm produces two variants based on `reverse`.
-        // For "name": folder_first stays ASC in both directions (folders always
-        // precede files); only the alpha order within each group flips.
-        let (where_clause, order_clause) = match order_by {
+        // ── Per-branch cursor pushdown ───────────────────────────────────────
+        // The cursor is applied INSIDE each UNION-ALL branch as a sargable
+        // row-value comparison on base columns — not on the CTE's computed
+        // columns — and every branch pre-sorts and pre-limits, so Postgres
+        // reads O(limit) rows per branch instead of rescanning and
+        // top-N-sorting the entire folder on every page (19.5x on a
+        // 20k-entry folder, benches/LISTING-KEYSET.md). The "name" sort is
+        // served by the expression indexes idx_files_folder_lname /
+        // idx_folders_parent_lname (migration 20260918000000).
+        //
+        // Sort-key columns that are CONSTANT within a branch (folder_first,
+        // the folder branch's type_order = 0 and size = -1) are folded in
+        // Rust: depending on which group the cursor points into, the branch
+        // predicate shortens to a row-value over the remaining keys, the
+        // branch keeps all its rows, or the branch drops out entirely.
+        enum BranchCursor {
+            /// The cursor has moved past every row this branch can produce.
+            Drop,
+            /// Every row in this branch sorts after the cursor.
+            All,
+            /// Row-value comparison over the branch's non-constant sort keys.
+            Pred(String),
+        }
+        use BranchCursor::{All, Drop, Pred};
+
+        let has_cursor = cursor.is_some();
+        // (folder-branch cursor, file-branch cursor, per-branch ORDER BY on
+        //  the branch's output aliases, outer merge ORDER BY)
+        let (folder_cur, file_cur, branch_order, outer_order) = match order_by {
             "type" => {
-                if reverse {
-                    (
-                        r#"WHERE ($3::bigint IS NULL)
-                              OR (type_order < $3)
-                              OR (type_order = $3 AND sort_str < $2)
-                              OR (type_order = $3 AND sort_str = $2 AND id < $5::uuid)"#,
-                        "ORDER BY type_order DESC, sort_str DESC, id DESC",
-                    )
+                let (op, ord) = if reverse {
+                    ("<", "ORDER BY type_order DESC, sort_str DESC, id DESC")
                 } else {
-                    (
-                        r#"WHERE ($3::bigint IS NULL)
-                              OR (type_order > $3)
-                              OR (type_order = $3 AND sort_str > $2)
-                              OR (type_order = $3 AND sort_str = $2 AND id > $5::uuid)"#,
-                        "ORDER BY type_order ASC, sort_str ASC, id ASC",
-                    )
-                }
+                    (">", "ORDER BY type_order ASC, sort_str ASC, id ASC")
+                };
+                let folder_cur = match cursor_int {
+                    None => All,
+                    // Folder rows have type_order = 0; a cursor sitting on a
+                    // file (type_order > 0) either exhausts the folder group
+                    // (ASC) or precedes all of it (DESC).
+                    Some(c_to) if c_to > 0 => {
+                        if reverse {
+                            All
+                        } else {
+                            Drop
+                        }
+                    }
+                    Some(_) => Pred(format!("(LOWER(f.name), f.id) {op} ($2, $5::uuid)")),
+                };
+                let file_cur = if has_cursor {
+                    Pred(format!(
+                        "(fm.category_order::bigint, LOWER(fm.name), fm.id) {op} ($3, $2, $5::uuid)"
+                    ))
+                } else {
+                    All
+                };
+                (folder_cur, file_cur, ord, ord)
             }
             "modified_at" => {
-                if reverse {
-                    (
-                        r#"WHERE ($4::timestamptz IS NULL)
-                              OR (modified_at > $4)
-                              OR (modified_at = $4 AND id > $5::uuid)"#,
-                        "ORDER BY modified_at ASC, id ASC",
-                    )
+                let (op, ord) = if reverse {
+                    (">", "ORDER BY modified_at ASC, id ASC")
                 } else {
-                    (
-                        r#"WHERE ($4::timestamptz IS NULL)
-                              OR (modified_at < $4)
-                              OR (modified_at = $4 AND id < $5::uuid)"#,
-                        "ORDER BY modified_at DESC, id DESC",
-                    )
-                }
+                    ("<", "ORDER BY modified_at DESC, id DESC")
+                };
+                let mk = |col: &str| {
+                    if has_cursor {
+                        Pred(format!("({col}.updated_at, {col}.id) {op} ($4, $5::uuid)"))
+                    } else {
+                        All
+                    }
+                };
+                (mk("f"), mk("fm"), ord, ord)
             }
             "created_at" => {
-                if reverse {
-                    (
-                        r#"WHERE ($4::timestamptz IS NULL)
-                              OR (created_at > $4)
-                              OR (created_at = $4 AND id > $5::uuid)"#,
-                        "ORDER BY created_at ASC, id ASC",
-                    )
+                let (op, ord) = if reverse {
+                    (">", "ORDER BY created_at ASC, id ASC")
                 } else {
-                    (
-                        r#"WHERE ($4::timestamptz IS NULL)
-                              OR (created_at < $4)
-                              OR (created_at = $4 AND id < $5::uuid)"#,
-                        "ORDER BY created_at DESC, id DESC",
-                    )
-                }
+                    ("<", "ORDER BY created_at DESC, id DESC")
+                };
+                let mk = |col: &str| {
+                    if has_cursor {
+                        Pred(format!("({col}.created_at, {col}.id) {op} ($4, $5::uuid)"))
+                    } else {
+                        All
+                    }
+                };
+                (mk("f"), mk("fm"), ord, ord)
             }
             "size" => {
-                if reverse {
-                    (
-                        r#"WHERE ($3::bigint IS NULL)
-                              OR (size < $3)
-                              OR (size = $3 AND id < $5::uuid)"#,
-                        "ORDER BY size DESC, id DESC",
-                    )
+                let (op, ord) = if reverse {
+                    ("<", "ORDER BY size DESC, id DESC")
                 } else {
-                    (
-                        r#"WHERE ($3::bigint IS NULL)
-                              OR (size > $3)
-                              OR (size = $3 AND id > $5::uuid)"#,
-                        "ORDER BY size ASC, id ASC",
-                    )
-                }
+                    (">", "ORDER BY size ASC, id ASC")
+                };
+                let folder_cur = match cursor_int {
+                    None => All,
+                    // Folder rows have size = -1; a cursor sitting on a file
+                    // (size >= 0) exhausts the folder group (ASC) or precedes
+                    // all of it (DESC).
+                    Some(c_sz) if c_sz > -1 => {
+                        if reverse {
+                            All
+                        } else {
+                            Drop
+                        }
+                    }
+                    Some(_) => Pred(format!("f.id {op} $5::uuid")),
+                };
+                let file_cur = if has_cursor {
+                    Pred(format!("(fm.size::bigint, fm.id) {op} ($3, $5::uuid)"))
+                } else {
+                    All
+                };
+                (folder_cur, file_cur, ord, ord)
             }
             _ => {
-                // "name" (default): folder_first stays ASC so folders always precede
-                // files; only the alpha order within each group flips when reversed.
-                if reverse {
-                    (
-                        r#"WHERE ($3::bigint IS NULL)
-                              OR (folder_first::bigint > $3)
-                              OR (folder_first::bigint = $3 AND sort_str < $2)
-                              OR (folder_first::bigint = $3 AND sort_str = $2 AND id < $5::uuid)"#,
-                        "ORDER BY folder_first ASC, sort_str DESC, id DESC",
-                    )
+                // "name" (default): folder_first stays ASC so folders always
+                // precede files; only the alpha order within each group flips
+                // when reversed. cursor_int carries folder_first (0|1).
+                let op = if reverse { "<" } else { ">" };
+                let branch_ord = if reverse {
+                    "ORDER BY sort_str DESC, id DESC"
                 } else {
-                    (
-                        r#"WHERE ($3::bigint IS NULL)
-                              OR (folder_first::bigint > $3)
-                              OR (folder_first::bigint = $3 AND sort_str > $2)
-                              OR (folder_first::bigint = $3 AND sort_str = $2 AND id > $5::uuid)"#,
-                        "ORDER BY folder_first ASC, sort_str ASC, id ASC",
-                    )
-                }
+                    "ORDER BY sort_str ASC, id ASC"
+                };
+                let outer_ord = if reverse {
+                    "ORDER BY folder_first ASC, sort_str DESC, id DESC"
+                } else {
+                    "ORDER BY folder_first ASC, sort_str ASC, id ASC"
+                };
+                let (folder_cur, file_cur) = match cursor_int {
+                    None => (All, All),
+                    // Cursor inside the folder group: folders continue after
+                    // the row-value cursor; every file still follows.
+                    Some(0) => (
+                        Pred(format!("(LOWER(f.name), f.id) {op} ($2, $5::uuid)")),
+                        All,
+                    ),
+                    // Cursor inside the file group: the folder group is done.
+                    Some(_) => (
+                        Drop,
+                        Pred(format!("(LOWER(fm.name), fm.id) {op} ($2, $5::uuid)")),
+                    ),
+                };
+                (folder_cur, file_cur, branch_ord, outer_ord)
             }
         };
 
+        let wrap = |branch: &str, cur: &BranchCursor| -> Option<String> {
+            let extra = match cur {
+                Drop => return None,
+                All => String::new(),
+                Pred(p) => format!(" AND {p}"),
+            };
+            Some(format!(
+                "(SELECT * FROM ({branch}{extra}) b {branch_order} LIMIT $6)"
+            ))
+        };
+        let mut branches = Vec::with_capacity(2);
+        if include_folders && let Some(b) = wrap(folder_branch, &folder_cur) {
+            branches.push(b);
+        }
+        if include_files && let Some(b) = wrap(file_branch, &file_cur) {
+            branches.push(b);
+        }
+        // Every requested branch dropped out (e.g. folders-only listing with
+        // the cursor already past the folder group).
+        if branches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = branches.join(" UNION ALL ");
+
         let sql = format!(
-            "WITH resources AS ({cte_inner}) \
-             SELECT resource_type, id, name, folder_id, mime_type, size, \
+            "SELECT resource_type, id, name, folder_id, mime_type, size, \
                     created_at, modified_at, drive_id, blob_hash, \
                     sort_str, type_order, folder_first \
-             FROM resources \
-             {where_clause} \
-             {order_clause} \
+             FROM ({inner}) r \
+             {outer_order} \
              LIMIT $6"
         );
 

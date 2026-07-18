@@ -84,6 +84,15 @@ impl ContactStoragePort for ContactStorageAdapter {
             .await
     }
 
+    async fn get_address_books_by_ids(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<AddressBook>, DomainError> {
+        self.address_book_repository
+            .get_address_books_by_ids(ids)
+            .await
+    }
+
     async fn get_public_address_books(&self) -> Result<Vec<AddressBook>, DomainError> {
         self.address_book_repository
             .get_public_address_books()
@@ -135,6 +144,14 @@ impl ContactStoragePort for ContactStorageAdapter {
         self.contact_repository
             .get_contacts_by_address_book(address_book_id)
             .await
+    }
+
+    fn stream_contacts_by_book(
+        &self,
+        address_book_id: Uuid,
+    ) -> futures::stream::BoxStream<'static, Result<Contact, DomainError>> {
+        self.contact_repository
+            .stream_contacts_by_book(address_book_id)
     }
 
     async fn get_contacts_by_address_book_paginated(

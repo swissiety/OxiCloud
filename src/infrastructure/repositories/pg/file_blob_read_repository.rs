@@ -11,9 +11,9 @@
 /// Post-D7-step-6: `storage.files.user_id` dropped, so it's no
 /// longer projected.
 type MediaFileRow = (
-    String,         // id
+    Uuid,           // id (binary decode; benches/ROUND6.md §10)
     String,         // name
-    Option<String>, // folder_id
+    Option<Uuid>,   // folder_id
     Option<String>, // folder path
     i64,            // size
     String,         // mime_type
@@ -83,9 +83,9 @@ const CALLER_CAN_READ_DRIVE: &str = "EXISTS (\
 /// longer part of the tuple; `row_to_file` populates the entity's
 /// legacy `user_id` field with `None`.
 type FileRow = (
+    Uuid,
     String,
-    String,
-    Option<String>,
+    Option<Uuid>,
     Option<String>,
     i64,
     String,
@@ -269,7 +269,7 @@ impl FileBlobReadRepository {
 
         let where_clause = conditions.join(" AND ");
         let sql = format!(
-            "SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path, \
+            "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
@@ -319,7 +319,7 @@ impl FileBlobReadRepository {
         }
 
         let rows = sqlx::query_as::<_, FileRow>(
-            "SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path, \
+            "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
@@ -413,19 +413,11 @@ impl FileBlobReadRepository {
         }
     }
 
-    /// Build a `StoragePath` from the materialized folder path + file name.
-    fn make_file_path(folder_path: Option<&str>, file_name: &str) -> StoragePath {
-        match folder_path {
-            Some(fp) if !fp.is_empty() => StoragePath::from_string(&format!("{fp}/{file_name}")),
-            _ => StoragePath::from_string(file_name),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn row_to_file(
-        id: String,
+        id: Uuid,
         name: String,
-        folder_id: Option<String>,
+        folder_id: Option<Uuid>,
         folder_path: Option<String>,
         size: i64,
         mime_type: String,
@@ -435,14 +427,13 @@ impl FileBlobReadRepository {
         created_by: Option<Uuid>,
         updated_by: Option<Uuid>,
     ) -> Result<File, DomainError> {
-        let storage_path = Self::make_file_path(folder_path.as_deref(), &name);
-        File::with_timestamps_blob_hash_and_provenance(
-            id,
+        File::from_materialized_row(
+            id.to_string(),
             name,
-            storage_path,
+            folder_path.as_deref(),
             size as u64,
             mime_type,
-            folder_id,
+            folder_id.map(|u| u.to_string()),
             created_at as u64,
             modified_at as u64,
             blob_hash,
@@ -488,13 +479,21 @@ impl FileBlobReadRepository {
     /// `sort_date` epoch for each file (used as pagination cursor).
     ///
     /// Uses the denormalised `media_sort_date` column (synced from
-    /// `file_metadata.captured_at` by trigger) so no JOIN with
-    /// `file_metadata` is needed.  The partial covering index
-    /// `idx_files_media_timeline_by_drive` (migration 20260901000001)
-    /// keys on `(drive_id, media_sort_date DESC)` filtered on non-trashed
-    /// image/video rows — Postgres does one IndexScan per in-scope
-    /// drive_id already ordered by capture date, so LIMIT stops the scan
-    /// early. Same O(LIMIT) shape as the pre-D7 `user_id`-keyed hot path.
+    /// `file_metadata.captured_at` by trigger). The accessible drive ids
+    /// are materialised once, then a `CROSS JOIN LATERAL (… ORDER BY
+    /// media_sort_date DESC LIMIT k)` per drive turns the partial covering
+    /// index `idx_files_media_timeline_by_drive` (migration 20260901000001,
+    /// `(drive_id, media_sort_date DESC)` filtered on non-trashed
+    /// image/video rows) into one BOUNDED index scan per drive; the outer
+    /// merge sorts `drives × k` rows. The folders / file_metadata joins sit
+    /// outside the top-N so only the k emitted rows pay them.
+    ///
+    /// The previous shape put the joins and the global `ORDER BY … LIMIT`
+    /// above a `drive_id IN (…)` nested loop — Postgres fed EVERY media row
+    /// through the join into a top-N heapsort, scanning the timeline index
+    /// to exhaustion on every page: O(library) per page, 97 ms on a
+    /// 50k-photo library vs 1.6 ms for this shape (55.7x,
+    /// benches/PHOTOS-TIMELINE.md).
     ///
     /// Scope (`docs/plan/drive.md` §15): drives with
     /// `policies.include_in_photo_index = true` where the caller has a
@@ -537,37 +536,47 @@ impl FileBlobReadRepository {
         };
         let sql = format!(
             r#"
-            SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
-                   fi.size, fi.mime_type,
-                   EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                   EXTRACT(EPOCH FROM fi.updated_at)::bigint,
-                   fi.blob_hash,
-
-                   fi.created_by, fi.updated_by,
-                   EXTRACT(EPOCH FROM fi.media_sort_date)::bigint AS sort_date,
+            WITH accessible AS MATERIALIZED (
+                SELECT d.id
+                  FROM storage.drives d
+                  JOIN storage.role_grants g
+                    ON g.resource_type = 'drive'
+                   AND g.resource_id   = d.id
+                 WHERE (
+                         (g.subject_type = 'user'  AND g.subject_id = $1)
+                      OR (g.subject_type = 'group' AND g.subject_id IN
+                              (SELECT storage.caller_group_ids($1)))
+                       )
+                   AND (g.expires_at IS NULL OR g.expires_at > NOW())
+                   AND (d.policies->>'include_in_photo_index')::boolean = true
+            )
+            SELECT top.id, top.name, top.folder_id, fo.path,
+                   top.size, top.mime_type,
+                   EXTRACT(EPOCH FROM top.created_at)::bigint,
+                   EXTRACT(EPOCH FROM top.updated_at)::bigint,
+                   top.blob_hash,
+                   top.created_by, top.updated_by,
+                   EXTRACT(EPOCH FROM top.media_sort_date)::bigint AS sort_date,
                    fm.width, fm.height
-              FROM storage.files fi
-              LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
-              LEFT JOIN storage.file_metadata fm ON fm.file_id = fi.id
-             WHERE fi.drive_id IN (
-                     SELECT d.id
-                       FROM storage.drives d
-                       JOIN storage.role_grants g
-                         ON g.resource_type = 'drive'
-                        AND g.resource_id   = d.id
-                      WHERE (
-                              (g.subject_type = 'user'  AND g.subject_id = $1)
-                           OR (g.subject_type = 'group' AND g.subject_id IN
-                                   (SELECT storage.caller_group_ids($1)))
-                            )
-                        AND (g.expires_at IS NULL OR g.expires_at > NOW())
-                        AND (d.policies->>'include_in_photo_index')::boolean = true
-                   )
-               AND NOT fi.is_trashed
-               AND (fi.mime_type LIKE 'image/%' OR fi.mime_type LIKE 'video/%')
-               {cursor_pred}
-             ORDER BY fi.media_sort_date DESC
-             LIMIT $3
+              FROM (
+                SELECT fi.*
+                  FROM accessible a
+                 CROSS JOIN LATERAL (
+                    SELECT fi.*
+                      FROM storage.files fi
+                     WHERE fi.drive_id = a.id
+                       AND NOT fi.is_trashed
+                       AND (fi.mime_type LIKE 'image/%' OR fi.mime_type LIKE 'video/%')
+                       {cursor_pred}
+                     ORDER BY fi.media_sort_date DESC
+                     LIMIT $3
+                 ) fi
+                 ORDER BY fi.media_sort_date DESC
+                 LIMIT $3
+              ) top
+              LEFT JOIN storage.folders fo ON fo.id = top.folder_id
+              LEFT JOIN storage.file_metadata fm ON fm.file_id = top.id
+             ORDER BY top.media_sort_date DESC
             "#,
         );
         let rows: Vec<MediaFileRow> = sqlx::query_as(&sql)
@@ -670,9 +679,9 @@ impl FileReadPort for FileBlobReadRepository {
         let row = sqlx::query_as::<
             _,
             (
-                String,         // id
+                Uuid,           // id (binary decode)
                 String,         // name
-                Option<String>, // folder_id
+                Option<Uuid>,   // folder_id
                 Option<String>, // folder path
                 i64,            // size
                 String,         // mime_type
@@ -684,7 +693,7 @@ impl FileReadPort for FileBlobReadRepository {
             ),
         >(
             r#"
-            SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+            SELECT fi.id, fi.name, fi.folder_id, fo.path,
                    fi.size, fi.mime_type,
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
                    EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -717,9 +726,9 @@ impl FileReadPort for FileBlobReadRepository {
         let row = sqlx::query_as::<
             _,
             (
+                Uuid,
                 String,
-                String,
-                Option<String>,
+                Option<Uuid>,
                 Option<String>,
                 i64,
                 String,
@@ -731,7 +740,7 @@ impl FileReadPort for FileBlobReadRepository {
             ),
         >(
             r#"
-            SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+            SELECT fi.id, fi.name, fi.folder_id, fo.path,
                    fi.size, fi.mime_type,
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
                    EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -759,7 +768,7 @@ impl FileReadPort for FileBlobReadRepository {
         let rows: Vec<FileRow> = if let Some(fid) = folder_id {
             sqlx::query_as(
                 r#"
-                SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+                SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -778,7 +787,7 @@ impl FileReadPort for FileBlobReadRepository {
         } else {
             sqlx::query_as(
                 r#"
-                SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+                SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -839,7 +848,7 @@ impl FileReadPort for FileBlobReadRepository {
         };
         let sql = format!(
             r#"
-            SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+            SELECT fi.id, fi.name, fi.folder_id, fo.path,
                    fi.size, fi.mime_type,
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
                    EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -912,7 +921,7 @@ impl FileReadPort for FileBlobReadRepository {
         .map_err(|e| DomainError::internal_error("FileBlobRead", format!("path: {e}")))?
         .ok_or_else(|| DomainError::not_found("File", id))?;
 
-        Ok(Self::make_file_path(row.1.as_deref(), &row.0))
+        Ok(StoragePath::from_folder_and_name(row.1.as_deref(), &row.0).0)
     }
 
     async fn get_parent_folder_id(
@@ -1005,9 +1014,9 @@ impl FileReadPort for FileBlobReadRepository {
             sqlx::query_as::<
                 _,
                 (
+                    Uuid,
                     String,
-                    String,
-                    Option<String>,
+                    Option<Uuid>,
                     Option<String>,
                     i64,
                     String,
@@ -1019,7 +1028,7 @@ impl FileReadPort for FileBlobReadRepository {
                 ),
             >(
                 r#"
-                SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+                SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -1043,9 +1052,9 @@ impl FileReadPort for FileBlobReadRepository {
             sqlx::query_as::<
                 _,
                 (
+                    Uuid,
                     String,
-                    String,
-                    Option<String>,
+                    Option<Uuid>,
                     Option<String>,
                     i64,
                     String,
@@ -1057,7 +1066,7 @@ impl FileReadPort for FileBlobReadRepository {
                 ),
             >(
                 r#"
-                SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+                SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -1098,12 +1107,12 @@ impl FileReadPort for FileBlobReadRepository {
 
         let stream = async_stream::try_stream! {
             let mut row_stream = sqlx::query_as::<_, (
-                String, String, Option<String>, Option<String>,
+                Uuid, String, Option<Uuid>, Option<String>,
                 i64, String, i64, i64, String,
                 Option<Uuid>, Option<Uuid>, // created_by, updated_by (§14)
             )>(
                 r#"
-                SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+                SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -1186,7 +1195,7 @@ impl FileReadPort for FileBlobReadRepository {
         let offset_bind = bind_idx + 2;
 
         let sql = format!(
-            "SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path, \
+            "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
@@ -1205,9 +1214,9 @@ impl FileReadPort for FileBlobReadRepository {
         let mut query = sqlx::query_as::<
             _,
             (
+                Uuid,
                 String,
-                String,
-                Option<String>,
+                Option<Uuid>,
                 Option<String>,
                 i64,
                 String,
@@ -1318,7 +1327,7 @@ impl FileReadPort for FileBlobReadRepository {
 
         // ── Single query with COUNT(*) OVER() ──
         let sql = format!(
-            "SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path, \
+            "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
                     EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
@@ -1337,9 +1346,9 @@ impl FileReadPort for FileBlobReadRepository {
         let mut query = sqlx::query_as::<
             _,
             (
+                Uuid,
                 String,
-                String,
-                Option<String>,
+                Option<Uuid>,
                 Option<String>,
                 i64,
                 String,
@@ -1404,14 +1413,22 @@ impl FileReadPort for FileBlobReadRepository {
         folder_id: Option<&str>,
         query: &str,
         limit: usize,
+        caller_id: Uuid,
     ) -> Result<Vec<File>, DomainError> {
+        // Scope by drive membership: `CALLER_CAN_READ_DRIVE` (`$1` =
+        // caller_id) restricts the result set to files whose owning drive
+        // the caller has any active `role_grants` on — direct or via a
+        // transitive group cascade. Pre-fix, the query only filtered on
+        // `NOT is_trashed AND name ILIKE $pattern`, exposing names + paths
+        // across every tenant on the instance (AuthZ audit finding #1,
+        // 2026-07-12).
         let pattern = super::like_escape(query);
         let limit_i64 = limit as i64;
 
         let rows: Vec<FileRow> = if let Some(fid) = folder_id {
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 r#"
-                SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
+                SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
                        EXTRACT(EPOCH FROM fi.updated_at)::bigint,
@@ -1420,7 +1437,40 @@ impl FileReadPort for FileBlobReadRepository {
                    fi.created_by, fi.updated_by
                   FROM storage.files fi
                   LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
-                 WHERE fi.folder_id = $1::uuid
+                 WHERE {CALLER_CAN_READ_DRIVE}
+                   AND fi.folder_id = $2::uuid
+                   AND NOT fi.is_trashed
+                   AND fi.name ILIKE $3
+                 ORDER BY CASE
+                            WHEN fi.name ILIKE $4 THEN 0
+                            WHEN fi.name ILIKE $4 || '%' THEN 1
+                            ELSE 2
+                          END,
+                          fi.name
+                 LIMIT $5
+                "#
+            ))
+            .bind(caller_id)
+            .bind(fid)
+            .bind(&pattern)
+            .bind(query)
+            .bind(limit_i64)
+            .fetch_all(self.pool.as_ref())
+            .await
+        } else {
+            sqlx::query_as(&format!(
+                r#"
+                SELECT fi.id, fi.name, fi.folder_id, fo.path,
+                       fi.size, fi.mime_type,
+                       EXTRACT(EPOCH FROM fi.created_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       fi.blob_hash,
+
+                   fi.created_by, fi.updated_by
+                  FROM storage.files fi
+                  LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
+                 WHERE {CALLER_CAN_READ_DRIVE}
+                   AND fi.folder_id IS NULL
                    AND NOT fi.is_trashed
                    AND fi.name ILIKE $2
                  ORDER BY CASE
@@ -1430,38 +1480,9 @@ impl FileReadPort for FileBlobReadRepository {
                           END,
                           fi.name
                  LIMIT $4
-                "#,
-            )
-            .bind(fid)
-            .bind(&pattern)
-            .bind(query)
-            .bind(limit_i64)
-            .fetch_all(self.pool.as_ref())
-            .await
-        } else {
-            sqlx::query_as(
-                r#"
-                SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
-                       fi.size, fi.mime_type,
-                       EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
-                       fi.blob_hash,
-
-                   fi.created_by, fi.updated_by
-                  FROM storage.files fi
-                  LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
-                 WHERE fi.folder_id IS NULL
-                   AND NOT fi.is_trashed
-                   AND fi.name ILIKE $1
-                 ORDER BY CASE
-                            WHEN fi.name ILIKE $2 THEN 0
-                            WHEN fi.name ILIKE $2 || '%' THEN 1
-                            ELSE 2
-                          END,
-                          fi.name
-                 LIMIT $3
-                "#,
-            )
+                "#
+            ))
+            .bind(caller_id)
             .bind(&pattern)
             .bind(query)
             .bind(limit_i64)

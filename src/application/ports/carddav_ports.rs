@@ -37,6 +37,12 @@ pub trait ContactStoragePort: Send + Sync + 'static {
     ) -> Result<AddressBook, DomainError>;
     async fn delete_address_book(&self, id: &Uuid) -> Result<(), DomainError>;
     async fn get_address_book_by_id(&self, id: &Uuid) -> Result<Option<AddressBook>, DomainError>;
+
+    /// Batch sibling of [`Self::get_address_book_by_id`]: hydrate a page
+    /// of grant-derived ids in ONE storage round-trip. Missing rows drop
+    /// out silently; ordering is not guaranteed.
+    async fn get_address_books_by_ids(&self, ids: &[Uuid])
+    -> Result<Vec<AddressBook>, DomainError>;
     async fn get_public_address_books(&self) -> Result<Vec<AddressBook>, DomainError>;
 
     // ── Contacts ─────────────────────────────────────────────────
@@ -60,6 +66,12 @@ pub trait ContactStoragePort: Send + Sync + 'static {
         &self,
         address_book_id: &Uuid,
     ) -> Result<Vec<Contact>, DomainError>;
+    /// Cursor stream over the book's contacts in listing order — feeds
+    /// the streaming CardDAV emitters.
+    fn stream_contacts_by_book(
+        &self,
+        address_book_id: Uuid,
+    ) -> futures::stream::BoxStream<'static, Result<Contact, DomainError>>;
     async fn get_contacts_by_address_book_paginated(
         &self,
         address_book_id: &Uuid,
@@ -168,6 +180,15 @@ pub trait ContactUseCase: Send + Sync + 'static {
     /// List contacts in an address book. `limit`/`offset` bound the
     /// result for paginated callers (REST API); `None` returns the full
     /// book, which the CardDAV listing/sync paths rely on.
+    /// Streaming support: cursor over the book's contacts (same Read
+    /// gate as [`Self::list_contacts`], checked once before the cursor
+    /// opens).
+    async fn stream_contacts_by_book(
+        &self,
+        address_book_id: &str,
+        user_id: Uuid,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ContactDto, DomainError>>, DomainError>;
+
     async fn list_contacts(
         &self,
         address_book_id: &str,

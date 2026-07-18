@@ -494,12 +494,14 @@ impl AddressBookUseCase for ContactService {
 
         let mut address_book_map = std::collections::HashMap::new();
 
-        for id in book_ids {
-            // Missing rows (deleted / trashed race) drop out silently
-            // — matches the calendar-listing carve-out.
-            if let Ok(Some(book)) = self.contact_storage.get_address_book_by_id(&id).await {
-                address_book_map.insert(*book.id(), book);
-            }
+        // Hydrate in ONE `= ANY` round-trip (was one point SELECT per
+        // accessible book — K serial round-trips on every CardDAV
+        // discovery poll). Missing rows (deleted / trashed race) drop
+        // out of the result set — matches the calendar-listing
+        // carve-out.
+        let ids: Vec<Uuid> = book_ids.into_iter().collect();
+        for book in self.contact_storage.get_address_books_by_ids(&ids).await? {
+            address_book_map.insert(*book.id(), book);
         }
 
         // Public address books surface for every authenticated caller
@@ -533,10 +535,16 @@ impl ContactUseCase for ContactService {
         let address_book_id = Uuid::parse_str(&dto.address_book_id)
             .map_err(|_| DomainError::validation_error("Invalid address book ID format"))?;
 
-        // Check if user has write access to the address book
+        // AuthZ audit #19 (2026-07-12): previously required
+        // `Permission::Update`, which is NOT in the Contributor bundle
+        // (Read + Create) — Contributor grantees on a shared address
+        // book couldn't add contacts via REST or CardDAV PUT despite
+        // holding the intended Create permission. `Delete` uses Delete
+        // (audit #13, above); creation must use Create. Same fix
+        // applied to `create_contact_from_vcard` + `create_group`.
         let caller_id = Uuid::parse_str(&dto.user_id)
             .map_err(|_| DomainError::validation_error("Invalid user ID format"))?;
-        self.require_address_book_perm(&address_book_id, &caller_id, Permission::Update)
+        self.require_address_book_perm(&address_book_id, &caller_id, Permission::Create)
             .await?;
 
         // Convert DTOs to domain entities
@@ -612,10 +620,13 @@ impl ContactUseCase for ContactService {
         let address_book_id = Uuid::parse_str(&dto.address_book_id)
             .map_err(|_| DomainError::validation_error("Invalid address book ID format"))?;
 
-        // Check if user has write access to the address book
+        // AuthZ audit #19 — see the sibling `create_contact` above.
+        // This is the CardDAV `PUT contact.vcf` entry point; the fix
+        // unblocks Contributor grantees creating contacts through the
+        // CardDAV protocol as well as the REST surface.
         let caller_id = Uuid::parse_str(&dto.user_id)
             .map_err(|_| DomainError::validation_error("Invalid user ID format"))?;
-        self.require_address_book_perm(&address_book_id, &caller_id, Permission::Update)
+        self.require_address_book_perm(&address_book_id, &caller_id, Permission::Create)
             .await?;
 
         // Parse vCard data
@@ -754,8 +765,14 @@ impl ContactUseCase for ContactService {
             .await?
             .ok_or_else(|| DomainError::not_found("Contact", "not found"))?;
 
-        // Check if user has write access to the address book
-        self.require_address_book_perm(contact.address_book_id(), &user_id, Permission::Update)
+        // AuthZ audit #13 (2026-07-12): previously required
+        // `Permission::Update`, which the Editor role bundle satisfies
+        // (Read + Comment + Create + Update). Every Editor grantee on a
+        // shared address book could delete individual contacts — a
+        // silent privilege escalation because the intent for CardDAV
+        // deletion is Delete, not Update. Sibling
+        // `CalendarService::delete_event` was the ground-truth pattern.
+        self.require_address_book_perm(contact.address_book_id(), &user_id, Permission::Delete)
             .await?;
 
         // Delete the contact
@@ -823,6 +840,25 @@ impl ContactUseCase for ContactService {
         Ok(contacts.into_iter().map(ContactDto::from).collect())
     }
 
+    async fn stream_contacts_by_book(
+        &self,
+        address_book_id: &str,
+        user_id: Uuid,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ContactDto, DomainError>>, DomainError>
+    {
+        use futures::StreamExt;
+        let id = Uuid::parse_str(address_book_id)
+            .map_err(|_| DomainError::validation_error("Invalid address book ID format"))?;
+        // Same Read gate as `list_contacts`, once, before the cursor.
+        self.require_address_book_read_or_public(&id, &user_id)
+            .await?;
+        Ok(Box::pin(
+            self.contact_storage
+                .stream_contacts_by_book(id)
+                .map(|r| r.map(ContactDto::from)),
+        ))
+    }
+
     async fn list_contacts(
         &self,
         address_book_id: &str,
@@ -881,10 +917,10 @@ impl ContactUseCase for ContactService {
         let address_book_id = Uuid::parse_str(&dto.address_book_id)
             .map_err(|_| DomainError::validation_error("Invalid address book ID format"))?;
 
-        // Check if user has write access to the address book
+        // AuthZ audit #19 — see the sibling `create_contact` above.
         let caller_id = Uuid::parse_str(&dto.user_id)
             .map_err(|_| DomainError::validation_error("Invalid user ID format"))?;
-        self.require_address_book_perm(&address_book_id, &caller_id, Permission::Update)
+        self.require_address_book_perm(&address_book_id, &caller_id, Permission::Create)
             .await?;
 
         let group = ContactGroup::new(address_book_id, dto.name);
@@ -938,8 +974,11 @@ impl ContactUseCase for ContactService {
             .await?
             .ok_or_else(|| DomainError::not_found("Contact group", "not found"))?;
 
-        // Check if user has write access to the address book
-        self.require_address_book_perm(group.address_book_id(), &user_id, Permission::Update)
+        // AuthZ audit #13 (2026-07-12): see the sibling `delete_contact`
+        // above — required `Update` (in the Editor bundle) instead of
+        // `Delete`, letting any Editor on a shared address book delete
+        // groups they shouldn't.
+        self.require_address_book_perm(group.address_book_id(), &user_id, Permission::Delete)
             .await?;
 
         // Delete the group

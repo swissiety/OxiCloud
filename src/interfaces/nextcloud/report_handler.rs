@@ -10,9 +10,7 @@ use quick_xml::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::application::dtos::display_helpers::{
-    category_for, format_file_size, icon_class_for, icon_special_class_for,
-};
+use crate::application::dtos::display_helpers::format_file_size;
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
 use crate::application::dtos::search_dto::SearchCriteriaDto;
@@ -26,7 +24,7 @@ use crate::interfaces::api::handlers::webdav_handler::{
 };
 use crate::interfaces::errors::AppError;
 use crate::interfaces::nextcloud::webdav_handler::{
-    batch_resolve_ids, format_oc_id, nc_href, write_file_response, write_folder_response,
+    batch_resolve_ids, format_oc_id, nc_href, nc_id_of, write_file_response, write_folder_response,
 };
 
 /// Handle WebDAV REPORT and SEARCH methods for Nextcloud compatibility.
@@ -150,8 +148,8 @@ async fn handle_filter_files(
     }
 
     // Pass 2: resolve every oc:fileid in two batch queries (was one per item).
-    let file_uuids: Vec<String> = files.iter().map(|f| f.id.clone()).collect();
-    let folder_uuids: Vec<String> = folders.iter().map(|f| f.id.clone()).collect();
+    let file_uuids: Vec<&str> = files.iter().map(|f| f.id.as_str()).collect();
+    let folder_uuids: Vec<&str> = folders.iter().map(|f| f.id.as_str()).collect();
     let (file_id_map, folder_id_map) =
         batch_resolve_ids(file_id_svc, &file_uuids, &folder_uuids).await;
 
@@ -184,7 +182,7 @@ async fn handle_filter_files(
                 continue;
             };
             let href = nc_href(url_user, subpath);
-            let fid = file_id_map.get(&file.id).copied();
+            let fid = nc_id_of(&file_id_map, &file.id);
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             let dead = dead_props_for(&file.id, &file_deads);
             write_file_response(
@@ -210,7 +208,7 @@ async fn handle_filter_files(
                 continue;
             };
             let href = format!("{}/", nc_href(url_user, subpath));
-            let fid = folder_id_map.get(&folder.id).copied();
+            let fid = nc_id_of(&folder_id_map, &folder.id);
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             let dead = dead_props_for(&folder.id, &folder_deads);
             write_folder_response(
@@ -297,8 +295,8 @@ async fn handle_search(
     // (was one INSERT round-trip per result).
     let files: Vec<FileDto> = results.files.iter().map(file_dto_from_search).collect();
     let folders: Vec<FolderDto> = results.folders.iter().map(folder_dto_from_search).collect();
-    let file_uuids: Vec<String> = files.iter().map(|f| f.id.clone()).collect();
-    let folder_uuids: Vec<String> = folders.iter().map(|f| f.id.clone()).collect();
+    let file_uuids: Vec<&str> = files.iter().map(|f| f.id.as_str()).collect();
+    let folder_uuids: Vec<&str> = folders.iter().map(|f| f.id.as_str()).collect();
     let (file_id_map, folder_id_map) =
         batch_resolve_ids(file_id_svc, &file_uuids, &folder_uuids).await;
 
@@ -325,7 +323,7 @@ async fn handle_search(
                 continue;
             };
             let href = nc_href(url_user, subpath);
-            let fid = file_id_map.get(&file.id).copied();
+            let fid = nc_id_of(&file_id_map, &file.id);
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             let dead = dead_props_for(&file.id, &file_deads);
             write_file_response(
@@ -352,7 +350,7 @@ async fn handle_search(
                 continue;
             };
             let href = format!("{}/", nc_href(url_user, subpath));
-            let fid = folder_id_map.get(&folder.id).copied();
+            let fid = nc_id_of(&folder_id_map, &folder.id);
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             let dead = dead_props_for(&folder.id, &folder_deads);
             write_folder_response(
@@ -401,15 +399,16 @@ fn file_dto_from_search(fr: &crate::application::dtos::search_dto::SearchFileRes
         name: fr.name.clone(),
         path: fr.path.clone(),
         size: fr.size,
-        mime_type: fr.mime_type.clone().into(),
+        // Interned `Arc<str>` carried through from enrichment — refcount
+        // bumps; the old code re-ran all three display classifiers and
+        // re-allocated each value per converted search row.
+        mime_type: fr.mime_type.clone(),
         folder_id: fr.folder_id.clone(),
         created_at: fr.created_at,
         modified_at: fr.modified_at,
-        icon_class: icon_class_for(&fr.name, &fr.mime_type).to_string().into(),
-        icon_special_class: icon_special_class_for(&fr.name, &fr.mime_type)
-            .to_string()
-            .into(),
-        category: category_for(&fr.name, &fr.mime_type).to_string().into(),
+        icon_class: fr.icon_class.clone(),
+        icon_special_class: fr.icon_special_class.clone(),
+        category: fr.category.clone(),
         size_formatted: format_file_size(fr.size),
         sort_date: None,
         content_hash: fr.blob_hash.clone(),
@@ -418,6 +417,16 @@ fn file_dto_from_search(fr: &crate::application::dtos::search_dto::SearchFileRes
         created_by: None,
         updated_by: None,
     }
+}
+
+/// Bench-only public wrapper (feature = "bench") over the private
+/// search→FileDto conversion so `examples/bench_search_enrich.rs` can
+/// measure and equivalence-gate it.
+#[cfg(feature = "bench")]
+pub fn file_dto_from_search_for_bench(
+    fr: &crate::application::dtos::search_dto::SearchFileResultDto,
+) -> FileDto {
+    file_dto_from_search(fr)
 }
 
 /// Build a `FolderDto` from a search folder result.

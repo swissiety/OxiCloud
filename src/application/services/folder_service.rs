@@ -429,6 +429,62 @@ impl FolderUseCase for FolderService {
         Ok(response)
     }
 
+    /// Keyset-paged sub-folder listing (name order), caller-scoped.
+    ///
+    /// AuthZ mirrors `list_folders_paginated_with_perms`: one
+    /// `authz.require(Read)` on the parent per batch; root scope goes
+    /// through the caller's drive-membership listing.
+    async fn list_folders_batch_with_perms(
+        &self,
+        parent_id: Option<&str>,
+        caller_id: Uuid,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FolderDto>, DomainError> {
+        match parent_id {
+            Some(pid) => {
+                self.authz
+                    .require(
+                        Subject::User(caller_id),
+                        Permission::Read,
+                        Self::folder_resource(pid)?,
+                    )
+                    .await?;
+                let folders = self
+                    .folder_storage
+                    .list_folders_batch(parent_id, after_name, limit)
+                    .await
+                    .map_err(|e| {
+                        DomainError::internal_error(
+                            "FolderStorage",
+                            format!("Failed to batch-list folders in parent {pid}: {e}"),
+                        )
+                    })?;
+                Ok(folders.into_iter().map(FolderDto::from).collect())
+            }
+            None => {
+                // Root scope: one row per readable drive — a handful.
+                let mut all = self
+                    .folder_storage
+                    .list_root_folders_for_caller(caller_id)
+                    .await
+                    .map_err(|e| {
+                        DomainError::internal_error(
+                            "FolderStorage",
+                            format!("Failed to batch-list root folders for '{caller_id}': {e}"),
+                        )
+                    })?;
+                all.sort_by(|a, b| a.name().cmp(b.name()));
+                Ok(all
+                    .into_iter()
+                    .filter(|f| after_name.is_none_or(|a| f.name() > a))
+                    .take(limit)
+                    .map(FolderDto::from)
+                    .collect())
+            }
+        }
+    }
+
     /// Lists folders with pagination, scoped to a specific owner.
     async fn list_folders_paginated_with_perms(
         &self,
@@ -525,7 +581,7 @@ impl FolderUseCase for FolderService {
             )
             .await?;
 
-        let folder = self
+        let renamed = self
             .folder_storage
             .rename_folder(id, dto.name, caller_id)
             .await
@@ -536,7 +592,26 @@ impl FolderUseCase for FolderService {
                 )
             })?;
 
-        Ok(FolderDto::from(folder))
+        // Root folders double as the drive's display name (see the
+        // `required_perm` branch above and `drive_pg_repository.rs`
+        // `readable_cache` + `default_drive_cache` docs).
+        // `drives.name` is sourced from `folders.name` of the root
+        // folder, so a rename affects BOTH caches — every user's
+        // readable-drive list AND the per-user default-drive lookup.
+        // Both are 30 s TTL; without the invalidation, `GET /api/drives`
+        // returns the stale name for up to that window after a root
+        // rename. Surfaced by `tests/api/drives_membership.hurl`
+        // Step 23. Regression from commit `12dc648c` ("perf: round 4 —
+        // drive-selector cache") which added the caches without
+        // wiring the root-rename invalidation.
+        if folder.parent_id().is_none()
+            && let Some(drive_repo) = &self.drive_repo
+        {
+            drive_repo.invalidate_readable_all();
+            drive_repo.invalidate_default_drive_all();
+        }
+
+        Ok(FolderDto::from(renamed))
     }
 
     /// Moves a folder to a new parent. Requires `Update` on the source and

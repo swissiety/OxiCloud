@@ -310,6 +310,10 @@ pub struct AzureStorageConfig {
     pub container: String,
     /// Optional SAS token (alternative to account key).
     pub sas_token: Option<String>,
+    /// Optional custom endpoint (Azurite emulator, private deployments,
+    /// benches). `None` = the public cloud URL derived from the account
+    /// name. Mirrors S3's `endpoint_url`.
+    pub endpoint_url: Option<String>,
 }
 
 /// LRU local disk cache configuration for remote blob backends.
@@ -1250,6 +1254,33 @@ impl Default for ContentSearchConfig {
     }
 }
 
+/// Search-results cache configuration — the per-user results-page cache
+/// inside `SearchService`, not the Tantivy content index above.
+///
+/// The cache is **byte-bounded**: each entry is weighed by the approximate
+/// heap size of its result page (see `search_results_entry_weight`) and moka
+/// evicts once the summed weight exceeds `max_bytes` — the same byte-budget
+/// pattern the file-content cache and the dedup manifest cache use. This
+/// replaced an entry-count capacity: with cache keys spanning
+/// user × query × offset × limit and up to 500 enriched rows per page, an
+/// entry count said nothing about resident memory (1000 entries could pin
+/// ~300 MB for the TTL). No entry-count knob is kept — bytes are the only
+/// dimension that matters here.
+#[derive(Debug, Clone)]
+pub struct SearchCacheConfig {
+    /// Byte budget for cached search-result pages. Default: 32 MiB.
+    /// Env: `OXICLOUD_SEARCH_CACHE_MAX_BYTES`.
+    pub max_bytes: u64,
+}
+
+impl Default for SearchCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
 /// WASM plugin runtime configuration (M0 walking skeleton).
 ///
 /// The runtime is doubly gated: it is only compiled when the `plugins` cargo
@@ -1375,6 +1406,8 @@ pub struct AppConfig {
     pub i18n: I18nConfig,
     /// Content-search configuration (embedded full-text index)
     pub content_search: ContentSearchConfig,
+    /// Search-results cache configuration (byte-bounded moka cache)
+    pub search_cache: SearchCacheConfig,
     /// WASM plugin runtime configuration
     pub plugins: PluginConfig,
     /// Face-recognition (People) model configuration
@@ -1431,6 +1464,7 @@ impl Default for AppConfig {
             magic_link: MagicLinkConfig::default(),
             i18n: I18nConfig::default(),
             content_search: ContentSearchConfig::default(),
+            search_cache: SearchCacheConfig::default(),
             plugins: PluginConfig::default(),
             faces: FacesConfig::default(),
         }
@@ -1934,6 +1968,13 @@ impl AppConfig {
             config.content_search.max_text_bytes = val;
         }
 
+        // Search-results cache (byte-bounded)
+        if let Ok(v) = env::var("OXICLOUD_SEARCH_CACHE_MAX_BYTES").map(|v| v.parse::<u64>())
+            && let Ok(val) = v
+        {
+            config.search_cache.max_bytes = val;
+        }
+
         // WASM plugin runtime
         if let Ok(v) = env::var("OXICLOUD_ENABLE_PLUGINS").map(|v| v.parse::<bool>())
             && let Ok(val) = v
@@ -2103,6 +2144,7 @@ impl AppConfig {
                 account_key: env::var("OXICLOUD_AZURE_ACCOUNT_KEY").unwrap_or_default(),
                 container,
                 sas_token: env::var("OXICLOUD_AZURE_SAS_TOKEN").ok(),
+                endpoint_url: env::var("OXICLOUD_AZURE_ENDPOINT_URL").ok(),
             });
         }
 

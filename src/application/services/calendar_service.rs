@@ -189,17 +189,13 @@ impl CalendarUseCase for CalendarService {
             })
             .collect();
 
-        // Hydrate DTOs. `get_calendar` misses on trashed / deleted
-        // calendars — those are dropped from the listing rather than
-        // erroring, so a lifecycle-race doesn't turn a PROPFIND into
-        // a 5xx.
-        let mut out = Vec::with_capacity(calendar_ids.len());
-        for id in calendar_ids {
-            if let Ok(dto) = self.calendar_storage.get_calendar(&id.to_string()).await {
-                out.push(dto);
-            }
-        }
-        Ok(out)
+        // Hydrate DTOs in ONE `= ANY` round-trip (was one point SELECT
+        // per accessible calendar — K serial round-trips on every
+        // CalDAV discovery poll). Missing rows (deleted/trashed race)
+        // drop out of the result set instead of erroring, so a
+        // lifecycle-race still doesn't turn a PROPFIND into a 5xx.
+        let ids: Vec<Uuid> = calendar_ids.into_iter().collect();
+        self.calendar_storage.get_calendars_by_ids(&ids).await
     }
 
     async fn list_public_calendars(
@@ -358,6 +354,28 @@ impl CalendarUseCase for CalendarService {
                 .list_events_by_calendar(calendar_id)
                 .await
         }
+    }
+
+    async fn stream_events_uid_order(
+        &self,
+        calendar_id: &str,
+        user_id: Uuid,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<CalendarEventDto, DomainError>>,
+        DomainError,
+    > {
+        // Same Read gate as `list_events`, checked ONCE before the
+        // cursor opens — the stream itself carries no further authz
+        // (single request, same caller, same resource).
+        let calendar = self.calendar_storage.get_calendar(calendar_id).await?;
+        let allowed = calendar.is_public
+            || self
+                .has_calendar_perm(calendar_id, user_id, Permission::Read)
+                .await?;
+        if !allowed {
+            return Err(DomainError::not_found("Calendar", calendar_id));
+        }
+        Ok(self.calendar_storage.stream_events_uid_order(calendar_id))
     }
 
     async fn get_events_in_range(
