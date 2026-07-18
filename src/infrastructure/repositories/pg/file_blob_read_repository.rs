@@ -625,10 +625,12 @@ impl FileBlobReadRepository {
             SELECT count(*)              AS n,
                    avg(fm.longitude)     AS clng,
                    avg(fm.latitude)      AS clat,
-                   -- Cast once per cluster, not once per row: uuid byte
-                   -- order == canonical-text order, so the chosen sample
-                   -- is identical (benches/ROUND11.md §Q4).
-                   min(fm.file_id)::text AS sample_id
+                   -- NOTE: `min(fm.file_id)::text` (cast per cluster, not
+                   -- per row) was attempted in ROUND11 §Q4 and REJECTED by
+                   -- its benchmark gate: PostgreSQL has no `min(uuid)`
+                   -- aggregate, and adding a custom one is schema surface
+                   -- this viewport query doesn't justify.
+                   min(fm.file_id::text) AS sample_id
               FROM storage.file_metadata fm
               JOIN storage.files fi ON fi.id = fm.file_id
              WHERE fi.drive_id IN (

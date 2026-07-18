@@ -7,7 +7,6 @@ pub enum TrashedItemType {
     Folder,
 }
 
-#[derive(Debug, Clone)]
 /// Owned decomposition of a [`TrashedItem`] (see
 /// [`TrashedItem::into_parts`]).
 pub struct TrashedItemParts {
@@ -19,6 +18,7 @@ pub struct TrashedItemParts {
     pub trashed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
 pub struct TrashedItem {
     id: Uuid,
     original_id: Uuid,

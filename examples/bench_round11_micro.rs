@@ -8,14 +8,17 @@
 //! Sections (all pure CPU, no Postgres):
 //!    1. REST download `FileDto` dead clone vs mime/size capture + move
 //!    2. Single-resource GET/HEAD `Last-Modified`: chrono `to_rfc2822()`
-//!       vs `common::fmt::rfc2822_utc` stack render (gate: byte-identical)
+//!       vs `common::fmt::rfc2822_utc` stack render (gate: byte-identical).
+//!       VERDICT: header port REJECTED — the chrono String is already the
+//!       terminal allocation; only body-emit sites benefit.
 //!    3. `/status.php` poll: rebuild `json!` + serialize vs `OnceLock<Bytes>`
 //!       (gate: byte-identical)
 //!    4. NC chunk-upload session PROPFIND: `push_str(&format!)` + chrono
 //!       per chunk vs `with_capacity` + `write!` + stack dates
 //!       (gate: byte-identical XML)
-//!    5. RateLimiter: 2 key allocs + entry+insert vs 1 alloc + single
-//!       `and_upsert_with` (gate: identical allow/deny + counts)
+//!    5. RateLimiter: 2 key allocs + entry+insert vs (a) `and_upsert_with`
+//!       [REJECTED: slower + more allocs] vs (b) lock-free get + insert
+//!       [ADOPTED] (gate: identical counter sequences)
 //!    6. CSRF header token: `to_string` vs borrow compare (gate: same bool)
 //!    7. Thumbnail ETag: `{:?}` Debug enums vs `as_str` + push (gate: bytes)
 //!    8. Recent-handler id: `Uuid::to_string` vs stack `encode_lower`

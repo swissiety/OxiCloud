@@ -312,7 +312,13 @@ async fn direct_grant_query(pool: &PgPool, subject: Uuid, cal: Uuid) -> bool {
     )
     .bind(vec!["user"])
     .bind(vec![subject])
-    .bind(vec!["reader", "contributor", "manager", "owner"])
+    .bind(vec![
+        "owner",
+        "editor",
+        "contributor",
+        "commenter",
+        "viewer",
+    ])
     .bind("calendar")
     .bind(cal)
     .fetch_optional(pool)
@@ -546,11 +552,15 @@ async fn section_geo(pool: &PgPool, s: &Seed, passes: usize) {
     }
     tx.commit().await.expect("commit geo seed");
 
-    let mut b = geo_query(pool, s.owner, "min(fm.file_id::text)").await;
-    let mut a = geo_query(pool, s.owner, "min(fm.file_id)::text").await;
-    b.sort_by(|x, y| x.3.cmp(&y.3));
-    a.sort_by(|x, y| x.3.cmp(&y.3));
-    gate("cluster rows identical", a == b);
+    // REJECTED BY GATE: PostgreSQL has no `min(uuid)` aggregate — the
+    // planned `min(fm.file_id)::text` (cast per cluster) fails to parse, so
+    // the per-row-cast original stays. Verify the rejection reproducibly
+    // and record the BEFORE for the doc.
+    let min_uuid_err = sqlx::query("SELECT min(fm.file_id)::text FROM storage.file_metadata fm")
+        .fetch_optional(pool)
+        .await
+        .is_err();
+    gate("min(uuid) unsupported → AFTER rejected", min_uuid_err);
 
     let (ms_b, _) = timed(passes.min(60), || async {
         geo_query(pool, s.owner, "min(fm.file_id::text)")
@@ -558,14 +568,7 @@ async fn section_geo(pool: &PgPool, s: &Seed, passes: usize) {
             .len()
     })
     .await;
-    let (ms_a, _) = timed(passes.min(60), || async {
-        geo_query(pool, s.owner, "min(fm.file_id)::text")
-            .await
-            .len()
-    })
-    .await;
-    println!("    BEFORE min(file_id::text)  p50 {ms_b:.3} ms");
-    println!("    AFTER  min(file_id)::text  p50 {ms_a:.3} ms");
+    println!("    BEFORE min(file_id::text)  p50 {ms_b:.3} ms   (AFTER rejected — see gate)");
 
     let _ = sqlx::query("DELETE FROM storage.files WHERE drive_id = $1 AND name LIKE 'geo-%'")
         .bind(s.drive)

@@ -20,10 +20,6 @@ tower-http = { version = "0.6.11", features = ["fs", "compression-gzip", "compre
 flate2 = "1.1.9"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# Round-11: moves log formatting+write off the async workers. `lossy(false)`
-# so audit lines are never dropped (emitters block only when the 128k-line
-# channel is full — backpressure, not loss). See benches/ROUND11.md.
-tracing-appender = "0.2"
 chrono = { version = "0.4.45", features = ["serde"] }
 # RFC 5545 iCalendar parser + emitter.
 #
@@ -146,6 +142,10 @@ bench = []
 
 [dev-dependencies]
 criterion = "0.5"
+# Round-11 L1 harness only (bench_log_writer): the non-blocking writer was
+# REJECTED for production — slower than sync on fast sinks and can lose
+# buffered tail lines at shutdown on slow ones (benches/ROUND11.md).
+tracing-appender = "0.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(integration_tests)'] }
