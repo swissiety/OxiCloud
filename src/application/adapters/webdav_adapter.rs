@@ -1710,7 +1710,7 @@ impl WebDavAdapter {
     /// Found</D:status>` instead of a `<D:propstat>` block.
     ///
     /// `subfolders`/`files`/`deleted` all take already-encoded hrefs —
-    /// encoding is the handler's job (see `encode_path_segment` in
+    /// encoding is the handler's job (`PATH_SEGMENT_ENCODE_SET` in
     /// `webdav_handler.rs`), matching how every other `write_*_entry*`
     /// caller in this module is fed pre-built hrefs.
     pub fn generate_sync_collection_response<W: Write>(
