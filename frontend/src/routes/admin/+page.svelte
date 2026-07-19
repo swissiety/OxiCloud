@@ -1136,11 +1136,14 @@
 			);
 			// The shared `drivesStore` (feeds `/config/drive/{uuid}`, the
 			// sidebar picker, the breadcrumb) caches `GET /api/drives` with
-			// `loaded=true` after the first fetch — without this invalidate
+			// `loaded=true` after the first fetch — without this refresh
 			// call the admin's policy change wouldn't propagate to those
 			// surfaces until a full page reload. Sibling `requestDeleteDrive`
 			// does the same after `deleteDriveAdmin`.
-			drivesStore.invalidate();
+			//
+			// Fire-and-forget: the modal closes immediately; the picker
+			// re-renders in place when the promise settles a few ms later.
+			void drivesStore.refresh();
 			closeManagePolicies();
 		} catch (e) {
 			managePoliciesError = errorMessage(e);
@@ -1168,10 +1171,10 @@
 		try {
 			await deleteDriveAdmin(d.id);
 			// Refresh the listing + the sidebar picker. Both have a cached
-			// view of this drive; without the invalidate the row lingers
+			// view of this drive; without the refresh the row lingers
 			// until the next full reload.
 			await loadDrivesTab();
-			drivesStore.invalidate();
+			await drivesStore.refresh();
 			ui.notify(t('admin.drive_deleted', 'Drive deleted.'), 'success');
 		} catch (e) {
 			reportError(e);
@@ -1205,10 +1208,10 @@
 			});
 			driveCreateOpen = false;
 			await loadDrivesTab();
-			// The global drives store backs the sidebar picker; drop its cache
+			// The global drives store backs the sidebar picker; re-fetch it
 			// so the new drive shows up for every consumer (picker, breadcrumb,
 			// session bootstrap) without a page reload.
-			drivesStore.invalidate();
+			await drivesStore.refresh();
 			ui.notify(t('admin.drive_created', 'Drive created.'), 'success');
 		} catch (err) {
 			driveCreateError = errorMessage(err);

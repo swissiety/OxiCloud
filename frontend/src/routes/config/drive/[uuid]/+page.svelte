@@ -60,8 +60,7 @@
 		deleting = true;
 		try {
 			await deleteDrive(drive.id);
-			drivesStore.invalidate();
-			await drivesStore.load();
+			await drivesStore.refresh();
 			ui.notify(t('drive.deleted', 'Drive deleted.'), 'success');
 			// Send the user back to /files. The picker's reload above
 			// already removed the now-deleted drive from the sidebar.
@@ -109,8 +108,7 @@
 			// parent_id IS NULL, so a non-Owner caller would 404 here
 			// (but the UI also hid this button for non-Owners).
 			await renameFolder(drive.root_folder_id, next);
-			drivesStore.invalidate();
-			await drivesStore.load();
+			await drivesStore.refresh();
 			renaming = false;
 		} catch (e) {
 			errorToast(e);
