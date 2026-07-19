@@ -878,7 +878,10 @@
     "delete_user_title": "Gebruiker verwijderen",
     "delete_user_warning": "Je staat op het punt \"{{name}}\" definitief te verwijderen. Het account wordt verwijderd, alle sessies ingetrokken en de persoonlijke schijf gewist. Dit kan niet ongedaan worden gemaakt.",
     "delete_user_confirm_hint": "Typ ter bevestiging het e-mailadres van het account hieronder: {{email}}",
-    "deleting": "Verwijderen…"
+    "deleting": "Verwijderen…",
+    "auth": "Authenticatie",
+    "quota": "Opslaggebruik",
+    "last_login": "Laatste aanmelding"
   },
   "profile": {
     "page_title": "Profiel",

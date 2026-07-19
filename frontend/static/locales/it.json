@@ -878,7 +878,10 @@
     "delete_user_title": "Elimina utente",
     "delete_user_warning": "Stai per eliminare definitivamente «{{name}}». L'account verrà rimosso, tutte le sessioni revocate e l'unità personale cancellata. Operazione irreversibile.",
     "delete_user_confirm_hint": "Per confermare, digita qui sotto l'email dell'account: {{email}}",
-    "deleting": "Eliminazione…"
+    "deleting": "Eliminazione…",
+    "auth": "Autenticazione",
+    "quota": "Uso archiviazione",
+    "last_login": "Ultimo accesso"
   },
   "profile": {
     "page_title": "Profilo",

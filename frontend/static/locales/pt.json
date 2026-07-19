@@ -878,7 +878,10 @@
     "delete_user_title": "Eliminar utilizador",
     "delete_user_warning": "Está prestes a eliminar permanentemente «{{name}}». A conta será removida, todas as sessões revogadas e a unidade pessoal apagada. Esta ação é irreversível.",
     "delete_user_confirm_hint": "Para confirmar, escreva o e-mail da conta abaixo: {{email}}",
-    "deleting": "A eliminar…"
+    "deleting": "A eliminar…",
+    "auth": "Autenticação",
+    "quota": "Uso de armazenamento",
+    "last_login": "Último acesso"
   },
   "profile": {
     "page_title": "Perfil",

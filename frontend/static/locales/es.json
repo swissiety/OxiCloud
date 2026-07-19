@@ -893,7 +893,10 @@
     "delete_user_title": "Eliminar usuario",
     "delete_user_warning": "Vas a eliminar permanentemente a «{{name}}». Se eliminará la cuenta, se revocarán todas las sesiones y se borrará la unidad personal. Esta acción no se puede deshacer.",
     "delete_user_confirm_hint": "Para confirmar, escribe el correo de la cuenta a continuación: {{email}}",
-    "deleting": "Eliminando…"
+    "deleting": "Eliminando…",
+    "auth": "Autenticación",
+    "quota": "Uso de almacenamiento",
+    "last_login": "Último acceso"
   },
   "profile": {
     "page_title": "Perfil",

@@ -878,7 +878,10 @@
     "delete_user_title": "Benutzer löschen",
     "delete_user_warning": "Du bist dabei „{{name}}\" endgültig zu löschen. Das Konto wird entfernt, alle Sitzungen widerrufen und das persönliche Laufwerk gelöscht. Dies kann nicht rückgängig gemacht werden.",
     "delete_user_confirm_hint": "Zur Bestätigung tippe die Konto-E-Mail unten ein: {{email}}",
-    "deleting": "Löschen…"
+    "deleting": "Löschen…",
+    "auth": "Authentifizierung",
+    "quota": "Speichernutzung",
+    "last_login": "Letzter Login"
   },
   "profile": {
     "page_title": "Profil",

@@ -878,7 +878,10 @@
     "delete_user_title": "Usuń użytkownika",
     "delete_user_warning": "Zamierzasz trwale usunąć „{{name}}\". Konto zostanie usunięte, wszystkie sesje unieważnione, a dysk osobisty skasowany. Tej operacji nie można cofnąć.",
     "delete_user_confirm_hint": "Aby potwierdzić, wpisz poniżej e-mail konta: {{email}}",
-    "deleting": "Usuwanie…"
+    "deleting": "Usuwanie…",
+    "auth": "Uwierzytelnianie",
+    "quota": "Użycie przestrzeni",
+    "last_login": "Ostatnie logowanie"
   },
   "profile": {
     "page_title": "Profil",

@@ -861,7 +861,10 @@
     "delete_user_title": "刪除使用者",
     "delete_user_warning": "即將永久刪除「{{name}}」。這將移除帳戶、撤銷所有工作階段並清除個人雲端硬碟。此操作無法復原。",
     "delete_user_confirm_hint": "要確認,請在下方輸入帳戶電子郵件: {{email}}",
-    "deleting": "刪除中…"
+    "deleting": "刪除中…",
+    "auth": "驗證",
+    "quota": "儲存用量",
+    "last_login": "上次登入"
   },
   "profile": {
     "page_title": "個人資料",

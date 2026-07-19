@@ -878,7 +878,10 @@
     "delete_user_title": "Supprimer l’utilisateur",
     "delete_user_warning": "Vous êtes sur le point de supprimer définitivement « {{name}} ». Cette action supprime le compte, révoque toutes les sessions et efface le disque personnel. Elle est irréversible.",
     "delete_user_confirm_hint": "Pour confirmer, saisissez l’e-mail du compte ci-dessous : {{email}}",
-    "deleting": "Suppression…"
+    "deleting": "Suppression…",
+    "auth": "Authentification",
+    "quota": "Utilisation du stockage",
+    "last_login": "Dernière connexion"
   },
   "profile": {
     "page_title": "Profil",

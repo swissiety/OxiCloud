@@ -878,7 +878,10 @@
     "delete_user_title": "ユーザーを削除",
     "delete_user_warning": "「{{name}}」を完全に削除しようとしています。アカウントは削除され、すべてのセッションが失効し、個人ドライブが回収されます。この操作は取り消せません。",
     "delete_user_confirm_hint": "確認のため、下記にアカウントのメールアドレスを入力してください: {{email}}",
-    "deleting": "削除中…"
+    "deleting": "削除中…",
+    "auth": "認証",
+    "quota": "ストレージ使用量",
+    "last_login": "最終ログイン"
   },
   "profile": {
     "page_title": "プロフィール",
