@@ -51,9 +51,9 @@ test('favorites batch select-all then move dialog', async ({ page }) => {
   await page.goto('/favorites');
   await expect(page.getByTestId(f1)).toBeVisible({ timeout: 15_000 });
   // The select-all checkbox lives in the list-view header.
-  await page.getByTestId('list-toolbar-view-list-btn').click();
+  await page.getByTestId('display-mode-view-list-btn').click();
   await page.getByTestId('resource-list-select-all-checkbox').check();
-  await expect(page.getByTestId('resource-list-batch-toolbar')).toBeVisible();
+  await expect(page.getByTestId('resource-list-batch-close-btn')).toBeVisible();
 
   // Batch-move opens the move dialog; cancel it.
   await page.getByTestId('favorites-batch-move-btn').click();

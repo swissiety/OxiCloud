@@ -1615,6 +1615,23 @@
 		onitemdragleave={rlOnItemDragLeave}
 		onitemdrop={rlOnItemDrop}
 	>
+		{#snippet emptyAction()}
+			<!-- Surfaces only when the folder isn't really empty — it's just
+			     filtered because the user chose to hide dotfiles. Clicking
+			     flips the app-wide `preferences.hideDotfiles` back off,
+			     re-populating the list without a hunt through settings. -->
+			{#if hiddenCount > 0}
+				<button
+					class="btn btn-secondary"
+					onclick={() => preferences.setHideDotfiles(false)}
+					data-testid="files-show-hidden-btn"
+				>
+					<Icon name="eye" />
+					{t('files.show_hidden', 'Show hidden files')}
+				</button>
+			{/if}
+		{/snippet}
+
 		{#snippet breadcrumb()}
 			<nav class="breadcrumb" aria-label="Breadcrumb">
 				<!-- Persistent home link → the root listing (bare /files canonicalizes to

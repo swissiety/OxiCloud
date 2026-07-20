@@ -130,6 +130,14 @@
 		emptyHint?: string;
 		/** Empty-state icon-registry name (e.g. "star", "clock", "trash"). */
 		emptyIcon?: string;
+		/**
+		 * Call-to-action rendered inside the empty state. Used by
+		 * `/files` to surface a "Show hidden files" button when the
+		 * folder holds only dotfiles the user has chosen to hide — the
+		 * page-specific hint stays in `emptyHint`, the action goes
+		 * here. `<EmptyState>` renders it below the hint text.
+		 */
+		emptyAction?: Snippet;
 		hasMore?: boolean;
 		onloadmore?: () => void;
 		/** Show the path/location column (list view only). */
@@ -318,6 +326,7 @@
 		emptyText,
 		emptyHint,
 		emptyIcon,
+		emptyAction,
 		hasMore = false,
 		onloadmore,
 		showPath = true,
@@ -1156,7 +1165,9 @@
 			icon={emptyIcon}
 			title={emptyText ?? t('common.empty', 'Nothing here yet.')}
 			hint={emptyHint}
-		/>
+		>
+			{#if emptyAction}{@render emptyAction()}{/if}
+		</EmptyState>
 	{:else}
 		<div class="files-container" bind:clientWidth={gridWidth}>
 			{#if grouped && filesStore.viewMode === 'list'}

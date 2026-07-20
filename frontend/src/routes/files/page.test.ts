@@ -177,7 +177,7 @@ it('batch-deletes the whole selection after confirmation', async () => {
 	m(deleteFolder).mockResolvedValue(undefined);
 	m(deleteFile).mockResolvedValue(undefined);
 	render(FilesPage);
-	await fireEvent.click(await screen.findByTestId('files-select-all-checkbox'));
+	await fireEvent.click(await screen.findByTestId('resource-list-select-all-checkbox'));
 	await fireEvent.click(await screen.findByTestId('files-batch-delete-btn'));
 	await waitFor(() => expect(deleteFolder).toHaveBeenCalledWith('sub1'));
 	await waitFor(() => expect(deleteFile).toHaveBeenCalledWith('f1'));
@@ -187,7 +187,7 @@ it('batch-favorites the selection via the favorites batch endpoint', async () =>
 	withListing();
 	m(apiFetch).mockResolvedValue({ ok: true });
 	render(FilesPage);
-	await fireEvent.click(await screen.findByTestId('files-select-all-checkbox'));
+	await fireEvent.click(await screen.findByTestId('resource-list-select-all-checkbox'));
 	await fireEvent.click(await screen.findByTestId('files-batch-favorite-btn'));
 	await waitFor(() =>
 		expect(apiFetch).toHaveBeenCalledWith(
