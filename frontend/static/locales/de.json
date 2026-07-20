@@ -339,6 +339,7 @@
     "modified": "Geändert",
     "no_files": "Keine Dateien in diesem Ordner",
     "empty_hint": "Laden Sie Dateien hoch oder erstellen Sie Ordner, um loszulegen",
+    "drop_to_upload": "Dateien zum Hochladen hier ablegen",
     "loading": "Dateien werden geladen…",
     "view_grid": "Rasteransicht",
     "view_list": "Listenansicht",

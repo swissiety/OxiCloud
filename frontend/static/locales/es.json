@@ -339,6 +339,7 @@
     "modified": "Modificado",
     "no_files": "No hay archivos en esta carpeta",
     "empty_hint": "Sube archivos o crea carpetas para comenzar",
+    "drop_to_upload": "Arrastra archivos aquí para subirlos",
     "loading": "Cargando archivos…",
     "view_grid": "Vista de cuadrícula",
     "view_list": "Vista de lista",

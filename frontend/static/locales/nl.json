@@ -339,6 +339,7 @@
     "modified": "Gewijzigd",
     "no_files": "Geen bestanden in deze map",
     "empty_hint": "Upload bestanden of maak mappen aan om te beginnen",
+    "drop_to_upload": "Sleep bestanden hier om te uploaden",
     "loading": "Bestanden laden…",
     "view_grid": "Rasterweergave",
     "view_list": "Lijstweergave",

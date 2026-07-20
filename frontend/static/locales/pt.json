@@ -339,6 +339,7 @@
     "modified": "Modificado",
     "no_files": "Nenhum arquivo nesta pasta",
     "empty_hint": "Envie arquivos ou crie pastas para começar",
+    "drop_to_upload": "Solte arquivos aqui para enviar",
     "loading": "Carregando arquivos…",
     "view_grid": "Visualização em grade",
     "view_list": "Visualização em lista",

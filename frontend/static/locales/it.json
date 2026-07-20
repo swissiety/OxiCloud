@@ -339,6 +339,7 @@
     "modified": "Modificato",
     "no_files": "Nessun file in questa cartella",
     "empty_hint": "Carica file o crea cartelle per iniziare",
+    "drop_to_upload": "Trascina i file qui per caricarli",
     "loading": "Caricamento file…",
     "view_grid": "Visualizzazione griglia",
     "view_list": "Visualizzazione elenco",

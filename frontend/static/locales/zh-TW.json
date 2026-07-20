@@ -339,6 +339,7 @@
     "modified": "修改日期",
     "no_files": "此資料夾中沒有檔案",
     "empty_hint": "上傳檔案或建立資料夾以開始使用",
+    "drop_to_upload": "將檔案拖放到此處上傳",
     "loading": "正在載入檔案…",
     "view_grid": "網格檢視",
     "view_list": "列表檢視",

@@ -339,6 +339,7 @@
     "modified": "Zmodyfikowano",
     "no_files": "Brak plików w tym folderze",
     "empty_hint": "Prześlij pliki lub utwórz foldery, aby rozpocząć",
+    "drop_to_upload": "Upuść pliki tutaj, aby wysłać",
     "loading": "Ładowanie plików…",
     "view_grid": "Widok siatki",
     "view_list": "Widok listy",

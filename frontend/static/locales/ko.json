@@ -409,6 +409,7 @@
     "modified": "수정일",
     "no_files": "이 폴더에 파일이 없습니다",
     "empty_hint": "파일을 업로드하거나 폴더를 만들어 시작하세요",
+    "drop_to_upload": "업로드할 파일을 여기에 놓으세요",
     "loading": "파일 로딩 중…",
     "view_grid": "그리드 보기",
     "view_list": "목록 보기",

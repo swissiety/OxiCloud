@@ -902,28 +902,44 @@
 	// breadcrumb) are handled by the existing `onitemdrop` hooks and use
 	// a private `application/x-oxi-item` MIME so the `Files` type check
 	// below never matches them.
-	let systemDropOver = $state(false);
+	// Drag-enter/leave chatter is unavoidable when the drag pointer moves
+	// between the wrapper and its descendants — the browser fires
+	// `dragleave` on the parent BEFORE firing `dragenter` on the child,
+	// so a naive `systemDropOver = false` in the leave handler produces
+	// a false→true flash on every row hover during the drag. Counter
+	// approach: increment on every dragenter, decrement on every
+	// dragleave; the overlay is visible when the count is positive. The
+	// count zeroes only when the drag has truly left the wrapper (or
+	// hit `drop`/`dragend`), so the overlay stays stable throughout.
+	let systemDragDepth = $state(0);
+	const systemDropOver = $derived(systemDragDepth > 0);
 	function isSystemDrag(e: DragEvent): boolean {
 		return !!e.dataTransfer?.types?.includes('Files');
 	}
 	function onSystemDragEnter(e: DragEvent) {
 		if (!isSystemDrag(e)) return;
 		e.preventDefault();
-		systemDropOver = true;
+		systemDragDepth++;
 	}
 	function onSystemDragOver(e: DragEvent) {
 		if (!isSystemDrag(e)) return;
+		// preventDefault on `dragover` is what tells the browser this
+		// element accepts drops — without it, `drop` never fires and
+		// the pointer shows the OS "no-drop" cursor.
 		e.preventDefault();
 		if (e.dataTransfer) e.dataTransfer.dropEffect = enableSystemDrop ? 'copy' : 'none';
 	}
 	function onSystemDragLeave(e: DragEvent) {
 		if (!isSystemDrag(e)) return;
-		systemDropOver = false;
+		if (systemDragDepth > 0) systemDragDepth--;
 	}
 	function onSystemDrop(e: DragEvent) {
 		if (!isSystemDrag(e)) return;
 		e.preventDefault();
-		systemDropOver = false;
+		// Drop ends the drag; force-clear regardless of counter state
+		// (a stray unbalanced dragenter would otherwise leave the
+		// overlay stuck on).
+		systemDragDepth = 0;
 		if (enableSystemDrop && onsystemdrop) {
 			onsystemdrop(e);
 		} else if (!enableSystemDrop) {
@@ -1138,7 +1154,6 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	class="rl-root"
-	class:rl-root--drop-over={systemDropOver && enableSystemDrop}
 	class:rl-root--rubberbanding={rubberband !== null}
 	bind:this={rlRoot}
 	onpointerdown={onRootPointerDown}
@@ -1330,6 +1345,24 @@
 			aria-hidden="true"
 		></div>
 	{/if}
+
+	<!-- System-drop overlay. Renders on top of the list ONLY while the
+	     user is dragging OS files over the wrapper AND this surface
+	     accepts them (`enableSystemDrop`). Filled tint + centred
+	     icon+message so the drop target is unmistakable — the dashed
+	     border alone read as decoration on busy folders. `pointer-events:
+	     none` on the container keeps it inert (drag events still hit
+	     `.rl-root` underneath so `dragleave`/`drop` fire correctly). -->
+	{#if systemDropOver && enableSystemDrop}
+		<div class="rl-drop-overlay" aria-hidden="true">
+			<div class="rl-drop-overlay__inner">
+				<Icon name="cloud-arrow-up" class="rl-drop-overlay__icon" />
+				<span class="rl-drop-overlay__label">
+					{t('files.drop_to_upload', 'Drop files here to upload')}
+				</span>
+			</div>
+		</div>
+	{/if}
 </div>
 <!-- /.rl-root -->
 
@@ -1419,13 +1452,50 @@
 		position: relative;
 	}
 
-	.rl-root--drop-over::after {
-		content: '';
-		position: absolute;
+	/* Viewport-fixed drop overlay. `position: fixed` (not absolute) so
+	   it covers the whole visible browser window regardless of the
+	   user's scroll position — an absolute-inset-0 inside `.rl-root`
+	   would center the card at the middle of the FULL list height,
+	   which sits above the fold on a scrolled folder. The dashed border
+	   also gets painted at the true viewport edge, so the sticky
+	   action-bar + breadcrumb are covered rather than clipping the
+	   border. `pointer-events: none` so drag events still fall through
+	   to `.rl-root`'s handlers underneath.
+	   `--z-overlay` beats `--z-sticky` (page chrome) + `--z-dropdown`
+	   (search suggestions); stays below `--z-modal` so a modal opened
+	   concurrently still wins. */
+	.rl-drop-overlay {
+		position: fixed;
 		inset: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: color-mix(in srgb, var(--color-accent) 12%, transparent);
 		border: 2px dashed var(--color-accent);
 		border-radius: var(--radius-md);
 		pointer-events: none;
+		z-index: var(--z-overlay);
+	}
+
+	.rl-drop-overlay__inner {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: var(--space-3);
+		padding: var(--space-6) var(--space-8);
+		color: var(--color-accent);
+		background: var(--color-bg-surface);
+		border-radius: var(--radius-lg);
+		box-shadow: var(--shadow-lg);
+	}
+
+	.rl-drop-overlay :global(.rl-drop-overlay__icon) {
+		font-size: 3rem;
+	}
+
+	.rl-drop-overlay__label {
+		font-weight: var(--weight-semibold);
+		font-size: var(--text-lg);
 	}
 
 	/* ── Rubberband (marquee) selection ────────────────────────────

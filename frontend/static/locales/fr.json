@@ -339,6 +339,7 @@
     "modified": "Modifié",
     "no_files": "Aucun fichier dans ce dossier",
     "empty_hint": "Téléversez des fichiers ou créez des dossiers pour commencer",
+    "drop_to_upload": "Déposez les fichiers ici pour les téléverser",
     "loading": "Chargement des fichiers…",
     "view_grid": "Vue en grille",
     "view_list": "Vue en liste",
