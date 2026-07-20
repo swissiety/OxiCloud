@@ -48,9 +48,12 @@
 	let reversed = $state(false);
 	const owners = useOwnerCache(resolveOwnerName);
 
-	// Envelope shape: `accessed_at` → `ctx.date`, `updated_by` → `ctx.ownerId`
-	// (Recent's provenance semantic — "who touched this recently" — differs
-	// from Favorites'/Files' `created_by`).
+	// Envelope shape: `accessed_at` → `ctx.date`, `created_by` → `ctx.ownerId`.
+	// Recent is a per-user view of items the caller accessed; the "who
+	// touched this last" (`updated_by`) semantic is real but adds noise
+	// (mostly the current user), so we align with Files / Favorites and
+	// show the original author instead. Cross-surface consistency wins
+	// over the finer-grained signal.
 	//
 	// Dotfile hiding is delegated to ResourceList via `showDotfileToggle`
 	// — the component reads `preferences.hideDotfiles` and drops matching
@@ -117,10 +120,10 @@
 			raw = reset ? page.items : [...raw, ...page.items];
 			primeContextPage(contextMap, reset, page.items, (it) => [
 				it.resource.id,
-				{ date: it.accessed_at, ownerId: it.resource.updated_by ?? null }
+				{ date: it.accessed_at, ownerId: it.resource.created_by ?? null }
 			]);
 			cursor = page.next_cursor;
-			void owners.resolve(page.items.map((i) => i.resource.updated_by));
+			void owners.resolve(page.items.map((i) => i.resource.created_by));
 		} catch (e) {
 			console.error('recent: load error', e);
 			error = t('errors_loadFailed', 'Failed to load items');
@@ -184,7 +187,7 @@
 			raw = [...raw.slice(0, idx), snapshot, ...raw.slice(idx)];
 			contextMap.set(item.id, {
 				date: snapshot.accessed_at,
-				ownerId: snapshot.resource.updated_by ?? null
+				ownerId: snapshot.resource.created_by ?? null
 			});
 			errorToast(e);
 		}

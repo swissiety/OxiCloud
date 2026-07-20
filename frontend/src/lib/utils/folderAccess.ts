@@ -74,4 +74,3 @@ export async function probeFolderAccess(id: string): Promise<boolean> {
 	inflight.set(id, p);
 	return p;
 }
-

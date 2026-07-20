@@ -25,7 +25,6 @@ vi.mock('$lib/api/endpoints/folders', () => ({ renameFolder: vi.fn(), deleteFold
 vi.mock('$lib/stores/dialogs.svelte', () => ({ confirmDialog, promptDialog }));
 
 import { fetchRecentPage, clearRecent, removeFromRecent } from '$lib/api/endpoints/recent';
-import { deleteFile } from '$lib/api/endpoints/files';
 import RecentPage from './+page.svelte';
 
 const m = (fn: unknown) => fn as ReturnType<typeof vi.fn>;

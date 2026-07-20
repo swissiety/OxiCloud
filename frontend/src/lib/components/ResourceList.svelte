@@ -1570,6 +1570,7 @@
 	.rl-ctx-item--disabled {
 		opacity: 0.5;
 	}
+
 	.rl-ctx-item--disabled:hover {
 		background: transparent;
 	}

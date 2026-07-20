@@ -366,8 +366,7 @@
 		<Button
 			icon="star-outline"
 			data-testid="favorites-batch-remove-btn"
-			onclick={() => sel.forEach(unfavorite)}
-			>{t('files.unfavorite', 'Remove favorite')}</Button
+			onclick={() => sel.forEach(unfavorite)}>{t('files.unfavorite', 'Remove favorite')}</Button
 		>
 	{/snippet}
 </ResourceList>

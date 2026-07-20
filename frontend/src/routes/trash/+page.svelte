@@ -300,17 +300,14 @@
 			standard action-bar sizing and reads consistently with
 			`/recent` and `/favorites` batch clusters.
 		-->
-		<Button
-			icon="undo"
-			data-testid="trash-batch-restore-btn"
-			onclick={() => sel.forEach(restore)}>{t('trash.restore', 'Restore')}</Button
+		<Button icon="undo" data-testid="trash-batch-restore-btn" onclick={() => sel.forEach(restore)}
+			>{t('trash.restore', 'Restore')}</Button
 		>
 		<Button
 			variant="danger"
 			icon="trash"
 			data-testid="trash-batch-delete-btn"
-			onclick={() => sel.forEach(purge)}
-			>{t('trash.delete', 'Delete permanently')}</Button
+			onclick={() => sel.forEach(purge)}>{t('trash.delete', 'Delete permanently')}</Button
 		>
 	{/snippet}
 	{#snippet rowBadge(_item, ctx)}
@@ -413,5 +410,18 @@
 	   colour still lands on the plain `.btn-action` restore button). */
 	:global(.files-grid-view .file-item .action-cell .btn-action--delete:hover) {
 		color: var(--color-error-text);
+	}
+
+	/* List view: hide the expiry chip that ResourceList paints inside
+	   `.file-icon__badge`. In list mode the same info is already in
+	   the "Expires at" column (`dateCell` snippet above) — showing
+	   the chip on the tiny row icon crops it and duplicates the
+	   signal. Grid view keeps the chip: no dedicated column exists
+	   there and the badge is the ONLY expiration surface on the
+	   card. Scoped to trash because trash is the only section
+	   emitting a rowBadge today; if another section starts using it,
+	   this rule stays inert for them. */
+	:global(.files-list-view .file-item .file-icon__badge) {
+		display: none;
 	}
 </style>
