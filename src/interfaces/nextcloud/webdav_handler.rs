@@ -2122,6 +2122,10 @@ mod tests {
             // §14 provenance not relevant to path-mapper tests.
             created_by: None,
             updated_by: None,
+            // Caller state flags not read by the WebDAV path mapper;
+            // Nextcloud DAV surfaces don't render the SPA badges.
+            is_favorite: false,
+            is_shared: false,
         }
     }
 
