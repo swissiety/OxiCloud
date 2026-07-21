@@ -130,7 +130,7 @@ fn report(tag: &str, before: Measure, after: Measure) {
 
 /// Roll-back gate: `exit(1)` unless AFTER strictly beats BEFORE on `metric`.
 fn gate(tag: &str, metric: &str, before: f64, after: f64) {
-    if !(after < before) {
+    if after >= before {
         eprintln!("GATE FAIL [{tag}] {metric}: AFTER {after} !< BEFORE {before} — rollback");
         std::process::exit(1);
     }

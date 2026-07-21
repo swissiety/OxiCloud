@@ -34,7 +34,7 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 fn gate(tag: &str, metric: &str, before: f64, after: f64) {
-    if !(after < before) {
+    if after >= before {
         eprintln!("GATE FAIL [{tag}] {metric}: AFTER {after} !< BEFORE {before} — rollback");
         std::process::exit(1);
     }
