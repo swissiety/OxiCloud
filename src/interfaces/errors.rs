@@ -219,17 +219,6 @@ impl AppError {
         )
     }
 
-    /// Create a 507 Insufficient Storage error for an expired RFC 6578
-    /// `sync-token` (client must discard local state and restart with a
-    /// fresh initial sync). Distinct from `ErrorKind::QuotaExceeded`,
-    /// which also maps to 507 but for actual storage-space exhaustion.
-    pub fn sync_token_expired(message: impl Into<String>) -> Self {
-        Self::new(
-            StatusCode::INSUFFICIENT_STORAGE,
-            message,
-            "SyncTokenExpired",
-        )
-    }
 }
 
 /// HTTP status for a domain error kind.
