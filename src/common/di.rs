@@ -1439,14 +1439,17 @@ impl AppServiceFactory {
         tracing::info!("Tree-ETag flush service initialized");
     }
 
-    /// Starts the RFC 6578 `sync-collection` change-log retention sweep
-    /// (requires database). Mirrors the trash cleanup job's shape —
-    /// fire-and-forget on the maintenance pool, always on (WebDAV isn't an
-    /// optional feature in this server, so its sync-log housekeeping isn't
-    /// either). Uses its own repository instance bound to `maintenance_pool`
-    /// so the periodic DELETE never competes with request-path queries on
-    /// the primary pool.
-    fn start_sync_log_retention_job(&self, maintenance_pool: &Arc<PgPool>) {
+    /// Registers the RFC 6578 `sync-collection` change-log retention sweep
+    /// with the periodic-job scheduler (requires database). Always on
+    /// (WebDAV isn't an optional feature in this server, so its sync-log
+    /// housekeeping isn't either). Uses its own repository instance bound
+    /// to `maintenance_pool` so the periodic DELETE never competes with
+    /// request-path queries on the primary pool.
+    async fn start_sync_log_retention_job(
+        &self,
+        maintenance_pool: &Arc<PgPool>,
+        core: &CoreServices,
+    ) {
         let folder_change_log = Arc::new(
             crate::infrastructure::repositories::pg::FolderSyncChangePgRepository::new(
                 maintenance_pool.clone(),
@@ -1462,16 +1465,19 @@ impl AppServiceFactory {
                 maintenance_pool.clone(),
             ),
         );
-        let service =
+        Arc::new(
             crate::infrastructure::services::sync_log_retention_service::SyncLogRetentionService::new(
                 folder_change_log,
                 calendar_change_log,
                 contact_change_log,
                 self.config.storage.sync_log_retention_days,
                 self.config.storage.sync_log_retention_sweep_interval_hours,
-            );
-        service.start_retention_job();
-        tracing::info!("Sync-log retention service initialized");
+                self.config.storage.sync_log_max_rows_per_collection,
+            ),
+        )
+        .register(&core.job_registry)
+        .await;
+        tracing::info!("Sync-log retention service registered");
     }
 
     /// Start the primary-pool saturation watchdog (Finding #3). Logs a WARN as
@@ -2164,7 +2170,8 @@ impl AppServiceFactory {
             let _ = self
                 .create_session_cleanup_service(&maintenance_pool, &core)
                 .await;
-            self.start_sync_log_retention_job(&maintenance_pool);
+            self.start_sync_log_retention_job(&maintenance_pool, &core)
+                .await;
 
             self.start_db_pool_monitor(&pool);
 
