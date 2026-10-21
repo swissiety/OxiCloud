@@ -2,7 +2,7 @@
 -- contacts.
 --
 -- Mirrors `caldav.calendar_sync_changes`
--- (`20261001000001_calendar_sync_changes.sql`) — same append-only shape,
+-- (`20261104000001_calendar_sync_changes.sql`) — same append-only shape,
 -- same trigger population, same retention-sweep lifecycle. Scoped to
 -- `carddav.contacts` only: contact groups are out of scope for
 -- sync-collection (CardDAV addressbook collections enumerate contacts,
@@ -40,7 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_contact_sync_changes_changed_at
     ON carddav.contact_sync_changes (changed_at);
 
 -- Per-collection (not singleton) — see `storage.folder_sync_watermark`'s
--- comment in `20261001000000_folder_sync_changes.sql` for why a single
+-- comment in `20261104000000_folder_sync_changes.sql` for why a single
 -- global watermark would falsely expire a quiet address book's token
 -- whenever a high-churn sibling address book's rows get purged. Missing
 -- row for a given address book means "never purged" (never expired).
