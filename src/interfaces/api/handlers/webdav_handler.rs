@@ -938,7 +938,7 @@ async fn build_streaming_propfind_response(
  *
  * The synthetic multi-drive root (`path.is_empty()`, no real
  * `storage.folders` row to log against — see
- * `migrations/20261001000000_folder_sync_changes.sql`'s header) is out of
+ * `migrations/20261104000000_folder_sync_changes.sql`'s header) is out of
  * scope for this phase and keeps the old full-listing-every-call
  * behavior with a fake timestamp token.
  *

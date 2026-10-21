@@ -2,7 +2,7 @@
 -- calendar events.
 --
 -- Mirrors `storage.folder_sync_changes`
--- (`20261001000000_folder_sync_changes.sql`) — same append-only shape,
+-- (`20261104000000_folder_sync_changes.sql`) — same append-only shape,
 -- same trigger population, same retention-sweep lifecycle. Simpler than
 -- the WebDAV table because a `caldav.calendar_events` row never moves
 -- between calendars (no move branch) and is never soft-deleted (no
@@ -39,7 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_calendar_sync_changes_changed_at
     ON caldav.calendar_sync_changes (changed_at);
 
 -- Per-collection (not singleton) — see `storage.folder_sync_watermark`'s
--- comment in `20261001000000_folder_sync_changes.sql` for why a single
+-- comment in `20261104000000_folder_sync_changes.sql` for why a single
 -- global watermark would falsely expire a quiet calendar's token whenever
 -- a high-churn sibling calendar's rows get purged. Missing row for a
 -- given calendar means "never purged" (never expired).

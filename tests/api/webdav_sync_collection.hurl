@@ -2,7 +2,7 @@
 # OxiCloud — WebDAV sync-collection (RFC 6578) for the file surface
 # =============================================================
 # Real incremental sync, backed by `storage.folder_sync_changes`
-# (see migrations/20261001000000_folder_sync_changes.sql,
+# (see migrations/20261104000000_folder_sync_changes.sql,
 # WebdavSyncCollectionService, webdav_handler.rs::handle_report).
 #
 # Coverage:
