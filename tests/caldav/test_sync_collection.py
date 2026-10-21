@@ -65,6 +65,53 @@ def _minimal_ical(uid: str, summary: str = "Sync coverage event") -> str:
     )
 
 
+def _minimal_vtodo(uid: str, summary: str = "Sync coverage task") -> str:
+    return _dedent_ical(
+        f"""\
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//pycaldav sync-collection coverage//EN
+        BEGIN:VTODO
+        UID:{uid}
+        DTSTAMP:20260101T080000Z
+        DUE:20260102T090000Z
+        STATUS:NEEDS-ACTION
+        SUMMARY:{summary}
+        END:VTODO
+        END:VCALENDAR
+        """
+    )
+
+
+def _recurring_ical_with_override(uid: str) -> str:
+    """Daily master plus one RECURRENCE-ID override — two rows in
+    `caldav.calendar_events`, ONE resource at `{uid}.ics`."""
+    return _dedent_ical(
+        f"""\
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//pycaldav sync-collection coverage//EN
+        BEGIN:VEVENT
+        UID:{uid}
+        DTSTAMP:20260101T080000Z
+        DTSTART:20260101T090000Z
+        DTEND:20260101T093000Z
+        RRULE:FREQ=DAILY;COUNT=5
+        SUMMARY:Recurring master
+        END:VEVENT
+        BEGIN:VEVENT
+        UID:{uid}
+        DTSTAMP:20260101T080000Z
+        RECURRENCE-ID:20260103T090000Z
+        DTSTART:20260103T100000Z
+        DTEND:20260103T103000Z
+        SUMMARY:Moved occurrence
+        END:VEVENT
+        END:VCALENDAR
+        """
+    )
+
+
 def _put_ical(calendar: caldav.Calendar, uid: str, body: str | None = None) -> None:
     url = str(calendar.url).rstrip("/") + f"/{uid}.ics"
     r = calendar.client.request(
@@ -309,6 +356,140 @@ def test_calendar_sync_token_rejected_against_wrong_calendar(
             other_calendar.delete()
         except Exception:
             pass
+
+
+# ─────────────────────────────────────────────────────────────
+# VTODO + recurring bundles — the calendar collection holds two
+# object kinds (#754) and a resource is a UID bundle, while the
+# change log is per row of either table.
+# ─────────────────────────────────────────────────────────────
+
+
+def _blocks_for(xml: str, uid: str) -> list[str]:
+    return [
+        b for b in _response_blocks(xml)
+        if _member_id_from_href(_href_from_block(b), ".ics") == uid
+    ]
+
+
+def test_calendar_sync_initial_includes_tasks(
+    dav_client: caldav.DAVClient, fresh_calendar: caldav.Calendar
+) -> None:
+    """A VTODO stored in the calendar is part of the initial snapshot —
+    a client that never sees it there has no way to learn of it."""
+    event_uid = f"sync-ev-{uuid.uuid4().hex[:8]}"
+    task_uid = f"sync-todo-{uuid.uuid4().hex[:8]}"
+    _put_ical(fresh_calendar, event_uid)
+    _put_ical(fresh_calendar, task_uid, _minimal_vtodo(task_uid))
+
+    status, xml = _sync_collection(dav_client, str(fresh_calendar.url), None)
+    assert status == 207, f"Initial sync-collection → HTTP {status}\n{xml}"
+    assert _blocks_for(xml, event_uid), f"Event missing from snapshot:\n{xml}"
+    assert _blocks_for(xml, task_uid), f"Task missing from snapshot:\n{xml}"
+    assert _extract_sync_token(xml)
+
+
+def test_calendar_sync_delta_tracks_task_create_update_delete(
+    dav_client: caldav.DAVClient, fresh_calendar: caldav.Calendar
+) -> None:
+    """Task changes advance the calendar's change log exactly like event
+    changes: create → live entry, update → live entry, delete →
+    tombstone. Before VTODO rows were logged, every one of these deltas
+    came back empty and the client kept a stale task list forever."""
+    url = str(fresh_calendar.url)
+    _, xml = _sync_collection(dav_client, url, None)
+    token = _extract_sync_token(xml)
+
+    task_uid = f"sync-todo-{uuid.uuid4().hex[:8]}"
+    _put_ical(fresh_calendar, task_uid, _minimal_vtodo(task_uid))
+    status, xml = _sync_collection(dav_client, url, token)
+    assert status == 207
+    blocks = _blocks_for(xml, task_uid)
+    assert len(blocks) == 1 and not _is_deleted_block(blocks[0]), (
+        f"Created task {task_uid} must appear once, live, in the delta:\n{xml}"
+    )
+    token = _extract_sync_token(xml)
+
+    _put_ical(fresh_calendar, task_uid, _minimal_vtodo(task_uid, "Edited task"))
+    status, xml = _sync_collection(dav_client, url, token)
+    assert status == 207
+    blocks = _blocks_for(xml, task_uid)
+    assert len(blocks) == 1 and not _is_deleted_block(blocks[0]), (
+        f"Edited task {task_uid} must appear once, live — never as a "
+        f"tombstone for a task that still exists:\n{xml}"
+    )
+    token = _extract_sync_token(xml)
+
+    assert _delete_ical(fresh_calendar, task_uid) in (200, 204)
+    status, xml = _sync_collection(dav_client, url, token)
+    assert status == 207
+    blocks = _blocks_for(xml, task_uid)
+    assert len(blocks) == 1 and _is_deleted_block(blocks[0]), (
+        f"Deleted task {task_uid} must come back as a tombstone:\n{xml}"
+    )
+
+
+def test_calendar_sync_recurring_bundle_is_one_live_resource(
+    dav_client: caldav.DAVClient, fresh_calendar: caldav.Calendar
+) -> None:
+    """A master + RECURRENCE-ID override are two rows but one href.
+    Rewriting the bundle (PUT = delete+recreate of every row) must yield
+    exactly one live response for it — never a tombstone, which would
+    make the client drop a series that still exists."""
+    url = str(fresh_calendar.url)
+    uid = f"sync-rec-{uuid.uuid4().hex[:8]}"
+    _put_ical(fresh_calendar, uid, _recurring_ical_with_override(uid))
+    _, xml = _sync_collection(dav_client, url, None)
+    token = _extract_sync_token(xml)
+
+    _put_ical(fresh_calendar, uid, _recurring_ical_with_override(uid))
+    status, xml = _sync_collection(dav_client, url, token)
+    assert status == 207
+    blocks = _blocks_for(xml, uid)
+    assert len(blocks) == 1, (
+        f"Bundle {uid} must render as exactly one response, got "
+        f"{len(blocks)}:\n{xml}"
+    )
+    assert not _is_deleted_block(blocks[0]), (
+        f"Rewritten bundle {uid} came back as a tombstone:\n{blocks[0]}"
+    )
+
+
+def test_calendar_sync_local_mirror_with_tasks_matches_server(
+    dav_client: caldav.DAVClient, fresh_calendar: caldav.Calendar
+) -> None:
+    """Delta-only mirror over mixed event/task churn must equal the
+    server's real membership — ground truth is a fresh initial sync,
+    which lists both kinds."""
+    url = str(fresh_calendar.url)
+    _, xml = _sync_collection(dav_client, url, None)
+    mirror: set[str] = set()
+    _apply_delta_to_mirror(mirror, xml, ".ics")
+    token = _extract_sync_token(xml)
+
+    live: list[str] = []
+    for i in range(4):
+        ev = f"mix-ev-{i}-{uuid.uuid4().hex[:6]}"
+        td = f"mix-td-{i}-{uuid.uuid4().hex[:6]}"
+        _put_ical(fresh_calendar, ev)
+        _put_ical(fresh_calendar, td, _minimal_vtodo(td))
+        live += [ev, td]
+        if i % 2 == 1:
+            gone = live.pop(0)
+            assert _delete_ical(fresh_calendar, gone) in (200, 204)
+        _, xml = _sync_collection(dav_client, url, token)
+        _apply_delta_to_mirror(mirror, xml, ".ics")
+        token = _extract_sync_token(xml)
+
+    _, snapshot = _sync_collection(dav_client, url, None)
+    ground_truth: set[str] = set()
+    _apply_delta_to_mirror(ground_truth, snapshot, ".ics")
+    assert mirror == ground_truth, (
+        f"Delta-built mirror diverged from server.\n"
+        f"missing locally: {sorted(ground_truth - mirror)}\n"
+        f"stale locally:   {sorted(mirror - ground_truth)}"
+    )
+    assert set(live) <= ground_truth
 
 
 # ─────────────────────────────────────────────────────────────
