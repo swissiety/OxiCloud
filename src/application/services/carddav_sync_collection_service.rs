@@ -28,7 +28,7 @@ struct ContactMemberResolver {
 impl SyncMemberResolver for ContactMemberResolver {
     type Member = ContactDto;
 
-    async fn resolve(&self, member_id: Uuid) -> Option<ContactDto> {
+    async fn resolve(&self, member_id: Uuid, _label: &str) -> Option<ContactDto> {
         // The member may have been hard-deleted after this row was logged
         // but before we resolved it — degrade to `None` (→ `Deleted`)
         // rather than surfacing the lookup error to the client.

@@ -27,9 +27,14 @@ use crate::infrastructure::services::pg_acl_engine::PgAclEngine;
 /// its current DTO. Returns `None` on any lookup miss (hard-deleted/purged
 /// race, or a swallowed error) — the engine degrades that to a `Deleted`
 /// entry rather than surfacing a lookup error to the client.
+///
+/// `label` is the row's logged label (iCalendar / vCard UID). A domain
+/// whose resource is addressed by label rather than by row — CalDAV, where
+/// a master and its RECURRENCE-ID overrides share one href — resolves to
+/// the label alone and hydrates the touched resources in one batch itself.
 pub trait SyncMemberResolver: Send + Sync + 'static {
     type Member;
-    async fn resolve(&self, member_id: Uuid) -> Option<Self::Member>;
+    async fn resolve(&self, member_id: Uuid, label: &str) -> Option<Self::Member>;
 }
 
 pub struct SyncCollectionEngine<L, R>
@@ -169,7 +174,7 @@ where
                     });
                 }
                 SyncChangeKind::Created | SyncChangeKind::Updated => {
-                    match self.resolver.resolve(row.member_id).await {
+                    match self.resolver.resolve(row.member_id, &row.label).await {
                         Some(member) => changes.push(SyncChange::Upserted(member)),
                         None => changes.push(SyncChange::Deleted {
                             member_id: row.member_id,

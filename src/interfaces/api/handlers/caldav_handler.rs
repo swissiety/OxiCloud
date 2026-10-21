@@ -41,7 +41,6 @@ use crate::application::dtos::calendar_dto::{
 use crate::application::ports::calendar_ports::{
     AccessibleCalendar, CalendarObject, CalendarUseCase,
 };
-use crate::application::ports::change_log_port::SyncChange;
 use crate::application::services::caldav_sync_collection_service::CaldavSyncCollectionService;
 use crate::application::services::calendar_service::CalendarService;
 use crate::common::di::AppState;
@@ -1058,34 +1057,13 @@ async fn handle_report(
                 .list_changes_with_perms(calendar_uuid, Some(token), user.id)
                 .await?;
 
-            // The log is per ROW, but a resource is a UID bundle (master
-            // + RECURRENCE-ID overrides share one href). Re-hydrate every
-            // touched UID as a whole: rows left → upsert with the full
-            // bundle; none left → tombstone. Rendering a lone changed
-            // override, or a 404 for a deleted override whose master
-            // survives, would corrupt the client's copy.
-            let mut touched: Vec<String> = Vec::new();
-            for change in delta.changes {
-                let uid = match change {
-                    SyncChange::Upserted(event) => event.ical_uid,
-                    SyncChange::Deleted { href_hint, .. } => href_hint
-                        .strip_suffix(".ics")
-                        .map(str::to_owned)
-                        .unwrap_or(href_hint),
-                };
-                if !touched.contains(&uid) {
-                    touched.push(uid);
-                }
-            }
-            if !touched.is_empty() {
-                events = calendar_service
-                    .get_events_by_ical_uids(calendar_id, &touched, user.id)
-                    .await
-                    .map_err(AppError::from)?;
-            }
-            deleted_hrefs = touched
+            // Already hydrated per UID bundle, events AND tasks — see
+            // `CaldavSyncCollectionService::list_changes_with_perms`.
+            events = delta.events;
+            todos = delta.todos;
+            deleted_hrefs = delta
+                .deleted_uids
                 .iter()
-                .filter(|uid| !events.iter().any(|e| &e.ical_uid == *uid))
                 .map(|uid| format!("{}{}.ics", base_href, uid))
                 .collect();
             sync_token = Some(delta.new_token.to_string());
