@@ -21,6 +21,7 @@ use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use oxicloud::access_log;
+use oxicloud::interfaces::middleware::lingering_body::lingering_body_middleware;
 use oxicloud::interfaces::middleware::trace_span::{ClientIpMakeSpan, UuidRequestId};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
@@ -1192,7 +1193,8 @@ async fn run(config: common::config::AppConfig) -> Result<(), Box<dyn std::error
             .layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
                 auth_middleware,
-            ));
+            ))
+            .layer(axum::middleware::from_fn(lingering_body_middleware));
 
         // Magic-link redemption — public, no CSRF, no rate limit (the token IS
         // the credential and `mark_used` is single-use). PR 12 will add a
@@ -1357,6 +1359,7 @@ async fn run(config: common::config::AppConfig) -> Result<(), Box<dyn std::error
             app = app.merge(
                 nc_router
                     .with_state(app_state.clone())
+                    .layer(axum::middleware::from_fn(lingering_body_middleware))
                     .layer(access_log!("http::nextcloud")),
             );
         }
