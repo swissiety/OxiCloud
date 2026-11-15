@@ -218,7 +218,6 @@ impl AppError {
             "ServiceUnavailable",
         )
     }
-
 }
 
 /// HTTP status for a domain error kind.

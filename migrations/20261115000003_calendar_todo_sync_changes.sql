@@ -3,7 +3,7 @@
 -- `caldav.calendar_todos` (#754, `20261029000000_caldav_vtodo.sql`) shares
 -- the calendar collection with `caldav.calendar_events`, so a task change
 -- must advance the same per-calendar change log
--- (`20261104000001_calendar_sync_changes.sql`). Without these triggers an
+-- (`20261115000001_calendar_sync_changes.sql`). Without these triggers an
 -- incremental sync-collection never reports a created, edited or deleted
 -- task: the client keeps a stale copy forever.
 --
