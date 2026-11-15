@@ -631,6 +631,13 @@ async fn handle_sync_collection(
     // result (benches/DEAD-PROPS.md).
     let file_deads = files_dead_props_map(&state.webdav_dead_props, &files).await;
     let folder_deads = folders_dead_props_map(&state.webdav_dead_props, &subfolders).await;
+    // `nc:creation_time`, batched like the other side channels; see the
+    // PROPFIND path above.
+    let file_meta = crate::interfaces::nextcloud::nc_creation_times(
+        &state.repositories.file_metadata_repository,
+        &file_uuids,
+    )
+    .await;
 
     let mut buf = Vec::new();
     {
@@ -655,6 +662,7 @@ async fn handle_sync_collection(
                 &user.username,
                 &favorite_ids,
                 dead,
+                super::nc_creation_time(&file_meta, &file.id),
             )
             .map_err(|e| AppError::internal_error(format!("XML write error: {}", e)))?;
         }
