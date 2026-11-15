@@ -475,3 +475,58 @@ mod transient_tests {
         assert_eq!(ErrorKind::TransientBackend.as_str(), "Transient Backend");
     }
 }
+
+/// Turns a lookup's `NotFound` into `Ok(None)` and passes every other
+/// error through unchanged.
+///
+/// Use it wherever "the row is gone" and "the read failed" lead to
+/// different outcomes. A read failure is never proof of absence: if a
+/// database error became `None`, a sync-collection resolver would tell
+/// the client to delete data that still exists.
+pub trait NotFoundAsNone<T> {
+    fn not_found_as_none(self) -> std::result::Result<Option<T>, DomainError>;
+}
+
+impl<T> NotFoundAsNone<T> for std::result::Result<T, DomainError> {
+    fn not_found_as_none(self) -> std::result::Result<Option<T>, DomainError> {
+        match self {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_found_becomes_none() {
+        let r: Result<u8> = Err(DomainError::not_found("Folder", "x"));
+        assert!(matches!(r.not_found_as_none(), Ok(None)));
+    }
+
+    /// Regression: the sync-collection resolvers used `.ok()`, which made
+    /// a failed DB read look like a deleted member, so the client was sent
+    /// a 404 tombstone and deleted data that still existed. Only NotFound
+    /// may mean absent.
+    #[test]
+    fn other_errors_are_not_absence() {
+        for kind in [
+            ErrorKind::DatabaseError,
+            ErrorKind::InternalError,
+            ErrorKind::Timeout,
+            ErrorKind::AccessDenied,
+        ] {
+            let r: Result<u8> = Err(DomainError::new(kind, "Folder", "boom"));
+            assert_eq!(r.not_found_as_none().unwrap_err().kind, kind);
+        }
+    }
+
+    #[test]
+    fn ok_becomes_some() {
+        let r: Result<u8> = Ok(7);
+        assert_eq!(r.not_found_as_none().unwrap(), Some(7));
+    }
+}

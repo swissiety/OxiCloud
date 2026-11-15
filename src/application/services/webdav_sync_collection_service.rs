@@ -20,6 +20,7 @@ use crate::application::ports::change_log_port::{SyncChange, SyncDelta};
 use crate::application::ports::storage_ports::FileReadPort;
 use crate::common::errors::DomainError;
 use crate::domain::entities::sync_token::SyncToken;
+use crate::domain::errors::NotFoundAsNone;
 use crate::domain::repositories::folder_repository::FolderRepository;
 use crate::domain::repositories::folder_sync_change_repository::{
     FolderSyncChangeRepository, SyncChangeKind, SyncMemberType,
@@ -160,25 +161,24 @@ impl WebdavSyncCollectionService {
                 }
                 SyncChangeKind::Created | SyncChangeKind::Updated => {
                     let member_id = row.member_id.to_string();
-                    // The member may have been hard-deleted/purged after
-                    // this row was logged but before we resolved it — the
-                    // deleted-branch will have (or will soon) log its own
-                    // tombstone; degrade this row to a Deleted entry with
-                    // the last-known name rather than surfacing a lookup
-                    // error to the client.
+                    // `None`: hard-deleted/purged after this row was
+                    // logged → degrade to a tombstone with the last-known
+                    // name. Any other lookup failure aborts the REPORT:
+                    // a read failure is never proof of absence, and a
+                    // false tombstone makes the client delete live data.
                     let resolved = match row.member_type {
                         SyncMemberType::Folder => self
                             .folder_storage
                             .get_folder(&member_id)
                             .await
-                            .map(|f| WebdavSyncMember::Folder(FolderDto::from(f)))
-                            .ok(),
+                            .not_found_as_none()?
+                            .map(|f| WebdavSyncMember::Folder(FolderDto::from(f))),
                         SyncMemberType::File => self
                             .file_read
                             .get_file(&member_id)
                             .await
-                            .map(|f| WebdavSyncMember::File(FileDto::from(f)))
-                            .ok(),
+                            .not_found_as_none()?
+                            .map(|f| WebdavSyncMember::File(FileDto::from(f))),
                     };
                     match resolved {
                         Some(member) => changes.push(SyncChange::Upserted(member)),

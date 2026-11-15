@@ -15,6 +15,7 @@ use crate::application::services::sync_collection_engine::{
 };
 use crate::common::errors::DomainError;
 use crate::domain::entities::sync_token::SyncToken;
+use crate::domain::errors::NotFoundAsNone;
 use crate::domain::repositories::contact_repository::ContactRepository;
 use crate::domain::services::authorization::Resource;
 use crate::infrastructure::repositories::pg::ContactPgRepository;
@@ -28,16 +29,21 @@ struct ContactMemberResolver {
 impl SyncMemberResolver for ContactMemberResolver {
     type Member = ContactDto;
 
-    async fn resolve(&self, member_id: Uuid, _label: &str) -> Option<ContactDto> {
-        // The member may have been hard-deleted after this row was logged
-        // but before we resolved it — degrade to `None` (→ `Deleted`)
-        // rather than surfacing the lookup error to the client.
-        self.contact_storage
+    async fn resolve(
+        &self,
+        member_id: Uuid,
+        _label: &str,
+    ) -> Result<Option<ContactDto>, DomainError> {
+        // `Ok(None)`: hard-deleted after the row was logged → the engine
+        // emits a tombstone. A failed read stays an error — reporting it
+        // as deleted would make the client drop a contact that exists.
+        let contact = self
+            .contact_storage
             .get_contact_by_id(&member_id)
             .await
-            .ok()
-            .flatten()
-            .map(ContactDto::from)
+            .not_found_as_none()?
+            .flatten();
+        Ok(contact.map(ContactDto::from))
     }
 }
 

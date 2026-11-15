@@ -984,16 +984,10 @@ async fn handle_report(
                 None => {
                     let subfolders = folder_service
                         .list_folders_with_perms(fid_ref, user.id)
-                        .await
-                        .map_err(|e| {
-                            AppError::internal_error(format!("Failed to list folders: {}", e))
-                        })?;
+                        .await?;
                     let files = file_retrieval_service
                         .list_files_with_perms(fid_ref, user.id)
-                        .await
-                        .map_err(|e| {
-                            AppError::internal_error(format!("Failed to list files: {}", e))
-                        })?;
+                        .await?;
                     let new_token = sync_service
                         .mint_initial_token(collection_id, user.id)
                         .await?;
@@ -1035,12 +1029,10 @@ async fn handle_report(
         let (subfolders, files) = if depth == "1" {
             let subfolders = folder_service
                 .list_folders_with_perms(fid_ref, user.id)
-                .await
-                .map_err(|e| AppError::internal_error(format!("Failed to list folders: {}", e)))?;
+                .await?;
             let files = file_retrieval_service
                 .list_files_with_perms(fid_ref, user.id)
-                .await
-                .map_err(|e| AppError::internal_error(format!("Failed to list files: {}", e)))?;
+                .await?;
             (subfolders, files)
         } else {
             (Vec::new(), Vec::new())

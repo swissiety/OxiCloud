@@ -41,8 +41,8 @@ struct CalendarUidResolver;
 impl SyncMemberResolver for CalendarUidResolver {
     type Member = String;
 
-    async fn resolve(&self, _member_id: Uuid, label: &str) -> Option<String> {
-        Some(label.to_owned())
+    async fn resolve(&self, _member_id: Uuid, label: &str) -> Result<Option<String>, DomainError> {
+        Ok(Some(label.to_owned()))
     }
 }
 

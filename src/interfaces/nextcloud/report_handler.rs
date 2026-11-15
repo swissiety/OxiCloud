@@ -18,7 +18,6 @@ use crate::application::dtos::favorites_dto::ItemKind;
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
 use crate::application::dtos::search_dto::SearchCriteriaDto;
-use crate::application::ports::authorization_ports::AuthorizationEngine;
 use crate::application::ports::change_log_port::SyncChange;
 use crate::application::ports::favorites_ports::FavoritesUseCase;
 use crate::application::ports::file_ports::FileRetrievalUseCase;
@@ -28,7 +27,6 @@ use crate::application::services::webdav_sync_collection_service::WebdavSyncMemb
 use crate::common::di::AppState;
 use crate::domain::entities::file::File;
 use crate::domain::entities::sync_token::SyncToken;
-use crate::domain::services::authorization::{Permission, Resource, Subject};
 use crate::infrastructure::services::path_resolver_service::ResolvedResource;
 use crate::interfaces::api::handlers::webdav_handler::{
     dead_props_for, files_dead_props_map, folders_dead_props_map,
@@ -514,14 +512,9 @@ async fn handle_sync_collection(
     };
     let folder_uuid =
         Uuid::parse_str(&folder.id).map_err(|_| AppError::not_found("Resource not found"))?;
-    state
-        .authorization
-        .require(
-            Subject::User(user.id),
-            Permission::Read,
-            Resource::Folder(folder_uuid),
-        )
-        .await?;
+    // No handler-level authz: every service call below
+    // (`mint_initial_token`, `list_*_with_perms`, `list_changes_with_perms`)
+    // checks Read on this folder itself (AGENTS.md § Authorization).
 
     let folder_service = &state.applications.folder_service;
     let file_service = &state.applications.file_retrieval_service;
@@ -555,16 +548,10 @@ async fn handle_sync_collection(
             None => {
                 let subfolders = folder_service
                     .list_folders_with_perms(Some(&folder.id), user.id)
-                    .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to list folders: {}", e))
-                    })?;
+                    .await?;
                 let files = file_service
                     .list_files_with_perms(Some(&folder.id), user.id)
-                    .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!("Failed to list files: {}", e))
-                    })?;
+                    .await?;
                 let new_token = sync_service
                     .mint_initial_token(folder_uuid, user.id)
                     .await?;

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tracing::{debug, error, info};
 
+use crate::common::errors::DomainError;
 use crate::domain::repositories::folder_sync_change_repository::FolderSyncChangeRepository;
 use crate::domain::repositories::sync_change_log_repository::SyncChangeLogRepository;
 use crate::infrastructure::repositories::pg::calendar_sync_change_pg_repository::CalendarSyncChangePgRepository;
@@ -42,12 +43,51 @@ pub struct SyncLogRetentionService {
 
 /// Per-domain outcome of one sweep. Kept separate from `JobOutcome` so the
 /// "does the whole run count as failed" decision lives in one place
-/// (`run()`), not scattered across `sweep()`.
+/// (`SweepStats::into_outcome`), not scattered across `sweep()`.
+#[derive(Default)]
 struct SweepStats {
     folder_deleted: u64,
     calendar_deleted: u64,
     contact_deleted: u64,
     errors: Vec<String>,
+}
+
+impl SweepStats {
+    fn total(&self) -> u64 {
+        self.folder_deleted + self.calendar_deleted + self.contact_deleted
+    }
+
+    /// Any failed sweep fails the run. A log that was not trimmed is work
+    /// skipped, and a job that skips work must not report success
+    /// (AGENTS.md § Resilience). Rows the other sweeps purged stay purged;
+    /// the counts travel in the error message so the run history still
+    /// shows them.
+    fn into_outcome(self) -> JobOutcome {
+        let extra = serde_json::json!({
+            "folder_deleted": self.folder_deleted,
+            "calendar_deleted": self.calendar_deleted,
+            "contact_deleted": self.contact_deleted,
+            "errors": self.errors,
+        });
+        if self.errors.is_empty() {
+            JobOutcome::ok_with(self.total(), extra)
+        } else {
+            JobOutcome::err(format!(
+                "sync-log retention: {} sweep(s) failed: {extra}",
+                self.errors.len()
+            ))
+        }
+    }
+}
+
+/// Folds one sweep call's result into the run: the purged count on
+/// success, a logged and recorded error otherwise.
+fn record(result: Result<u64, DomainError>, what: &str, errors: &mut Vec<String>) -> u64 {
+    result.unwrap_or_else(|e| {
+        error!("Sync-log {what} sweep failed: {e:?}");
+        errors.push(format!("{what}: {e}"));
+        0
+    })
 }
 
 impl SyncLogRetentionService {
@@ -94,79 +134,51 @@ impl SyncLogRetentionService {
     /// `TrashCleanupService::run_once`'s GC step.
     async fn sweep(&self) -> SweepStats {
         let cutoff = Utc::now() - chrono::Duration::days(self.retention_days);
-        let mut stats = SweepStats {
-            folder_deleted: 0,
-            calendar_deleted: 0,
-            contact_deleted: 0,
-            errors: Vec::new(),
-        };
+        let cap = self.max_rows_per_collection;
+        let mut stats = SweepStats::default();
 
-        match self.folder_change_log.delete_expired_before(cutoff).await {
-            Ok(n) => stats.folder_deleted += n,
-            Err(e) => {
-                error!("Folder sync-log retention sweep failed: {:?}", e);
-                stats.errors.push(format!("folder retention: {e}"));
-            }
-        }
-        match self
-            .folder_change_log
-            .enforce_row_cap(self.max_rows_per_collection)
-            .await
-        {
-            Ok(n) => stats.folder_deleted += n,
-            Err(e) => {
-                error!("Folder sync-log row-cap sweep failed: {:?}", e);
-                stats.errors.push(format!("folder row cap: {e}"));
-            }
-        }
+        // Every sweep runs even if an earlier one failed: one broken log
+        // must not stop the other two from being trimmed.
+        stats.folder_deleted += record(
+            self.folder_change_log.delete_expired_before(cutoff).await,
+            "folder retention",
+            &mut stats.errors,
+        );
+        stats.folder_deleted += record(
+            self.folder_change_log.enforce_row_cap(cap).await,
+            "folder row cap",
+            &mut stats.errors,
+        );
+        stats.calendar_deleted += record(
+            self.calendar_change_log.delete_expired_before(cutoff).await,
+            "calendar retention",
+            &mut stats.errors,
+        );
+        stats.calendar_deleted += record(
+            self.calendar_change_log.enforce_row_cap(cap).await,
+            "calendar row cap",
+            &mut stats.errors,
+        );
+        stats.contact_deleted += record(
+            self.contact_change_log.delete_expired_before(cutoff).await,
+            "contact retention",
+            &mut stats.errors,
+        );
+        stats.contact_deleted += record(
+            self.contact_change_log.enforce_row_cap(cap).await,
+            "contact row cap",
+            &mut stats.errors,
+        );
 
-        match self.calendar_change_log.delete_expired_before(cutoff).await {
-            Ok(n) => stats.calendar_deleted += n,
-            Err(e) => {
-                error!("Calendar sync-log retention sweep failed: {:?}", e);
-                stats.errors.push(format!("calendar retention: {e}"));
-            }
-        }
-        match self
-            .calendar_change_log
-            .enforce_row_cap(self.max_rows_per_collection)
-            .await
-        {
-            Ok(n) => stats.calendar_deleted += n,
-            Err(e) => {
-                error!("Calendar sync-log row-cap sweep failed: {:?}", e);
-                stats.errors.push(format!("calendar row cap: {e}"));
-            }
-        }
-
-        match self.contact_change_log.delete_expired_before(cutoff).await {
-            Ok(n) => stats.contact_deleted += n,
-            Err(e) => {
-                error!("Contact sync-log retention sweep failed: {:?}", e);
-                stats.errors.push(format!("contact retention: {e}"));
-            }
-        }
-        match self
-            .contact_change_log
-            .enforce_row_cap(self.max_rows_per_collection)
-            .await
-        {
-            Ok(n) => stats.contact_deleted += n,
-            Err(e) => {
-                error!("Contact sync-log row-cap sweep failed: {:?}", e);
-                stats.errors.push(format!("contact row cap: {e}"));
-            }
-        }
-
-        let total = stats.folder_deleted + stats.calendar_deleted + stats.contact_deleted;
-        if total == 0 && stats.errors.is_empty() {
-            debug!("Sync-log retention: nothing to purge");
-        } else if !stats.errors.is_empty() {
+        let total = stats.total();
+        if !stats.errors.is_empty() {
             info!(
                 "Sync-log retention: purged {total} row(s) with {} error(s): {:?}",
                 stats.errors.len(),
                 stats.errors
             );
+        } else if total == 0 {
+            debug!("Sync-log retention: nothing to purge");
         } else {
             info!("Sync-log retention: purged {total} row(s)");
         }
@@ -183,32 +195,60 @@ impl JobHandler for SyncLogRetentionService {
 
     /// `args.force` is ignored — retention days and the row cap are fixed
     /// policy, not a per-run override (same as `TrashCleanupService::run`).
-    ///
-    /// The whole run is `JobOutcome::Err` only if every one of the six
-    /// underlying sweep calls (2 per domain) failed — i.e. nothing at all
-    /// happened this sweep. Any partial success still reports `Ok` with
-    /// the summed count and the per-domain breakdown (including any
-    /// errors) in `extra`, so admins keep full visibility through
-    /// `GET /api/admin/jobs/sync_log_retention/runs` instead of logs-only.
+    /// See `SweepStats::into_outcome` for when a run counts as failed.
     async fn run(&self, _args: &JobRunArgs) -> JobOutcome {
-        let stats = self.sweep().await;
-        let total = stats.folder_deleted + stats.calendar_deleted + stats.contact_deleted;
+        self.sweep().await.into_outcome()
+    }
+}
 
-        if total == 0 && stats.errors.len() >= 6 {
-            return JobOutcome::err(format!(
-                "sync-log retention: all sweeps failed: {:?}",
-                stats.errors
-            ));
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        JobOutcome::ok_with(
-            total,
-            serde_json::json!({
-                "folder_deleted": stats.folder_deleted,
-                "calendar_deleted": stats.calendar_deleted,
-                "contact_deleted": stats.contact_deleted,
-                "errors": stats.errors,
-            }),
-        )
+    /// Regression: the run reported `Ok` unless all six sweeps failed, so
+    /// a log that never got trimmed (five failures, one success) looked
+    /// healthy in the admin job history. One failure must fail the run.
+    #[test]
+    fn one_failed_sweep_fails_the_run() {
+        let stats = SweepStats {
+            folder_deleted: 12,
+            errors: vec!["calendar row cap: db down".to_owned()],
+            ..SweepStats::default()
+        };
+        let outcome = stats.into_outcome();
+        assert!(!outcome.is_ok());
+        let JobOutcome::Err { message } = outcome else {
+            unreachable!()
+        };
+        assert!(message.contains("calendar row cap"), "{message}");
+        assert!(message.contains("\"folder_deleted\":12"), "{message}");
+    }
+
+    #[test]
+    fn a_clean_run_reports_the_total() {
+        let stats = SweepStats {
+            folder_deleted: 1,
+            calendar_deleted: 2,
+            contact_deleted: 3,
+            errors: Vec::new(),
+        };
+        let JobOutcome::Ok { count, .. } = stats.into_outcome() else {
+            panic!("clean run must be Ok")
+        };
+        assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn record_keeps_the_count_or_the_error() {
+        let mut errors = Vec::new();
+        assert_eq!(record(Ok(4), "x", &mut errors), 4);
+        let failed = record(
+            Err(DomainError::database_error("boom")),
+            "folder retention",
+            &mut errors,
+        );
+        assert_eq!(failed, 0);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("folder retention: "));
     }
 }
