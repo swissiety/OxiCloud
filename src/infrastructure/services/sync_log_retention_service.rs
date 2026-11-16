@@ -6,7 +6,6 @@ use chrono::Utc;
 use tracing::{debug, error, info};
 
 use crate::common::errors::DomainError;
-use crate::domain::repositories::folder_sync_change_repository::FolderSyncChangeRepository;
 use crate::domain::repositories::sync_change_log_repository::SyncChangeLogRepository;
 use crate::infrastructure::repositories::pg::calendar_sync_change_pg_repository::CalendarSyncChangePgRepository;
 use crate::infrastructure::repositories::pg::contact_sync_change_pg_repository::ContactSyncChangePgRepository;

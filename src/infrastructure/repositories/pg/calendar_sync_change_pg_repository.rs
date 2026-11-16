@@ -14,6 +14,7 @@ impl SyncChangeLogSchema for CalendarSyncChangeSchema {
     const WATERMARK_TABLE: &'static str = "caldav.calendar_sync_watermark";
     const COLLECTION_ID_COLUMN: &'static str = "collection_calendar_id";
     const LABEL_COLUMN: &'static str = "member_ical_uid";
+    const IS_COLLECTION_EXPR: &'static str = "false";
     const LOG_NAME: &'static str = "calendar_sync_changes";
 }
 

@@ -1,15 +1,13 @@
 //! Shared shape for RFC 6578 incremental sync-collection deltas.
 //!
-//! WebDAV (folders/files), CalDAV (calendar events), and CardDAV (contacts)
-//! each get their own change-log repository trait and table — deliberately
-//! WITHOUT a FK from the change-log row to its parent collection (see the
-//! `*_sync_changes` migrations and
-//! `domain/repositories/folder_sync_change_repository.rs` for why: a bulk
-//! delete of a collection can outrun the tombstone insert for its own
-//! members) — but every one of those traits returns `SyncDelta<M>` built
-//! from these two types, so the response-building and depth/token-validation
-//! logic in the handlers is written once against this shape and reused by
-//! all three protocols instead of growing a fourth/fifth bespoke copy.
+//! WebDAV (folders/files), CalDAV (calendar events) and CardDAV (contacts)
+//! each have their own change-log table, deliberately WITHOUT a FK from the
+//! change-log row to its parent collection (a bulk delete of a collection
+//! can outrun the tombstone insert for its own members — see the
+//! `*_sync_changes` migrations). All three are read through one
+//! `SyncChangeLogRepository` and resolved by one `SyncCollectionEngine` into
+//! `SyncDelta<M>`, so the response-building and token-validation logic in the
+//! handlers is written once against this shape.
 //!
 //! **Assumption baked into this design: the `AuthorizationEngine` is
 //! grant-only (additive).** A caller's set of visible collections can only

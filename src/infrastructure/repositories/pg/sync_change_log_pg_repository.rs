@@ -1,14 +1,12 @@
 //! Generic PostgreSQL-backed change-log repository for RFC 6578
 //! `sync-collection` — parameterized over table/column names via
-//! `SyncChangeLogSchema` so `CalendarSyncChangePgRepository` and
-//! `ContactSyncChangePgRepository` (see the two schema files next to this
-//! one) collapse to a schema struct + type alias instead of a hand-copied
-//! impl each. WebDAV's `FolderSyncChangePgRepository` stays hand-rolled
-//! (5-column row incl. member_type, two source tables) — not a fit here.
+//! `SyncChangeLogSchema` so the folder, calendar and contact logs (see the
+//! three schema files next to this one) are each a schema struct + type
+//! alias instead of a hand-copied impl.
 //!
 //! SQL safety note: every `{table}`/`{column}` substitution below comes
 //! from a `SyncChangeLogSchema::CONST` — a compiler-controlled
-//! `&'static str` fixed at the two `impl` sites in this crate, never from
+//! `&'static str` fixed at the `impl` sites in this crate, never from
 //! request/user input — so the runtime `format!()`-templated SQL carries
 //! no injection risk despite not going through the compile-time-checked
 //! `sqlx::query!` macro (this crate uses runtime query strings throughout).
@@ -40,9 +38,13 @@ pub trait SyncChangeLogSchema: Send + Sync + 'static {
     /// / `"collection_address_book_id"`) — also the watermark table's
     /// primary key column.
     const COLLECTION_ID_COLUMN: &'static str;
-    /// The row's identifying-label column (`"member_ical_uid"` /
-    /// `"member_uid"`) — becomes `SyncChangeRow::label`.
+    /// The row's identifying-label column (`"member_href_name"` /
+    /// `"member_ical_uid"` / `"member_uid"`) — becomes `SyncChangeRow::label`.
     const LABEL_COLUMN: &'static str;
+    /// Boolean SQL expression over the log's columns that becomes
+    /// `SyncChangeRow::is_collection` — `"member_type = 'folder'"` for the
+    /// WebDAV log, `"false"` for logs whose members are never containers.
+    const IS_COLLECTION_EXPR: &'static str;
     /// Short human tag for error messages (`"calendar_sync_changes"` /
     /// `"contact_sync_changes"`) — cosmetic only, never interpolated into SQL.
     const LOG_NAME: &'static str;
@@ -70,9 +72,11 @@ impl<S: SyncChangeLogSchema> SyncChangeLogRepository for SyncChangeLogPgReposito
     ) -> Result<(Vec<SyncChangeRow>, u64), DomainError> {
         let since = since_seq.map(|s| s as i64).unwrap_or(0);
 
-        // Capture the upper bound FIRST — see the WebDAV repo's
-        // `changes_since` comment for why a query issued after the delta
-        // fetch would race a concurrent insert and silently drop it.
+        // Capture the upper bound FIRST and bound the delta query by it
+        // (`seq <= $3`). Reading MAX(seq) after the delta query would race
+        // a concurrent insert: its seq could become the minted token while
+        // the row itself was not in the fetched delta, and the next poll
+        // (`seq > token`) would skip it forever.
         let max_sql = format!(
             "SELECT MAX(seq) FROM {} WHERE {} = $1",
             S::TABLE,
@@ -86,14 +90,17 @@ impl<S: SyncChangeLogSchema> SyncChangeLogRepository for SyncChangeLogPgReposito
 
         let new_token_seq = max_seq.unwrap_or(since).max(since) as u64;
 
-        // Row order doesn't matter to the client — see the WebDAV repo's
-        // `changes_since` comment; the same-href-collision hazard is
-        // handled by dropping stale tombstones before rendering (see
-        // `sync_collection_engine.rs`), not by row order here.
+        // DISTINCT ON collapses churn to the latest row per member. Row
+        // order doesn't matter to the client: the response buckets upserts
+        // and deletions separately, so the one ordering hazard (a stale
+        // tombstone outliving a same-href recreation in one poll window)
+        // is handled by dropping such tombstones in
+        // `sync_collection_engine.rs`, not by row order here.
         let sql = format!(
             r#"
             SELECT DISTINCT ON (member_id)
-                   member_id, {label} AS label, change_kind
+                   member_id, {label} AS label, change_kind,
+                   ({is_collection}) AS is_collection
               FROM {table}
              WHERE {collection_col} = $1
                AND seq > $2
@@ -101,11 +108,12 @@ impl<S: SyncChangeLogSchema> SyncChangeLogRepository for SyncChangeLogPgReposito
              ORDER BY member_id, seq DESC
             "#,
             label = S::LABEL_COLUMN,
+            is_collection = S::IS_COLLECTION_EXPR,
             table = S::TABLE,
             collection_col = S::COLLECTION_ID_COLUMN,
         );
 
-        let rows = sqlx::query_as::<_, (Uuid, String, String)>(&sql)
+        let rows = sqlx::query_as::<_, (Uuid, String, String, bool)>(&sql)
             .bind(collection_id)
             .bind(since)
             .bind(new_token_seq as i64)
@@ -117,15 +125,18 @@ impl<S: SyncChangeLogSchema> SyncChangeLogRepository for SyncChangeLogPgReposito
 
         let changes = rows
             .into_iter()
-            .map(|(member_id, label, change_kind)| SyncChangeRow {
-                member_id,
-                label,
-                kind: match change_kind.as_str() {
-                    "created" => SyncChangeKind::Created,
-                    "deleted" => SyncChangeKind::Deleted,
-                    _ => SyncChangeKind::Updated,
+            .map(
+                |(member_id, label, change_kind, is_collection)| SyncChangeRow {
+                    member_id,
+                    label,
+                    kind: match change_kind.as_str() {
+                        "created" => SyncChangeKind::Created,
+                        "deleted" => SyncChangeKind::Deleted,
+                        _ => SyncChangeKind::Updated,
+                    },
+                    is_collection,
                 },
-            })
+            )
             .collect();
 
         Ok((changes, new_token_seq))

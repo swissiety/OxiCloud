@@ -1,14 +1,14 @@
-//! Shared engine behind CalDAV's and CardDAV's `sync-collection` services
-//! — both resolve a homogeneous change log into `SyncDelta<M>` with
-//! identical control flow (authz gate → expiry check → changes_since →
-//! per-row resolve-or-degrade). WebDAV's service stays hand-rolled
-//! (`WebdavSyncCollectionService`, heterogeneous folder/file members,
-//! drive/path resolution) — not a fit here, per that service's doc comment.
+//! Shared engine behind every `sync-collection` service — WebDAV folders,
+//! CalDAV calendars and CardDAV address books resolve their change log
+//! into `SyncDelta<M>` with identical control flow: authz gate → expiry
+//! check → changes_since → drop stale tombstones → one batch lookup of the
+//! still-live members → tombstone whatever the lookup no longer finds.
 //!
 //! Authz here assumes a grant-only engine — see
 //! `application::ports::change_log_port`'s module doc for the reasoning
 //! and why deny rules would need this revisited.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -18,31 +18,30 @@ use crate::application::ports::change_log_port::{SyncChange, SyncDelta};
 use crate::common::errors::DomainError;
 use crate::domain::entities::sync_token::SyncToken;
 use crate::domain::repositories::sync_change_log_repository::{
-    SyncChangeKind, SyncChangeLogRepository,
+    SyncChangeKind, SyncChangeLogRepository, SyncChangeRow,
 };
 use crate::domain::services::authorization::{Permission, Resource, Subject};
 use crate::infrastructure::services::pg_acl_engine::PgAclEngine;
 
-/// Per-domain hook resolving a `Created`/`Updated` row's member id back to
-/// its current DTO.
+/// Per-domain hook resolving the `Created`/`Updated` rows of one delta to
+/// their current DTOs, in one batch.
 ///
-/// `Ok(None)` means the member is **gone** (hard-deleted or purged after
-/// the row was logged); the engine turns that into a `Deleted` entry.
-/// Any other failure must be `Err`: a read failure is never proof of
-/// absence, and a wrongly emitted tombstone makes the client delete data
-/// that still exists. Use `NotFoundAsNone` to map a lookup's `NotFound`.
+/// Returns the members that still exist, keyed by `member_id`. A row whose
+/// id is missing from the map is **gone** (hard-deleted, purged or trashed
+/// after it was logged) and the engine emits a tombstone for it. Any lookup
+/// failure must be `Err`: a read failure is never proof of absence, and a
+/// wrongly emitted tombstone makes the client delete data that still exists.
 ///
-/// `label` is the row's logged label (iCalendar / vCard UID). A domain
-/// whose resource is addressed by label rather than by row — CalDAV, where
-/// a master and its RECURRENCE-ID overrides share one href — resolves to
-/// the label alone and hydrates the touched resources in one batch itself.
+/// One call per REPORT, never one per row: a delta can hold up to the
+/// per-collection row cap (default 20k), and a per-row lookup would turn
+/// that into as many database round trips.
 pub trait SyncMemberResolver: Send + Sync + 'static {
     type Member;
-    async fn resolve(
+    async fn resolve_batch(
         &self,
-        member_id: Uuid,
-        label: &str,
-    ) -> Result<Option<Self::Member>, DomainError>;
+        collection_id: Uuid,
+        rows: &[&SyncChangeRow],
+    ) -> Result<HashMap<Uuid, Self::Member>, DomainError>;
 }
 
 pub struct SyncCollectionEngine<L, R, A = PgAclEngine>
@@ -54,12 +53,12 @@ where
     change_log: Arc<L>,
     resolver: R,
     authz: Arc<A>,
-    /// `Resource::Calendar` / `Resource::AddressBook` are themselves valid
-    /// `fn(Uuid) -> Resource` values (tuple-variant constructors) — no
-    /// closure needed.
+    /// `Resource::Folder` / `Resource::Calendar` / `Resource::AddressBook`
+    /// are themselves valid `fn(Uuid) -> Resource` values (tuple-variant
+    /// constructors) — no closure needed.
     resource_of: fn(Uuid) -> Resource,
     /// Turns a row's `label` into the `href_hint` a `Deleted` entry
-    /// carries (`"{label}.ics"` / `"{label}.vcf"`).
+    /// carries (the bare name for WebDAV, `"{label}.vcf"` for CardDAV).
     label_to_href_hint: fn(&str) -> String,
     /// `entity_type` passed to `DomainError::sync_token_expired`.
     error_tag: &'static str,
@@ -89,6 +88,16 @@ where
         }
     }
 
+    async fn require_read(&self, collection_id: Uuid, caller_id: Uuid) -> Result<(), DomainError> {
+        self.authz
+            .require(
+                Subject::User(caller_id),
+                Permission::Read,
+                (self.resource_of)(collection_id),
+            )
+            .await
+    }
+
     /// Mints the token an **initial** sync response should hand back
     /// (empty/absent client `sync-token`). Cheaper than routing through
     /// `list_changes_with_perms`, which would also walk the collection's
@@ -98,14 +107,7 @@ where
         collection_id: Uuid,
         caller_id: Uuid,
     ) -> Result<SyncToken, DomainError> {
-        self.authz
-            .require(
-                Subject::User(caller_id),
-                Permission::Read,
-                (self.resource_of)(collection_id),
-            )
-            .await?;
-
+        self.require_read(collection_id, caller_id).await?;
         let seq = self.change_log.current_seq(collection_id).await?;
         Ok(SyncToken::mint(collection_id, seq))
     }
@@ -121,13 +123,7 @@ where
         since_token: Option<SyncToken>,
         caller_id: Uuid,
     ) -> Result<SyncDelta<R::Member>, DomainError> {
-        self.authz
-            .require(
-                Subject::User(caller_id),
-                Permission::Read,
-                (self.resource_of)(collection_id),
-            )
-            .await?;
+        self.require_read(collection_id, caller_id).await?;
 
         if let Some(token) = since_token
             && self
@@ -152,48 +148,43 @@ where
             .await?;
 
         // A `label` (→ href) can appear on more than one row in this
-        // batch: CalDAV/CardDAV "update" is delete+recreate at the DB
-        // layer (a brand-new `member_id`, never a SQL UPDATE of the old
-        // row — see the migration header), so deleting then recreating
-        // the same href within one poll window produces two genuinely
-        // different rows — a tombstone for the old member_id and a
-        // creation for the new one. The handler renders upserts and
-        // deletions as separate buckets (`split_homogeneous`), which
-        // can't express "this happened before that", so a stale
-        // tombstone sharing a href with a live upsert in the SAME batch
-        // must be dropped here — the href demonstrably still exists,
-        // and a client has no order-based way to reach that conclusion
-        // itself from the rendered response.
-        let live_labels: std::collections::HashSet<String> = rows
+        // batch: a delete followed by a fresh create of the same name
+        // within one poll window mints a brand-new `member_id` (CalDAV /
+        // CardDAV "update" is delete+recreate too), so it yields a
+        // tombstone for the old id and a creation for the new one. The
+        // response renders upserts and deletions as separate buckets,
+        // which can't express "this happened before that", so a stale
+        // tombstone sharing a href with a live row in the SAME batch is
+        // dropped here — the href demonstrably still exists.
+        let live: Vec<&SyncChangeRow> = rows
             .iter()
-            .filter(|r| !matches!(r.kind, SyncChangeKind::Deleted))
-            .map(|r| r.label.clone())
+            .filter(|r| r.kind != SyncChangeKind::Deleted)
             .collect();
+        let live_labels: HashSet<&str> = live.iter().map(|r| r.label.as_str()).collect();
+
+        let mut resolved = if live.is_empty() {
+            HashMap::new()
+        } else {
+            self.resolver.resolve_batch(collection_id, &live).await?
+        };
 
         let mut changes = Vec::with_capacity(rows.len());
-        for row in rows {
-            match row.kind {
-                SyncChangeKind::Deleted => {
-                    if live_labels.contains(row.label.as_str()) {
-                        continue;
-                    }
-                    changes.push(SyncChange::Deleted {
-                        member_id: row.member_id,
-                        href_hint: (self.label_to_href_hint)(&row.label),
-                        is_collection: false,
-                    });
-                }
+        for row in &rows {
+            let member = match row.kind {
+                SyncChangeKind::Deleted if live_labels.contains(row.label.as_str()) => continue,
+                SyncChangeKind::Deleted => None,
                 SyncChangeKind::Created | SyncChangeKind::Updated => {
-                    match self.resolver.resolve(row.member_id, &row.label).await? {
-                        Some(member) => changes.push(SyncChange::Upserted(member)),
-                        None => changes.push(SyncChange::Deleted {
-                            member_id: row.member_id,
-                            href_hint: (self.label_to_href_hint)(&row.label),
-                            is_collection: false,
-                        }),
-                    }
+                    resolved.remove(&row.member_id)
                 }
-            }
+            };
+            changes.push(match member {
+                Some(member) => SyncChange::Upserted(member),
+                None => SyncChange::Deleted {
+                    member_id: row.member_id,
+                    href_hint: (self.label_to_href_hint)(&row.label),
+                    is_collection: row.is_collection,
+                },
+            });
         }
 
         Ok(SyncDelta {
@@ -208,8 +199,8 @@ mod tests {
     use super::*;
     use crate::application::ports::authorization_ports::test_support::FakeEngine;
     use crate::domain::errors::ErrorKind;
-    use crate::domain::repositories::sync_change_log_repository::SyncChangeRow;
     use chrono::{DateTime, Utc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Change log that returns a fixed batch, never expired.
     struct FixedLog(Vec<SyncChangeRow>);
@@ -243,14 +234,25 @@ mod tests {
         Fails,
     }
 
-    struct StubResolver(Answer);
+    struct StubResolver {
+        answer: Answer,
+        calls: Arc<AtomicUsize>,
+    }
 
     impl SyncMemberResolver for StubResolver {
         type Member = String;
-        async fn resolve(&self, _: Uuid, label: &str) -> Result<Option<String>, DomainError> {
-            match self.0 {
-                Answer::Live => Ok(Some(label.to_owned())),
-                Answer::Gone => Ok(None),
+        async fn resolve_batch(
+            &self,
+            _: Uuid,
+            rows: &[&SyncChangeRow],
+        ) -> Result<HashMap<Uuid, String>, DomainError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.answer {
+                Answer::Live => Ok(rows
+                    .iter()
+                    .map(|r| (r.member_id, r.label.clone()))
+                    .collect()),
+                Answer::Gone => Ok(HashMap::new()),
                 Answer::Fails => Err(DomainError::new(
                     ErrorKind::DatabaseError,
                     "Contact",
@@ -265,6 +267,7 @@ mod tests {
             member_id: Uuid::new_v4(),
             label: label.to_owned(),
             kind,
+            is_collection: false,
         }
     }
 
@@ -273,9 +276,18 @@ mod tests {
         answer: Answer,
         caller: Uuid,
     ) -> SyncCollectionEngine<FixedLog, StubResolver, FakeEngine> {
+        engine_counting(rows, answer, caller, Arc::default())
+    }
+
+    fn engine_counting(
+        rows: Vec<SyncChangeRow>,
+        answer: Answer,
+        caller: Uuid,
+        calls: Arc<AtomicUsize>,
+    ) -> SyncCollectionEngine<FixedLog, StubResolver, FakeEngine> {
         SyncCollectionEngine::new(
             Arc::new(FixedLog(rows)),
-            StubResolver(answer),
+            StubResolver { answer, calls },
             Arc::new(FakeEngine::granting(vec![Subject::User(caller)])),
             Resource::AddressBook,
             |label| format!("{label}.vcf"),
@@ -356,5 +368,64 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Regression: WebDAV and CardDAV looked members up one query per
+    /// row, so a delta at the 20k row cap cost 20k round trips. The engine
+    /// must hand every live row to the resolver in ONE call.
+    #[tokio::test]
+    async fn live_rows_are_resolved_in_one_batch() {
+        let (caller, coll) = (Uuid::new_v4(), Uuid::new_v4());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rows = (0..50)
+            .map(|i| row(&format!("m{i}"), SyncChangeKind::Updated))
+            .collect();
+        let e = engine_counting(rows, Answer::Live, caller, calls.clone());
+        let delta = e
+            .list_changes_with_perms(coll, token(coll), caller)
+            .await
+            .unwrap();
+        assert_eq!(delta.changes.len(), 50);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A delta of pure deletions needs no lookup at all.
+    #[tokio::test]
+    async fn a_delete_only_delta_skips_the_resolver() {
+        let (caller, coll) = (Uuid::new_v4(), Uuid::new_v4());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let e = engine_counting(
+            vec![row("gone", SyncChangeKind::Deleted)],
+            Answer::Fails,
+            caller,
+            calls.clone(),
+        );
+        let delta = e
+            .list_changes_with_perms(coll, token(coll), caller)
+            .await
+            .unwrap();
+        assert_eq!(delta.changes.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A deleted WebDAV subfolder's tombstone keeps its collection flag,
+    /// so the handler renders its href with the trailing slash.
+    #[tokio::test]
+    async fn a_tombstone_keeps_the_collection_flag() {
+        let (caller, coll) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut folder = row("docs", SyncChangeKind::Deleted);
+        folder.is_collection = true;
+        let e = engine(vec![folder], Answer::Live, caller);
+        let delta = e
+            .list_changes_with_perms(coll, token(coll), caller)
+            .await
+            .unwrap();
+        assert!(matches!(
+            delta.changes.as_slice(),
+            [SyncChange::Deleted {
+                is_collection: true,
+                ..
+            }]
+        ));
     }
 }

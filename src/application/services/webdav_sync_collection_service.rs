@@ -1,31 +1,28 @@
 //! Application-layer orchestration for WebDAV `sync-collection` REPORT
-//! (RFC 6578) — resolves the durable change log
-//! (`FolderSyncChangeRepository`) into `SyncDelta<WebdavSyncMember>`,
-//! enforcing the same authz gate every other `_with_perms` method uses
-//! before touching the collection.
+//! (RFC 6578) — wraps `SyncCollectionEngine` over the
+//! `storage.folder_sync_changes` log, with a resolver that looks up the
+//! delta's folders and files in one batch query each.
 //!
 //! Kept as its own service (rather than folded into `FolderService`/
 //! `FileRetrievalService`) because it composes both — a WebDAV collection
 //! mixes file and folder members — without changing either service's
 //! constructor or existing call sites.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use uuid::Uuid;
 
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
-use crate::application::ports::authorization_ports::AuthorizationEngine;
-use crate::application::ports::change_log_port::{SyncChange, SyncDelta};
-use crate::application::ports::storage_ports::FileReadPort;
+use crate::application::ports::change_log_port::SyncDelta;
+use crate::application::services::sync_collection_engine::{
+    SyncCollectionEngine, SyncMemberResolver,
+};
 use crate::common::errors::DomainError;
 use crate::domain::entities::sync_token::SyncToken;
-use crate::domain::errors::NotFoundAsNone;
-use crate::domain::repositories::folder_repository::FolderRepository;
-use crate::domain::repositories::folder_sync_change_repository::{
-    FolderSyncChangeRepository, SyncChangeKind, SyncMemberType,
-};
-use crate::domain::services::authorization::{Permission, Resource, Subject};
+use crate::domain::repositories::sync_change_log_repository::SyncChangeRow;
+use crate::domain::services::authorization::Resource;
 use crate::infrastructure::repositories::pg::file_blob_read_repository::FileBlobReadRepository;
 use crate::infrastructure::repositories::pg::folder_db_repository::FolderDbRepository;
 use crate::infrastructure::repositories::pg::folder_sync_change_pg_repository::FolderSyncChangePgRepository;
@@ -40,11 +37,47 @@ pub enum WebdavSyncMember {
     File(FileDto),
 }
 
-pub struct WebdavSyncCollectionService {
-    change_log: Arc<FolderSyncChangePgRepository>,
+/// Resolves a delta's live rows with two batch queries, one per member
+/// type. Trashed members drop out of both (`NOT is_trashed`), so a member
+/// trashed after its row was logged is reported as deleted.
+struct WebdavMemberResolver {
     folder_storage: Arc<FolderDbRepository>,
     file_read: Arc<FileBlobReadRepository>,
-    authz: Arc<PgAclEngine>,
+}
+
+impl SyncMemberResolver for WebdavMemberResolver {
+    type Member = WebdavSyncMember;
+
+    async fn resolve_batch(
+        &self,
+        _collection_id: Uuid,
+        rows: &[&SyncChangeRow],
+    ) -> Result<HashMap<Uuid, WebdavSyncMember>, DomainError> {
+        let (folder_rows, file_rows): (Vec<_>, Vec<_>) = rows.iter().partition(|r| r.is_collection);
+        let ids = |rows: Vec<&&SyncChangeRow>| -> Vec<String> {
+            rows.iter().map(|r| r.member_id.to_string()).collect()
+        };
+        let (folder_ids, file_ids) = (ids(folder_rows), ids(file_rows));
+
+        let mut members = HashMap::with_capacity(rows.len());
+        if !folder_ids.is_empty() {
+            for folder in self.folder_storage.get_folders_by_ids(&folder_ids).await? {
+                let dto = FolderDto::from(folder);
+                members.insert(dto.id.parse()?, WebdavSyncMember::Folder(dto));
+            }
+        }
+        if !file_ids.is_empty() {
+            for file in self.file_read.get_files_by_ids(&file_ids).await? {
+                let dto = FileDto::from(file);
+                members.insert(dto.id.parse()?, WebdavSyncMember::File(dto));
+            }
+        }
+        Ok(members)
+    }
+}
+
+pub struct WebdavSyncCollectionService {
+    engine: SyncCollectionEngine<FolderSyncChangePgRepository, WebdavMemberResolver>,
 }
 
 impl WebdavSyncCollectionService {
@@ -55,146 +88,47 @@ impl WebdavSyncCollectionService {
         authz: Arc<PgAclEngine>,
     ) -> Self {
         Self {
-            change_log,
-            folder_storage,
-            file_read,
-            authz,
+            engine: SyncCollectionEngine::new(
+                change_log,
+                WebdavMemberResolver {
+                    folder_storage,
+                    file_read,
+                },
+                authz,
+                Resource::Folder,
+                // The leaf name is the href segment as-is; the handler
+                // percent-encodes it and appends `/` for collections.
+                |label| label.to_owned(),
+                "FolderSyncChange",
+            ),
         }
     }
 
     /// Mints the token an **initial** sync response should hand back
     /// (empty/absent client `sync-token` — the caller renders a full
     /// listing itself and just needs a cursor for the client's *next*
-    /// poll). Cheaper than routing through `list_changes_with_perms`,
-    /// which would also walk the collection's full change history only
-    /// to discard it.
+    /// poll).
     pub async fn mint_initial_token(
         &self,
         collection_folder_id: Uuid,
         caller_id: Uuid,
     ) -> Result<SyncToken, DomainError> {
-        self.authz
-            .require(
-                Subject::User(caller_id),
-                Permission::Read,
-                Resource::Folder(collection_folder_id),
-            )
-            .await?;
-
-        let seq = self.change_log.current_seq(collection_folder_id).await?;
-        Ok(SyncToken::mint(collection_folder_id, seq))
+        self.engine
+            .mint_initial_token(collection_folder_id, caller_id)
+            .await
     }
 
-    /// Resolves the delta for `collection_folder_id` since `since_token`
-    /// (`None` for an initial sync — still walks the log with `since = 0`
-    /// so `new_token` is correctly minted, but callers doing a true
-    /// initial sync should render a full listing instead of this delta,
-    /// matching RFC 6578 §3.7's "empty sync-token" semantics).
-    ///
-    /// Returns `Err(ErrorKind::SyncTokenExpired)` (→ HTTP 507) when
-    /// `since_token` predates the retention watermark — the caller must
-    /// discard local state and restart with a fresh initial sync.
+    /// Resolves the delta for `collection_folder_id` since `since_token`.
+    /// Authz, token expiry and tombstone rules are the engine's (see
+    /// `SyncCollectionEngine::list_changes_with_perms`).
     pub async fn list_changes_with_perms(
         &self,
         collection_folder_id: Uuid,
         since_token: Option<SyncToken>,
         caller_id: Uuid,
     ) -> Result<SyncDelta<WebdavSyncMember>, DomainError> {
-        self.authz
-            .require(
-                Subject::User(caller_id),
-                Permission::Read,
-                Resource::Folder(collection_folder_id),
-            )
-            .await?;
-
-        if let Some(token) = since_token
-            && self
-                .change_log
-                .is_seq_expired(collection_folder_id, token.seq())
-                .await?
-        {
-            return Err(DomainError::sync_token_expired(
-                "FolderSyncChange",
-                format!(
-                    "sync-token seq {} for collection {} predates the retention window",
-                    token.seq(),
-                    collection_folder_id
-                ),
-            ));
-        }
-
-        let since_seq = since_token.map(|t| t.seq());
-        let (rows, new_seq) = self
-            .change_log
-            .changes_since(collection_folder_id, since_seq)
-            .await?;
-
-        // A `href_name` can appear on more than one row in this batch: a
-        // hard delete followed by a fresh create/upload of the same name
-        // within one poll window mints a brand-new `member_id`, never
-        // reusing the old row (unlike move/trash/restore, which do keep
-        // the same row). The handler renders upserts and deletions as
-        // separate buckets, which can't express "this happened before
-        // that", so a stale tombstone sharing a href with a live upsert
-        // in the SAME batch must be dropped here — the href demonstrably
-        // still exists, and a client has no order-based way to reach
-        // that conclusion itself from the rendered response.
-        let live_hrefs: std::collections::HashSet<String> = rows
-            .iter()
-            .filter(|r| !matches!(r.kind, SyncChangeKind::Deleted))
-            .map(|r| r.href_name.clone())
-            .collect();
-
-        let mut changes = Vec::with_capacity(rows.len());
-        for row in rows {
-            match row.kind {
-                SyncChangeKind::Deleted => {
-                    if live_hrefs.contains(row.href_name.as_str()) {
-                        continue;
-                    }
-                    changes.push(SyncChange::Deleted {
-                        member_id: row.member_id,
-                        href_hint: row.href_name,
-                        is_collection: matches!(row.member_type, SyncMemberType::Folder),
-                    });
-                }
-                SyncChangeKind::Created | SyncChangeKind::Updated => {
-                    let member_id = row.member_id.to_string();
-                    // `None`: hard-deleted/purged after this row was
-                    // logged → degrade to a tombstone with the last-known
-                    // name. Any other lookup failure aborts the REPORT:
-                    // a read failure is never proof of absence, and a
-                    // false tombstone makes the client delete live data.
-                    let resolved = match row.member_type {
-                        SyncMemberType::Folder => self
-                            .folder_storage
-                            .get_folder(&member_id)
-                            .await
-                            .not_found_as_none()?
-                            .map(|f| WebdavSyncMember::Folder(FolderDto::from(f))),
-                        SyncMemberType::File => self
-                            .file_read
-                            .get_file(&member_id)
-                            .await
-                            .not_found_as_none()?
-                            .map(|f| WebdavSyncMember::File(FileDto::from(f))),
-                    };
-                    match resolved {
-                        Some(member) => changes.push(SyncChange::Upserted(member)),
-                        None => changes.push(SyncChange::Deleted {
-                            member_id: row.member_id,
-                            is_collection: matches!(row.member_type, SyncMemberType::Folder),
-                            href_hint: row.href_name,
-                        }),
-                    }
-                }
-            }
-        }
-
-        Ok(SyncDelta {
-            changes,
-            new_token: SyncToken::mint(collection_folder_id, new_seq),
-        })
+        self.engine
+            .list_changes_with_perms(collection_folder_id, since_token, caller_id)
+            .await
     }
 }

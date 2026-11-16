@@ -14,7 +14,7 @@
 //! resolves every row to its UID only, and this service hydrates each
 //! touched UID as a whole, from both object tables, in one batch per kind.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -27,6 +27,7 @@ use crate::application::services::sync_collection_engine::{
 };
 use crate::common::errors::DomainError;
 use crate::domain::entities::sync_token::SyncToken;
+use crate::domain::repositories::sync_change_log_repository::SyncChangeRow;
 use crate::domain::services::authorization::Resource;
 use crate::infrastructure::adapters::calendar_storage_adapter::CalendarStorageAdapter;
 use crate::infrastructure::repositories::pg::calendar_sync_change_pg_repository::CalendarSyncChangePgRepository;
@@ -41,8 +42,15 @@ struct CalendarUidResolver;
 impl SyncMemberResolver for CalendarUidResolver {
     type Member = String;
 
-    async fn resolve(&self, _member_id: Uuid, label: &str) -> Result<Option<String>, DomainError> {
-        Ok(Some(label.to_owned()))
+    async fn resolve_batch(
+        &self,
+        _collection_id: Uuid,
+        rows: &[&SyncChangeRow],
+    ) -> Result<HashMap<Uuid, String>, DomainError> {
+        Ok(rows
+            .iter()
+            .map(|r| (r.member_id, r.label.clone()))
+            .collect())
     }
 }
 

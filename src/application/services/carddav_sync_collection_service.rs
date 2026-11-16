@@ -4,6 +4,7 @@
 //! engine, differing only in the resolver and the `.vcf`/`Resource`
 //! parameterization.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -15,8 +16,8 @@ use crate::application::services::sync_collection_engine::{
 };
 use crate::common::errors::DomainError;
 use crate::domain::entities::sync_token::SyncToken;
-use crate::domain::errors::NotFoundAsNone;
 use crate::domain::repositories::contact_repository::ContactRepository;
+use crate::domain::repositories::sync_change_log_repository::SyncChangeRow;
 use crate::domain::services::authorization::Resource;
 use crate::infrastructure::repositories::pg::ContactPgRepository;
 use crate::infrastructure::repositories::pg::contact_sync_change_pg_repository::ContactSyncChangePgRepository;
@@ -29,21 +30,24 @@ struct ContactMemberResolver {
 impl SyncMemberResolver for ContactMemberResolver {
     type Member = ContactDto;
 
-    async fn resolve(
+    /// One indexed `uid = ANY(..)` query for the whole delta, re-keyed by
+    /// contact id. A row whose contact was deleted, or replaced by a
+    /// recreate under a new id, is simply absent and becomes a tombstone;
+    /// a failed query fails the REPORT.
+    async fn resolve_batch(
         &self,
-        member_id: Uuid,
-        _label: &str,
-    ) -> Result<Option<ContactDto>, DomainError> {
-        // `Ok(None)`: hard-deleted after the row was logged → the engine
-        // emits a tombstone. A failed read stays an error — reporting it
-        // as deleted would make the client drop a contact that exists.
-        let contact = self
+        collection_id: Uuid,
+        rows: &[&SyncChangeRow],
+    ) -> Result<HashMap<Uuid, ContactDto>, DomainError> {
+        let uids: Vec<String> = rows.iter().map(|r| r.label.clone()).collect();
+        let contacts = self
             .contact_storage
-            .get_contact_by_id(&member_id)
-            .await
-            .not_found_as_none()?
-            .flatten();
-        Ok(contact.map(ContactDto::from))
+            .get_contacts_by_uids(&collection_id, &uids)
+            .await?;
+        Ok(contacts
+            .into_iter()
+            .map(|c| (*c.id(), ContactDto::from(c)))
+            .collect())
     }
 }
 
