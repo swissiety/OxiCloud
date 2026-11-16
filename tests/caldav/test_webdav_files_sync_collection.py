@@ -441,7 +441,6 @@ def test_files_sync_expired_token_after_row_cap_returns_507_then_recovers(
 
     trigger_resp = requests.post(
         f"{base_url}/api/admin/jobs/sync_log_retention/trigger",
-        params={"force": "true"},
         headers={"Authorization": f"Bearer {admin_jwt}"},
         timeout=30,
     )

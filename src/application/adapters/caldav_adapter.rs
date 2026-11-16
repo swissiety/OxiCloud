@@ -440,6 +440,9 @@ impl CalDavAdapter {
         let mut in_calendar_query = false;
         let mut in_calendar_multiget = false;
         let mut in_sync_collection = false;
+        // Only text directly inside `<sync-token>` is the token; any other
+        // text in the body (`<sync-level>1</sync-level>`) must not leak in.
+        let mut in_sync_token = false;
         let mut in_prop = false;
         let mut in_filter = false;
         let mut start_time: Option<DateTime<Utc>> = None;
@@ -507,7 +510,7 @@ impl CalDavAdapter {
                             }
                         }
                         s if s == "sync-token" || s.ends_with(":sync-token") => {
-                            // We'll capture the text in the Text event
+                            in_sync_token = true
                         }
                         s if s == "href" || s.ends_with(":href") => {
                             // We'll capture the text in the Text event
@@ -522,8 +525,7 @@ impl CalDavAdapter {
                 Ok(Event::Text(e)) => {
                     let text = e.decode().unwrap_or_default();
 
-                    // Check if we're in sync-token element
-                    if in_sync_collection && !in_prop && !in_filter {
+                    if in_sync_token {
                         sync_token = text.to_string();
                     }
 
@@ -540,6 +542,9 @@ impl CalDavAdapter {
                         // Don't reset report-type flags — they're needed at EOF for decision logic
                         s if s == "prop" || s.ends_with(":prop") => in_prop = false,
                         s if s == "filter" || s.ends_with(":filter") => in_filter = false,
+                        s if s == "sync-token" || s.ends_with(":sync-token") => {
+                            in_sync_token = false
+                        }
                         s if s == "time-range" || s.ends_with(":time-range") => { /* time-range end, attributes already parsed */
                         }
                         _ => (),

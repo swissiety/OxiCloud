@@ -192,8 +192,9 @@ impl JobHandler for SyncLogRetentionService {
         SYNC_LOG_RETENTION_JOB_NAME
     }
 
-    /// `args.force` is ignored — retention days and the row cap are fixed
-    /// policy, not a per-run override (same as `TrashCleanupService::run`).
+    /// Takes no run arguments — retention days and the row cap are fixed
+    /// policy, not a per-run override, so the trigger endpoint rejects
+    /// `force` and friends for this job.
     /// See `SweepStats::into_outcome` for when a run counts as failed.
     async fn run(&self, _args: &JobRunArgs) -> JobOutcome {
         self.sweep().await.into_outcome()
