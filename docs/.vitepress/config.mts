@@ -162,6 +162,7 @@ export default defineConfig({
           text: "Configuration",
           items: [
             { text: "Deployment & Docker", link: "/config/deployment" },
+            { text: "Public Share Links Only", link: "/config/public-share-gateway" },
             { text: "Environment Variables", link: "/config/env" },
             { text: "Storage Fine Tuning", link: "/config/storage-fine-tuning" },
             { text: "Authentication", link: "/config/authentication" },

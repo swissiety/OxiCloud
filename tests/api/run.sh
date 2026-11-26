@@ -626,6 +626,9 @@ HURL_FILES=( \
   "$API_DIR/audio_id3_extraction.hurl" \
   "$API_DIR/public_shares.hurl" \
   "$API_DIR/anonymous_share_session.hurl" \
+  # The edge allowlist in docs/config/public-share-gateway.md: a full
+  # share visit through only the paths and methods that config admits.
+  "$API_DIR/public_share_gateway.hurl" \
   "$API_DIR/share_download_limits.hurl" \
   "$API_DIR/share_download_attribution.hurl" \
   "$API_DIR/permissions.hurl" \

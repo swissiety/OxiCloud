@@ -215,6 +215,9 @@ Two rules apply to every proxy setup:
    reconstructs the browser-visible URL from them; without them every bound
    request fails with `dpop.verify_failed reason=wrong_htu`.
 
+To keep OxiCloud private and put only public share links on the internet,
+see [Public Share Links Only](/config/public-share-gateway).
+
 ### Traefik (Docker Compose, same host)
 
 For a deployment where Traefik and OxiCloud run as containers on the same Docker host, the clean shape is a `docker-compose.override.yml` that attaches OxiCloud to Traefik's external network, drops the host port exposure, and adds the router labels. The base `docker-compose.yml` stays untouched.
