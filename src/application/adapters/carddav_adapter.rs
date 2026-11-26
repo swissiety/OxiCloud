@@ -12,6 +12,7 @@ use quick_xml::{
 use std::io::{BufReader, Read, Write};
 
 use crate::application::adapters::param_encoding::render_param_value;
+use crate::application::adapters::sync_collection_xml;
 use crate::application::adapters::webdav_adapter::{
     PropFindRequest, PropFindType, QualifiedName, Result, WebDavAdapter, WebDavError,
 };
@@ -60,6 +61,9 @@ pub enum CardDavReportType {
     /// Sync-collection report
     SyncCollection {
         sync_token: String,
+        /// Raw `<D:sync-level>` text, `None` when the element is missing.
+        /// Validated by the handler (RFC 6578 §3.3).
+        sync_level: Option<String>,
         props: Vec<QualifiedName>,
     },
 }
@@ -83,6 +87,8 @@ impl CardDavAdapter {
         let mut sync_token = String::new();
         let mut in_href = false;
         let mut in_sync_token = false;
+        let mut in_sync_level = false;
+        let mut sync_level: Option<String> = None;
         let mut ns_map = std::collections::HashMap::<String, String>::new();
 
         loop {
@@ -109,6 +115,10 @@ impl CardDavAdapter {
                         s if s == "sync-token" || s.ends_with(":sync-token") => {
                             in_sync_token = true
                         }
+                        s if s == "sync-level" || s.ends_with(":sync-level") => {
+                            in_sync_level = true;
+                            sync_level.get_or_insert_with(String::new);
+                        }
                         _ if in_prop => {
                             let qname = WebDavAdapter::resolve_name(name_str, &ns_map);
                             props.push(qname);
@@ -122,6 +132,8 @@ impl CardDavAdapter {
                         hrefs.push(text.to_string());
                     } else if in_sync_token {
                         sync_token = text.to_string();
+                    } else if in_sync_level && let Some(level) = sync_level.as_mut() {
+                        level.push_str(&text);
                     }
                 }
                 Ok(Event::End(ref e)) => {
@@ -133,6 +145,9 @@ impl CardDavAdapter {
                         s if s == "href" || s.ends_with(":href") => in_href = false,
                         s if s == "sync-token" || s.ends_with(":sync-token") => {
                             in_sync_token = false
+                        }
+                        s if s == "sync-level" || s.ends_with(":sync-level") => {
+                            in_sync_level = false
                         }
                         _ => {}
                     }
@@ -154,7 +169,11 @@ impl CardDavAdapter {
         if in_addressbook_multiget || !hrefs.is_empty() {
             Ok(CardDavReportType::AddressbookMultiget { hrefs, props })
         } else if in_sync_collection {
-            Ok(CardDavReportType::SyncCollection { sync_token, props })
+            Ok(CardDavReportType::SyncCollection {
+                sync_token,
+                sync_level,
+                props,
+            })
         } else if in_addressbook_query {
             Ok(CardDavReportType::AddressbookQuery { props })
         } else {
@@ -695,7 +714,6 @@ impl CardDavAdapter {
         Ok(())
     }
 
-    /// Generate response for contacts (for REPORT)
     /// REPORT `<D:multistatus>` opening tag (DAV + CardDAV namespaces).
     /// Streaming emitters call this once, then
     /// [`Self::write_contacts_report_page`] per cursor page, then
@@ -743,15 +761,34 @@ impl CardDavAdapter {
         Ok(())
     }
 
+    /// Generate response for contacts (for REPORT).
+    ///
+    /// `deleted_hrefs` renders each as an RFC 6578 §3.7
+    /// `<D:status>HTTP/1.1 404 Not Found</D:status>` sub-response instead
+    /// of a `<D:propstat>` block, and `sync_token` (when `Some`) renders
+    /// as a trailing `<D:sync-token>` — both empty/`None` for the
+    /// addressbook-query / addressbook-multiget report types, which
+    /// don't use either.
     pub fn generate_contacts_response<W: Write>(
         writer: W,
         contacts: &[ContactDto],
         report: &CardDavReportType,
         base_href: &str,
+        deleted_hrefs: &[String],
+        sync_token: Option<&str>,
     ) -> Result<()> {
         let mut xml_writer = Writer::new(writer);
         Self::write_report_multistatus_start(&mut xml_writer)?;
         Self::write_contacts_report_page(&mut xml_writer, contacts, report, base_href)?;
+
+        for href in deleted_hrefs {
+            sync_collection_xml::write_deleted_response(&mut xml_writer, "D:", href)?;
+        }
+
+        if let Some(token) = sync_token {
+            sync_collection_xml::write_sync_token(&mut xml_writer, "D:", token)?;
+        }
+
         Self::write_carddav_multistatus_end(&mut xml_writer)
     }
 

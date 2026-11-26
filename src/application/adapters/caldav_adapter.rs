@@ -12,6 +12,7 @@ use quick_xml::{
 use std::io::{BufReader, Read, Write};
 use uuid::Uuid;
 
+use crate::application::adapters::sync_collection_xml;
 use crate::application::adapters::webdav_adapter::{
     PropFindRequest, PropFindType, QualifiedName, Result, WebDavAdapter, WebDavError,
 };
@@ -402,6 +403,9 @@ pub enum CalDavReportType {
     /// Sync-collection report
     SyncCollection {
         sync_token: String,
+        /// Raw `<D:sync-level>` text, `None` when the element is missing.
+        /// Validated by the handler (RFC 6578 §3.3).
+        sync_level: Option<String>,
         props: Vec<QualifiedName>,
     },
 }
@@ -439,6 +443,12 @@ impl CalDavAdapter {
         let mut in_calendar_query = false;
         let mut in_calendar_multiget = false;
         let mut in_sync_collection = false;
+        // Only text directly inside `<sync-token>` is the token; any other
+        // text in the body (`<sync-level>1</sync-level>`) must not leak in.
+        let mut in_sync_token = false;
+        let mut in_sync_level = false;
+        let mut sync_level: Option<String> = None;
+        let mut in_href = false;
         let mut in_prop = false;
         let mut in_filter = false;
         let mut start_time: Option<DateTime<Utc>> = None;
@@ -506,11 +516,13 @@ impl CalDavAdapter {
                             }
                         }
                         s if s == "sync-token" || s.ends_with(":sync-token") => {
-                            // We'll capture the text in the Text event
+                            in_sync_token = true
                         }
-                        s if s == "href" || s.ends_with(":href") => {
-                            // We'll capture the text in the Text event
+                        s if s == "sync-level" || s.ends_with(":sync-level") => {
+                            in_sync_level = true;
+                            sync_level.get_or_insert_with(String::new);
                         }
+                        s if s == "href" || s.ends_with(":href") => in_href = true,
                         _ if in_prop => {
                             let qname = WebDavAdapter::resolve_name(name_str, &ns_map);
                             props.push(qname);
@@ -521,13 +533,13 @@ impl CalDavAdapter {
                 Ok(Event::Text(e)) => {
                     let text = e.decode().unwrap_or_default();
 
-                    // Check if we're in sync-token element
-                    if in_sync_collection && !in_prop && !in_filter {
+                    if in_sync_token {
                         sync_token = text.to_string();
+                    } else if in_sync_level && let Some(level) = sync_level.as_mut() {
+                        level.push_str(&text);
                     }
 
-                    // Check if we're in href element
-                    if (in_calendar_multiget || in_sync_collection) && !in_prop && !in_filter {
+                    if in_href && in_calendar_multiget {
                         hrefs.push(text.to_string());
                     }
                 }
@@ -539,6 +551,13 @@ impl CalDavAdapter {
                         // Don't reset report-type flags — they're needed at EOF for decision logic
                         s if s == "prop" || s.ends_with(":prop") => in_prop = false,
                         s if s == "filter" || s.ends_with(":filter") => in_filter = false,
+                        s if s == "sync-token" || s.ends_with(":sync-token") => {
+                            in_sync_token = false
+                        }
+                        s if s == "sync-level" || s.ends_with(":sync-level") => {
+                            in_sync_level = false
+                        }
+                        s if s == "href" || s.ends_with(":href") => in_href = false,
                         s if s == "time-range" || s.ends_with(":time-range") => { /* time-range end, attributes already parsed */
                         }
                         _ => (),
@@ -608,7 +627,11 @@ impl CalDavAdapter {
         } else if in_calendar_multiget {
             CalDavReportType::CalendarMultiget { hrefs, props }
         } else if in_sync_collection {
-            CalDavReportType::SyncCollection { sync_token, props }
+            CalDavReportType::SyncCollection {
+                sync_token,
+                sync_level,
+                props,
+            }
         } else {
             // Default to empty calendar query
             CalDavReportType::CalendarQuery {
@@ -1447,11 +1470,20 @@ impl CalDavAdapter {
     }
 
     /// Generate a response for calendar objects (events or tasks).
+    ///
+    /// `deleted_hrefs` renders each as an RFC 6578 §3.7
+    /// `<D:status>HTTP/1.1 404 Not Found</D:status>` sub-response instead
+    /// of a `<D:propstat>` block, and `sync_token` (when `Some`) renders
+    /// as a trailing `<D:sync-token>` — both empty/`None` for the
+    /// calendar-query / calendar-multiget report types, which don't use
+    /// either.
     pub fn generate_calendar_events_response<W: Write, T: CalendarObjectRow>(
         writer: W,
         rows: &[T],
         request: &CalDavReportType,
         base_href: &str,
+        deleted_hrefs: &[String],
+        sync_token: Option<&str>,
     ) -> Result<()> {
         let mut xml_writer = Writer::new(writer);
 
@@ -1462,6 +1494,14 @@ impl CalDavAdapter {
         // `write_report_page`, which the streaming emitters reuse
         // page by page.
         Self::write_report_page(&mut xml_writer, rows, request, base_href)?;
+
+        for href in deleted_hrefs {
+            sync_collection_xml::write_deleted_response(&mut xml_writer, "D:", href)?;
+        }
+
+        if let Some(token) = sync_token {
+            sync_collection_xml::write_sync_token(&mut xml_writer, "D:", token)?;
+        }
 
         Self::write_caldav_multistatus_end(&mut xml_writer)?;
 

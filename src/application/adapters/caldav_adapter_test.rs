@@ -181,6 +181,63 @@ mod tests {
         }
     }
 
+    fn parsed_sync_token(xml: &str) -> String {
+        match CalDavAdapter::parse_report(Cursor::new(xml)).expect("REPORT parses") {
+            CalDavReportType::SyncCollection { sync_token, .. } => sync_token,
+            other => panic!("Expected SyncCollection, got {:?}", other),
+        }
+    }
+
+    /// Regression: the parser stored ANY text inside `<sync-collection>` as
+    /// the token, so `<sync-token/><sync-level>1</sync-level>` (an initial
+    /// sync, as python-caldav and DAVx5 send it) parsed as token "1" and was
+    /// rejected with 400 "malformed sync-token". Only text inside
+    /// `<sync-token>` counts; an empty element means initial sync.
+    #[test]
+    fn test_sync_collection_ignores_text_outside_sync_token() {
+        let initial = r#"<D:sync-collection xmlns:D="DAV:">
+            <D:sync-token/><D:sync-level>1</D:sync-level>
+            <D:prop><D:getetag/></D:prop>
+        </D:sync-collection>"#;
+        assert_eq!(parsed_sync_token(initial), "");
+
+        let delta = r#"<D:sync-collection xmlns:D="DAV:">
+            <D:sync-token>http://oxicloud.local/ns/sync/abc/7</D:sync-token>
+            <D:sync-level>1</D:sync-level>
+            <D:prop><D:getetag/></D:prop>
+        </D:sync-collection>"#;
+        assert_eq!(
+            parsed_sync_token(delta),
+            "http://oxicloud.local/ns/sync/abc/7"
+        );
+    }
+
+    fn parsed_sync_level(xml: &str) -> Option<String> {
+        match CalDavAdapter::parse_report(Cursor::new(xml)).expect("REPORT parses") {
+            CalDavReportType::SyncCollection { sync_level, .. } => sync_level,
+            other => panic!("Expected SyncCollection, got {:?}", other),
+        }
+    }
+
+    /// RFC 6578 §3.3 makes `<sync-level>` mandatory, and the handler refuses
+    /// a body without one. The parser must tell "missing" (None) apart from
+    /// a present value, and must not treat the level text as an href, which
+    /// the old catch-all text capture did.
+    #[test]
+    fn test_sync_collection_captures_sync_level() {
+        let with_level = r#"<D:sync-collection xmlns:D="DAV:">
+            <D:sync-token/><D:sync-level>1</D:sync-level>
+            <D:prop><D:getetag/></D:prop>
+        </D:sync-collection>"#;
+        assert_eq!(parsed_sync_level(with_level).as_deref(), Some("1"));
+
+        let without = r#"<D:sync-collection xmlns:D="DAV:">
+            <D:sync-token/>
+            <D:prop><D:getetag/></D:prop>
+        </D:sync-collection>"#;
+        assert_eq!(parsed_sync_level(without), None);
+    }
+
     // ========================
     // PROPFIND response tests
     // ========================
@@ -377,6 +434,8 @@ mod tests {
             &events,
             &report,
             "/caldav/cal-001",
+            &[],
+            None,
         );
 
         assert!(
@@ -417,6 +476,8 @@ mod tests {
             &events,
             &report,
             "/caldav/cal-001",
+            &[],
+            None,
         );
 
         assert!(

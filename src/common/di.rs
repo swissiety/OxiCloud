@@ -2801,8 +2801,10 @@ impl AppServiceFactory {
             last_seen_tracker,
             calendar_service: None,
             calendar_use_case: None,
+            caldav_sync_collection_service: None,
             addressbook_use_case: None,
             contact_use_case: None,
+            carddav_sync_collection_service: None,
             music_service: None,
             wopi_token_service: None,
             wopi_lock_service: None,
@@ -3572,13 +3574,29 @@ impl AppServiceFactory {
                     todo_repo,
                 )
             );
+            let calendar_sync_change_repo = Arc::new(
+                crate::infrastructure::repositories::pg::CalendarSyncChangePgRepository::new(
+                    pool.clone(),
+                ),
+            );
             let calendar_service = Arc::new(
                 crate::application::services::calendar_service::CalendarService::new(
-                    calendar_storage,
+                    calendar_storage.clone(),
                     authorization.clone(),
                 ),
             );
             app_state.calendar_use_case = Some(calendar_service as Arc<CalendarService>);
+
+            // RFC 6578 sync-collection — dedicated service (mirrors
+            // CarddavSyncCollectionService below), fixing the previous
+            // inconsistency of CalendarService owning this inline.
+            app_state.caldav_sync_collection_service = Some(Arc::new(
+                crate::application::services::caldav_sync_collection_service::CaldavSyncCollectionService::new(
+                    calendar_sync_change_repo,
+                    calendar_storage,
+                    authorization.clone(),
+                ),
+            ));
 
             // CardDAV
             let address_book_repo: Arc<AddressBookPgRepository> = Arc::new(
@@ -3595,7 +3613,7 @@ impl AppServiceFactory {
             let contact_storage = Arc::new(
                 crate::infrastructure::adapters::contact_storage_adapter::ContactStorageAdapter::new(
                     address_book_repo,
-                    contact_repo,
+                    contact_repo.clone(),
                     group_repo,
                 ),
             );
@@ -3603,6 +3621,22 @@ impl AppServiceFactory {
                 Arc::new(ContactService::new(contact_storage, authorization.clone()));
             app_state.addressbook_use_case = Some(contact_service.clone());
             app_state.contact_use_case = Some(contact_service);
+
+            // RFC 6578 sync-collection — dedicated service (mirrors
+            // WebdavSyncCollectionService), holding its own change-log repo
+            // plus the raw contact repo for resolving Created/Updated rows.
+            let contact_sync_change_repo = Arc::new(
+                crate::infrastructure::repositories::pg::ContactSyncChangePgRepository::new(
+                    pool.clone(),
+                ),
+            );
+            app_state.carddav_sync_collection_service = Some(Arc::new(
+                crate::application::services::carddav_sync_collection_service::CarddavSyncCollectionService::new(
+                    contact_sync_change_repo,
+                    contact_repo.clone(),
+                    authorization.clone(),
+                ),
+            ));
 
             tracing::info!("CalDAV and CardDAV services initialized with PostgreSQL repositories");
         }
@@ -4359,8 +4393,20 @@ pub struct AppState {
     >,
     pub calendar_service: Option<Arc<CalendarService>>,
     pub calendar_use_case: Option<Arc<CalendarService>>,
+    /// RFC 6578 `sync-collection` REPORT — real incremental sync for
+    /// CalDAV events. Separate service (mirrors
+    /// `carddav_sync_collection_service`) rather than folded into
+    /// `CalendarService` — see `CaldavSyncCollectionService`'s doc comment.
+    pub caldav_sync_collection_service:
+        Option<Arc<crate::application::services::caldav_sync_collection_service::CaldavSyncCollectionService>>,
     pub addressbook_use_case: Option<Arc<ContactService>>,
     pub contact_use_case: Option<Arc<ContactService>>,
+    /// RFC 6578 `sync-collection` REPORT — real incremental sync for
+    /// CardDAV contacts. Separate service (mirrors
+    /// `webdav_sync_collection_service`) rather than folded into
+    /// `ContactService` — see `CarddavSyncCollectionService`'s doc comment.
+    pub carddav_sync_collection_service:
+        Option<Arc<crate::application::services::carddav_sync_collection_service::CarddavSyncCollectionService>>,
     pub music_service: Option<Arc<MusicService>>,
     pub wopi_token_service:
         Option<Arc<crate::application::services::wopi_token_service::WopiTokenService>>,

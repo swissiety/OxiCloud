@@ -89,6 +89,7 @@ def test_response_hrefs_preserve_the_uploaded_collection(
         else:
             expected.add(collection_path)
     elif operation == "sync":
+        depth = "0"  # RFC 6578 §3.2: sync-collection is only defined at Depth 0
         body = (
             '<D:sync-collection xmlns:D="DAV:">'
             f'<D:sync-token/><D:sync-level>1</D:sync-level>{props}'

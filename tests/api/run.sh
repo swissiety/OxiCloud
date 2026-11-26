@@ -611,6 +611,7 @@ HURL_FILES=( \
   "$API_DIR/carddav_vcard_properties.hurl" \
   "$API_DIR/webdav_carddav_param_encoding.hurl" \
   "$API_DIR/contacts.hurl" \
+  "$API_DIR/contact_sync_collection.hurl" \
   "$API_DIR/calendar.hurl" \
   "$API_DIR/calendar_rest.hurl" \
   "$API_DIR/caldav_shared_roles.hurl" \
@@ -618,6 +619,7 @@ HURL_FILES=( \
   "$API_DIR/caldav_tzid.hurl" \
   "$API_DIR/caldav_vtodo.hurl" \
   "$API_DIR/caldav_calendar_query.hurl" \
+  "$API_DIR/calendar_sync_collection.hurl" \
   "$API_DIR/playlists.hurl" \
   # Adjacent to playlists.hurl because it drives the same
   # /api/playlists/audio-metadata endpoint — but it is about the

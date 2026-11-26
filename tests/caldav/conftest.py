@@ -177,19 +177,16 @@ def carddav_url(caldav_url: str) -> str:
     return caldav_url.replace("/caldav/", "/carddav/", 1)
 
 
-@pytest.fixture
-def fresh_addressbook(dav_client: caldav.DAVClient, carddav_url: str):
-    """Create a fresh CardDAV address book and return its
-    server-authoritative URL as a string.
+def make_addressbook(dav_client: caldav.DAVClient, carddav_url: str) -> str:
+    """Create an address book and return its server-authoritative URL
+    (string, trailing `/`). The caller deletes it.
 
-    Same URL-rebind hazard as `fresh_calendar`: OxiCloud's MKCOL
-    assigns its own UUID and ignores the URL slug we PUT to
-    (RFC 6352 leaves this implementation-defined). Discover the
-    canonical URL via PROPFIND Depth 1 on the CardDAV root and
-    match by displayname.
-
-    Yields the URL (string, trailing `/`); teardown DELETEs it
-    on best-effort."""
+    OxiCloud's MKCOL assigns its own UUID and ignores the URL slug we PUT
+    to (RFC 6352 leaves this implementation-defined), so the slug URL is
+    NOT the book's URL. Discover the canonical one via PROPFIND Depth 1 on
+    the CardDAV root and match by displayname. Shared by the
+    `fresh_addressbook` fixture and tests that need a second book.
+    """
     name = f"pycarddav-{uuid.uuid4().hex[:12]}"
 
     mkcol_url = carddav_url.rstrip("/") + f"/{name}/"
@@ -242,6 +239,14 @@ def fresh_addressbook(dav_client: caldav.DAVClient, carddav_url: str):
     origin = re.match(r"^(https?://[^/]+)", carddav_url).group(1)
     ab_url = f"{origin}{href}"
 
+    return ab_url
+
+
+@pytest.fixture
+def fresh_addressbook(dav_client: caldav.DAVClient, carddav_url: str):
+    """A brand-new address book per test (see `make_addressbook`); yields
+    its URL and DELETEs it on teardown, best-effort."""
+    ab_url = make_addressbook(dav_client, carddav_url)
     yield ab_url
     try:
         dav_client.request(ab_url, method="DELETE")
